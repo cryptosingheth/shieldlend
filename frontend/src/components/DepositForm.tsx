@@ -3,7 +3,8 @@
 import { useState } from "react";
 import { parseEther } from "viem";
 import { useDeposit } from "@/lib/contracts";
-import { createNote, serializeNote, fieldToBytes32 } from "@/lib/circuits";
+import { createNote, serializeNote } from "@/lib/circuits";
+import { fieldToBytes32 } from "@/lib/contracts";
 
 export function DepositForm() {
   const [amountEth, setAmountEth] = useState("");

@@ -7,10 +7,9 @@ import { useWithdraw } from "@/lib/contracts";
 import {
   deserializeNote,
   generateWithdrawProof,
-  fieldToBytes32,
   type MerklePath,
 } from "@/lib/circuits";
-import { SHIELDED_POOL_ADDRESS, SHIELDED_POOL_ABI } from "@/lib/contracts";
+import { SHIELDED_POOL_ADDRESS, SHIELDED_POOL_ABI, fieldToBytes32 } from "@/lib/contracts";
 
 type ZkVerifyResult = {
   statement: string;
@@ -38,16 +37,17 @@ export function WithdrawForm() {
 
     const logs = await publicClient.getLogs({
       address: SHIELDED_POOL_ADDRESS,
-      event: SHIELDED_POOL_ABI.find((x) => "name" in x && x.name === "Deposit") as never,
       fromBlock: 0n,
     });
 
     // Build commitments array from events (ordered by leafIndex)
+    // Decode Deposit event: Deposit(bytes32 indexed commitment, uint32 leafIndex, ...)
     const commitments: `0x${string}`[] = [];
     for (const log of logs) {
-      if (!log.args) continue;
-      const args = log.args as { commitment: `0x${string}`; leafIndex: number };
-      commitments[Number(args.leafIndex)] = args.commitment;
+      if (log.topics.length < 2) continue;
+      const commitment = log.topics[1] as `0x${string}`;
+      const leafIndex = parseInt(log.data.slice(2, 66), 16);
+      commitments[leafIndex] = commitment;
     }
 
     // Build Merkle path for the target leaf
@@ -57,7 +57,6 @@ export function WithdrawForm() {
     const F = poseidon.F;
 
     const LEVELS = 20;
-    const ZERO = "0x0000000000000000000000000000000000000000000000000000000000000000";
 
     // Fill in zeros for missing leaves
     const leaves: bigint[] = Array(2 ** LEVELS)
@@ -111,20 +110,19 @@ export function WithdrawForm() {
       })) as `0x${string}`;
 
       // Get deposit event for this note to find leafIndex
+      // Deposit(bytes32 indexed commitment, uint32 leafIndex, uint256 timestamp, uint256 amount)
       const logs = await publicClient.getLogs({
         address: SHIELDED_POOL_ADDRESS,
-        event: SHIELDED_POOL_ABI.find((x) => "name" in x && x.name === "Deposit") as never,
         fromBlock: 0n,
       });
 
       const noteCommitment = fieldToBytes32(note.commitment);
-      const depositLog = logs.find((l) => {
-        const args = l.args as { commitment: `0x${string}` };
-        return args.commitment?.toLowerCase() === noteCommitment.toLowerCase();
-      });
-      if (!depositLog?.args) throw new Error("Note not found on-chain. Was it deposited?");
+      const depositLog = logs.find((l) =>
+        l.topics[1]?.toLowerCase() === noteCommitment.toLowerCase()
+      );
+      if (!depositLog) throw new Error("Note not found on-chain. Was it deposited?");
 
-      const leafIndex = Number((depositLog.args as { leafIndex: number }).leafIndex);
+      const leafIndex = parseInt(depositLog.data.slice(2, 66), 16);
       const merklePath = await fetchMerklePath(leafIndex, currentRoot);
 
       setStatus("proving");

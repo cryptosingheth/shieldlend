@@ -4,8 +4,8 @@ import { useState } from "react";
 import { parseEther, formatEther } from "viem";
 import { useAccount } from "wagmi";
 import { type Address } from "viem";
-import { deserializeNote, generateCollateralProof, fieldToBytes32 } from "@/lib/circuits";
-import { useHasActiveLoan } from "@/lib/contracts";
+import { deserializeNote, generateCollateralProof } from "@/lib/circuits";
+import { useHasActiveLoan, fieldToBytes32 } from "@/lib/contracts";
 
 const COLLATERAL_RATIO = 15000n; // 150% in BPS (10000 = 100%)
 

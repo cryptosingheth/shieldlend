@@ -42,12 +42,13 @@ export async function POST(req: NextRequest) {
         {
           event: ZkVerifyEvents.NewAggregationReceipt,
           options: { domainId: 0 },
-          callback: async (eventData: { data: { aggregationId: string; domainId: string }; blockHash: string }) => {
-            const incomingAggId = parseInt(eventData.data.aggregationId.replace(/,/g, ""));
+          callback: async (eventData: unknown) => {
+            const ev = eventData as { data: { aggregationId: string; domainId: string }; blockHash: string };
+            const incomingAggId = parseInt(ev.data.aggregationId.replace(/,/g, ""));
             if (aggregationId === incomingAggId) {
               statementPath = await session.getAggregateStatementPath(
-                eventData.blockHash,
-                parseInt(eventData.data.domainId),
+                ev.blockHash,
+                parseInt(ev.data.domainId),
                 incomingAggId,
                 statement!
               );
