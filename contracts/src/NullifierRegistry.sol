@@ -22,14 +22,29 @@ contract NullifierRegistry {
     mapping(bytes32 => bool) private _spent;
 
     // Only ShieldedPool can mark nullifiers as spent
-    address public immutable shieldedPool;
+    address public shieldedPool;
+    address public immutable admin;
 
     event NullifierSpent(bytes32 indexed nullifierHash);
 
     error AlreadySpent(bytes32 nullifierHash);
     error Unauthorized();
+    error AlreadyInitialized();
 
     constructor(address _shieldedPool) {
+        shieldedPool = _shieldedPool;
+        admin = msg.sender;
+    }
+
+    /*
+     * One-time setter for ShieldedPool address.
+     * Needed because ShieldedPool and NullifierRegistry have a circular dependency:
+     * each needs the other's address at deploy time. This initializer breaks the cycle.
+     * Can only be called once by the deployer.
+     */
+    function setShieldedPool(address _shieldedPool) external {
+        if (msg.sender != admin) revert Unauthorized();
+        if (shieldedPool != address(0)) revert AlreadyInitialized();
         shieldedPool = _shieldedPool;
     }
 
