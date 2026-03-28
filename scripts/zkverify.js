@@ -21,113 +21,121 @@
  * Docs: https://docs.zkverify.io/tutorials/complete-tutorials/zkverify-js
  */
 
-const { zkVerifySession, ZkVerifyEvents, Library } = require("zkverifyjs");
+const { zkVerifySession, ZkVerifyEvents, Library, CurveType } = require("zkverifyjs");
 const snarkjs = require("snarkjs");
 const path = require("path");
 const fs = require("fs");
 
 const KEYS_DIR = path.join(__dirname, "../circuits/keys");
 
-// zkVerify testnet configuration
-// Network: zkVerify testnet (https://docs.zkverify.io)
-const ZKVERIFY_CONFIG = {
-  network: "testnet",    // use "mainnet" for production
-  // Seed phrase from environment (NEVER hardcode)
-  seedPhrase: process.env.ZKVERIFY_SEED_PHRASE,
-};
+// zkVerify network configuration
+// Network: "Volta" = testnet with latest features
+// Docs: https://docs.zkverify.io/overview/getting-started/zkverify-js
+const SEED_PHRASE = process.env.ZKVERIFY_SEED_PHRASE;
 
 /**
- * Submit a Groth16 proof to zkVerify and wait for attestation.
+ * Submit a Groth16 proof to zkVerify and wait for aggregation.
  *
- * @param {string} circuit     - "deposit", "withdraw", or "collateral"
- * @param {object} proof       - Groth16 proof from snarkjs
- * @param {string[]} publicSignals - Public inputs/outputs from snarkjs
- * @returns {Promise<{attestationId: number, leafDigest: string}>}
+ * zkVerify's model (2026):
+ *   Proofs are batched into "aggregations". Your proof gets a `statement`
+ *   (leaf digest in the aggregation Merkle tree). Once the aggregation is
+ *   published, you get a `statementPath` — a Merkle proof that your proof
+ *   was included. This path is what ShieldedPool.sol verifies on-chain.
+ *
+ * @param {string} circuit       - "deposit", "withdraw", or "collateral"
+ * @param {object} proof         - Groth16 proof from snarkjs
+ * @param {string[]} publicSignals - Public signals from snarkjs
+ * @param {number} domainId      - zkVerify domain ID (0 = default)
+ * @returns {Promise<{statement, aggregationId, statementPath, txHash}>}
  */
-async function submitToZkVerify(circuit, proof, publicSignals) {
-  if (!ZKVERIFY_CONFIG.seedPhrase) {
-    throw new Error(
-      "Set ZKVERIFY_SEED_PHRASE environment variable (your zkVerify account seed phrase)"
-    );
+async function submitToZkVerify(circuit, proof, publicSignals, domainId = 0) {
+  if (!SEED_PHRASE) {
+    throw new Error("Set ZKVERIFY_SEED_PHRASE environment variable");
   }
 
   const vkeyPath = path.join(KEYS_DIR, `${circuit}_vkey.json`);
   const vkey = JSON.parse(fs.readFileSync(vkeyPath));
 
-  console.log(`\n[zkVerify] Submitting ${circuit} proof to zkVerify testnet...`);
+  console.log(`\n[zkVerify] Submitting ${circuit} proof to Volta testnet...`);
 
-  // Start a zkVerify session
+  // Verify locally before spending gas on zkVerify chain
+  const localValid = await snarkjs.groth16.verify(vkey, publicSignals, proof);
+  if (!localValid) {
+    throw new Error("Local proof verification failed — aborting zkVerify submission");
+  }
+  console.log("[zkVerify] Local proof check: PASS");
+
   const session = await zkVerifySession.start()
-    .Testnet()
-    .withAccount(ZKVERIFY_CONFIG.seedPhrase);
+    .Volta()
+    .withAccount(SEED_PHRASE);
 
   try {
-    // Verify the proof locally first (sanity check before submitting)
-    const localValid = await snarkjs.groth16.verify(vkey, publicSignals, proof);
-    if (!localValid) {
-      throw new Error("Proof failed local verification — not submitting to zkVerify");
-    }
-    console.log("[zkVerify] Local proof verification: ✓");
-
-    // Submit to zkVerify
-    // zkVerifyJS wraps the proof submission into a transaction on the zkVerify chain
+    // Submit proof — groth16 with snarkjs library on BN128 curve
     const { events, transactionResult } = await session
       .verify()
-      .groth16()
+      .groth16({ library: Library.snarkjs, curve: CurveType.bn128 })
       .execute({
-        proofData: {
-          vk: vkey,
-          proof: proof,
-          publicSignals: publicSignals,
-        },
-        library: Library.SnarkJS, // tells zkVerify this came from snarkjs
+        proofData: { vk: vkey, proof, publicSignals },
+        domainId,
       });
 
-    // Listen for attestation confirmation
-    let attestationId = null;
-    let leafDigest = null;
+    let statement = null;
+    let aggregationId = null;
+    let statementPath = null;
 
+    // Step 1: proof included in a block → get statement (leaf digest)
     events.on(ZkVerifyEvents.IncludedInBlock, (eventData) => {
-      console.log(`[zkVerify] Proof included in block: ${eventData.blockHash}`);
+      console.log(`[zkVerify] Included in block: ${eventData.blockHash}`);
+      statement = eventData.statement;
+      aggregationId = eventData.aggregationId;
+      console.log(`  statement:     ${statement}`);
+      console.log(`  aggregationId: ${aggregationId}`);
     });
 
-    events.on(ZkVerifyEvents.Finalized, (eventData) => {
-      console.log(`[zkVerify] Proof finalized!`);
-      console.log(`  attestationId: ${eventData.attestationId}`);
-      console.log(`  leafDigest:    ${eventData.leafDigest}`);
-      attestationId = eventData.attestationId;
-      leafDigest = eventData.leafDigest;
-    });
+    // Step 2: aggregation published → get Merkle path for on-chain verification
+    session.subscribe([
+      {
+        event: ZkVerifyEvents.NewAggregationReceipt,
+        options: { domainId },
+        callback: async (eventData) => {
+          const incomingAggId = parseInt(
+            eventData.data.aggregationId.replace(/,/g, "")
+          );
+          if (aggregationId === incomingAggId) {
+            console.log(`[zkVerify] Aggregation ${aggregationId} published!`);
+            // Get Merkle path for on-chain verification
+            statementPath = await session.getAggregateStatementPath(
+              eventData.blockHash,
+              parseInt(eventData.data.domainId),
+              incomingAggId,
+              statement
+            );
+            console.log(`  statementPath: ${JSON.stringify(statementPath)}`);
+          }
+        },
+      },
+    ]);
 
-    // Wait for the transaction to complete
     const result = await transactionResult;
-    console.log(`[zkVerify] Transaction hash: ${result.txHash}`);
+    console.log(`[zkVerify] Transaction: ${result.txHash}`);
 
-    if (!attestationId) {
-      throw new Error("Attestation event not received");
+    // Wait for aggregation (may take a few minutes on Volta)
+    const maxWait = 5 * 60 * 1000; // 5 minutes
+    const deadline = Date.now() + maxWait;
+    while (!statementPath && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 2000));
     }
 
-    return { attestationId, leafDigest, txHash: result.txHash };
-  } finally {
-    await session.close();
-  }
-}
+    if (!statementPath) {
+      console.warn("[zkVerify] Aggregation not yet published — saving partial result");
+    }
 
-/**
- * Verify that an attestation is valid on the zkVerify chain.
- * This is the check that ShieldedPool.sol will do on-chain.
- */
-async function verifyAttestation(attestationId, leafDigest) {
-  const session = await zkVerifySession.start()
-    .Testnet()
-    .readOnly(); // read-only — no account needed for verification
-
-  try {
-    const isValid = await session.verify()
-      .attestation(attestationId, leafDigest);
-
-    console.log(`[zkVerify] Attestation ${attestationId}: ${isValid ? "VALID ✓" : "INVALID ✗"}`);
-    return isValid;
+    return {
+      statement,
+      aggregationId,
+      statementPath,
+      txHash: result.txHash,
+    };
   } finally {
     await session.close();
   }

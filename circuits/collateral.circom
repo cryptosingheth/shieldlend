@@ -53,7 +53,7 @@ template CollateralCheck(n) {
 
     // GreaterEqualThan(n) outputs 1 if lhs >= rhs, 0 otherwise
     // We add a constraint that the output MUST be 1 (proof fails if not satisfied)
-    component gte = GreaterEqualThan(n);
+    component gte = GreaterEqThan(n);
     gte.in[0] <== lhs;
     gte.in[1] <== rhs;
 
