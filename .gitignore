@@ -1,0 +1,32 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Proving keys (large binary files)
+keys/
+*.zkey
+*.ptau
+
+# Circuit build artifacts
+build/
+*.r1cs
+*.sym
+*.wtns
+
+# Node
+node_modules/
+.next/
+
+# Foundry
+out/
+cache/
+broadcast/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
