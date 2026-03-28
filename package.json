@@ -22,6 +22,10 @@
   },
   "homepage": "https://github.com/cryptosingheth/shieldlend#readme",
   "dependencies": {
-    "circomlib": "^2.0.5"
+    "circomlib": "^2.0.5",
+    "circomlibjs": "^0.1.7",
+    "ethers": "^6.16.0",
+    "poseidon-solidity": "^0.0.5",
+    "zkverifyjs": "^2.3.0"
   }
 }

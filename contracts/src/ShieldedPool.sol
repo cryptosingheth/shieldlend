@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {NullifierRegistry} from "./NullifierRegistry.sol";
+import {PoseidonT3} from "poseidon-solidity/PoseidonT3.sol";
 
 /*
  * ShieldedPool — ShieldLend
@@ -196,17 +197,15 @@ contract ShieldedPool {
     }
 
     /*
-     * Poseidon hash of two children.
-     * In production: replace with a proper Poseidon precompile call or library.
-     * For now: uses keccak256 as placeholder — MUST be replaced before deployment.
+     * Poseidon hash of two children — matches the hash used in withdraw.circom.
+     * PoseidonT3.hash([left, right]) computes Poseidon permutation with t=3
+     * (2 inputs + 1 capacity element), identical to circomlib's Poseidon(2) template.
      *
-     * TODO: integrate the Poseidon library (e.g., from circomlibjs or a Solidity port)
+     * This alignment is critical: if the contract uses a different hash than the circuit,
+     * the Merkle roots won't match and every withdrawal proof will be invalid.
      */
     function hashLeftRight(bytes32 left, bytes32 right) internal pure returns (bytes32) {
-        // PLACEHOLDER — replace with Poseidon(left, right) before deployment
-        // Using keccak256 here breaks the circuit-contract alignment.
-        // The withdraw.circom uses Poseidon; the contract must use the same hash.
-        return keccak256(abi.encodePacked(left, right));
+        return bytes32(PoseidonT3.hash([uint256(left), uint256(right)]));
     }
 
     // ── Internal: zkVerify attestation check ──────────────────────────────────
