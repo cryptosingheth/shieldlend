@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useAccount, usePublicClient } from "wagmi";
-import { type Address } from "viem";
+import { type Address, type Log } from "viem";
 import { useWithdraw } from "@/lib/contracts";
 import {
   deserializeNote,
@@ -10,6 +10,25 @@ import {
   type MerklePath,
 } from "@/lib/circuits";
 import { SHIELDED_POOL_ADDRESS, SHIELDED_POOL_ABI, fieldToBytes32 } from "@/lib/contracts";
+
+// ShieldedPool was deployed at this block — avoids querying from genesis
+const DEPLOY_BLOCK = 39499000n;
+const CHUNK_SIZE = 9000n;
+
+// Fetch all logs in chunks to stay within RPC's 10,000-block getLogs limit
+async function getAllLogs(
+  publicClient: NonNullable<ReturnType<typeof usePublicClient>>,
+  address: `0x${string}`
+): Promise<Log[]> {
+  const latest = await publicClient.getBlockNumber();
+  const allLogs: Log[] = [];
+  for (let from = DEPLOY_BLOCK; from <= latest; from += CHUNK_SIZE) {
+    const to = from + CHUNK_SIZE - 1n < latest ? from + CHUNK_SIZE - 1n : latest;
+    const chunk = await publicClient.getLogs({ address, fromBlock: from, toBlock: to });
+    allLogs.push(...chunk);
+  }
+  return allLogs;
+}
 
 type ZkVerifyResult = {
   statement: string;
@@ -31,60 +50,59 @@ export function WithdrawForm() {
   const { withdraw, isPending, isConfirming, isSuccess } = useWithdraw();
 
   async function fetchMerklePath(leafIndex: number, root: `0x${string}`): Promise<MerklePath> {
-    // Reconstruct Merkle path by querying on-chain Deposit events
-    // In production: use an indexer. Here we query events directly.
     if (!publicClient) throw new Error("No public client");
 
-    const logs = await publicClient.getLogs({
-      address: SHIELDED_POOL_ADDRESS,
-      fromBlock: 0n,
-    });
+    const logs = await getAllLogs(publicClient, SHIELDED_POOL_ADDRESS);
 
-    // Build commitments array from events (ordered by leafIndex)
-    // Decode Deposit event: Deposit(bytes32 indexed commitment, uint32 leafIndex, ...)
-    const commitments: `0x${string}`[] = [];
+    // Build sparse commitments map: leafIndex → commitment value
+    const commitMap = new Map<number, bigint>();
     for (const log of logs) {
       if (log.topics.length < 2) continue;
       const commitment = log.topics[1] as `0x${string}`;
-      const leafIndex = parseInt(log.data.slice(2, 66), 16);
-      commitments[leafIndex] = commitment;
+      const idx = parseInt(log.data.slice(2, 66), 16);
+      commitMap.set(idx, BigInt(commitment));
     }
 
-    // Build Merkle path for the target leaf
-    // In production: use a relayer/indexer API. This is a simplified version.
     const { buildPoseidon } = await import("circomlibjs");
     const poseidon = await buildPoseidon();
     const F = poseidon.F;
-
     const LEVELS = 20;
 
-    // Fill in zeros for missing leaves
-    const leaves: bigint[] = Array(2 ** LEVELS)
-      .fill(0n)
-      .map((_, i) => (commitments[i] ? BigInt(commitments[i]) : 0n));
-
-    // Build tree bottom-up
-    let nodes: bigint[][] = [leaves];
-    for (let level = 0; level < LEVELS; level++) {
-      const layer = nodes[level];
-      const next: bigint[] = [];
-      for (let i = 0; i < layer.length; i += 2) {
-        const left = layer[i];
-        const right = layer[i + 1] ?? 0n;
-        next.push(F.toObject(poseidon([left, right])) as bigint);
-      }
-      nodes.push(next);
+    // Precompute zero hashes for each level — O(20) instead of O(2^20)
+    // zeros[0] = empty leaf, zeros[i] = Poseidon(zeros[i-1], zeros[i-1])
+    const zeros: bigint[] = [0n];
+    for (let i = 0; i < LEVELS; i++) {
+      zeros.push(F.toObject(poseidon([zeros[i], zeros[i]])) as bigint);
     }
 
-    // Extract path for leafIndex
+    // Sparse path computation — only compute nodes along the proof path
+    // At each level, track only the non-zero nodes needed to compute siblings
     const pathElements: bigint[] = [];
     const pathIndices: number[] = [];
+
+    let currentLevel = new Map<number, bigint>(commitMap);
+
     let idx = leafIndex;
     for (let level = 0; level < LEVELS; level++) {
       const isRight = idx % 2;
       const siblingIdx = isRight ? idx - 1 : idx + 1;
+
+      // Sibling is either a known non-zero node or a zero subtree
+      pathElements.push(currentLevel.get(siblingIdx) ?? zeros[level]);
       pathIndices.push(isRight);
-      pathElements.push(nodes[level][siblingIdx] ?? 0n);
+
+      // Compute parent level — only for non-zero nodes
+      const nextLevel = new Map<number, bigint>();
+      for (const [nodeIdx, val] of currentLevel) {
+        const parentIdx = Math.floor(nodeIdx / 2);
+        if (nextLevel.has(parentIdx)) continue; // already computed from sibling
+        const sibIdx = nodeIdx % 2 === 0 ? nodeIdx + 1 : nodeIdx - 1;
+        const sibVal = currentLevel.get(sibIdx) ?? zeros[level];
+        const left = nodeIdx % 2 === 0 ? val : sibVal;
+        const right = nodeIdx % 2 === 0 ? sibVal : val;
+        nextLevel.set(parentIdx, F.toObject(poseidon([left, right])) as bigint);
+      }
+      currentLevel = nextLevel;
       idx = Math.floor(idx / 2);
     }
 
@@ -110,11 +128,7 @@ export function WithdrawForm() {
       })) as `0x${string}`;
 
       // Get deposit event for this note to find leafIndex
-      // Deposit(bytes32 indexed commitment, uint32 leafIndex, uint256 timestamp, uint256 amount)
-      const logs = await publicClient.getLogs({
-        address: SHIELDED_POOL_ADDRESS,
-        fromBlock: 0n,
-      });
+      const logs = await getAllLogs(publicClient, SHIELDED_POOL_ADDRESS);
 
       const noteCommitment = fieldToBytes32(note.commitment);
       const depositLog = logs.find((l) =>
@@ -151,6 +165,7 @@ export function WithdrawForm() {
         BigInt(zkResult.aggregationId)
       );
 
+      setStatus("done");
       setTxHash(zkResult.txHash);
     } catch (err) {
       setStatus("error");
@@ -169,9 +184,10 @@ export function WithdrawForm() {
   };
 
   const isLoading =
-    ["fetching-path", "proving", "zkverify", "submitting"].includes(status) ||
+    status !== "idle" && status !== "done" && status !== "error" &&
+    (["fetching-path", "proving", "zkverify", "submitting"].includes(status) ||
     isPending ||
-    isConfirming;
+    isConfirming);
 
   return (
     <div className="space-y-5">

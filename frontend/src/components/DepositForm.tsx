@@ -36,7 +36,7 @@ export function DepositForm() {
       localStorage.setItem(`shieldlend_note_${commitment}`, serialized);
 
       setStatus("submitting");
-      deposit(commitment, amount);
+      await deposit(commitment, amount);
     } catch (err) {
       setStatus("error");
       setErrorMsg(err instanceof Error ? err.message : "Unknown error");

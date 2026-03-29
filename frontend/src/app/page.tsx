@@ -1,7 +1,8 @@
 "use client";
 
-import { useState } from "react";
-import { useAccount, useConnect, useDisconnect } from "wagmi";
+import { useState, useEffect } from "react";
+import { useAccount, useConnect, useDisconnect, useChainId, useSwitchChain } from "wagmi";
+import { baseSepolia } from "wagmi/chains";
 import { DepositForm } from "@/components/DepositForm";
 import { WithdrawForm } from "@/components/WithdrawForm";
 import { BorrowForm } from "@/components/BorrowForm";
@@ -12,7 +13,13 @@ export default function Home() {
   const { address, isConnected } = useAccount();
   const { connect, connectors } = useConnect();
   const { disconnect } = useDisconnect();
+  const chainId = useChainId();
+  const { switchChain } = useSwitchChain();
   const [tab, setTab] = useState<Tab>("deposit");
+  const [mounted, setMounted] = useState(false);
+  // Avoid SSR/client hydration mismatch — chain state is client-only
+  useEffect(() => { setMounted(true); }, []);
+  const isWrongNetwork = mounted && isConnected && chainId !== baseSepolia.id;
 
   return (
     <main className="min-h-screen bg-zinc-950 text-zinc-100">
@@ -22,7 +29,8 @@ export default function Home() {
           <h1 className="text-xl font-semibold tracking-tight">ShieldLend</h1>
           <p className="text-xs text-zinc-500">Private DeFi lending · Horizen L3 + zkVerify</p>
         </div>
-        {isConnected ? (
+        {/* Gate on mounted — wagmi reconnects on client, not server */}
+        {mounted && isConnected ? (
           <div className="flex items-center gap-3">
             <span className="text-xs text-zinc-400 font-mono">
               {address?.slice(0, 6)}...{address?.slice(-4)}
@@ -43,6 +51,19 @@ export default function Home() {
           </button>
         )}
       </header>
+
+      {/* Wrong network banner */}
+      {isWrongNetwork && (
+        <div className="bg-red-900/60 border-b border-red-700 px-6 py-2 flex items-center justify-between text-sm">
+          <span className="text-red-300">Wrong network — contracts are on Base Sepolia</span>
+          <button
+            onClick={() => switchChain({ chainId: baseSepolia.id })}
+            className="text-xs px-3 py-1 bg-red-700 hover:bg-red-600 rounded font-medium transition-colors"
+          >
+            Switch to Base Sepolia
+          </button>
+        </div>
+      )}
 
       {/* Privacy notice */}
       <div className="max-w-2xl mx-auto mt-8 px-4">

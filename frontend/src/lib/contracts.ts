@@ -5,10 +5,14 @@
  */
 
 import { type Address, parseAbi, formatEther } from "viem";
+import { baseSepolia } from "wagmi/chains";
+// wagmi write hooks
 import {
   useReadContract,
   useWriteContract,
   useWaitForTransactionReceipt,
+  useSwitchChain,
+  useChainId,
 } from "wagmi";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -100,11 +104,16 @@ export function useLoanDetails(loanId: bigint | undefined) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function useDeposit() {
-  const { writeContract, data: hash, isPending, error } = useWriteContract();
+  const { writeContractAsync, data: hash, isPending, error } = useWriteContract();
   const { isLoading: isConfirming, isSuccess } = useWaitForTransactionReceipt({ hash });
+  const { switchChainAsync } = useSwitchChain();
+  const chainId = useChainId();
 
-  const deposit = (commitment: `0x${string}`, amount: bigint) => {
-    writeContract({
+  const deposit = async (commitment: `0x${string}`, amount: bigint) => {
+    if (chainId !== baseSepolia.id) {
+      await switchChainAsync({ chainId: baseSepolia.id });
+    }
+    return writeContractAsync({
       address: SHIELDED_POOL_ADDRESS,
       abi: SHIELDED_POOL_ABI,
       functionName: "deposit",

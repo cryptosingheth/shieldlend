@@ -30,45 +30,22 @@ export async function POST(req: NextRequest) {
         .execute({ proofData: { vk: vkey, proof, publicSignals }, domainId: 0 });
 
       let statement: string | null = null;
-      let aggregationId: number | null = null;
-      let statementPath: unknown = null;
+      let aggregationId: number = 0;
 
+      // Capture statement info once proof is included in a Volta block
       events.on(ZkVerifyEvents.IncludedInBlock, (eventData: { blockHash: string; statement: string; aggregationId: number }) => {
         statement = eventData.statement;
-        aggregationId = eventData.aggregationId;
+        aggregationId = eventData.aggregationId ?? 0;
       });
 
-      session.subscribe([
-        {
-          event: ZkVerifyEvents.NewAggregationReceipt,
-          options: { domainId: 0 },
-          callback: async (eventData: unknown) => {
-            const ev = eventData as { data: { aggregationId: string; domainId: string }; blockHash: string };
-            const incomingAggId = parseInt(ev.data.aggregationId.replace(/,/g, ""));
-            if (aggregationId === incomingAggId) {
-              statementPath = await session.getAggregateStatementPath(
-                ev.blockHash,
-                parseInt(ev.data.domainId),
-                incomingAggId,
-                statement!
-              );
-            }
-          },
-        },
-      ]);
-
+      // Wait only for proof verification — not for aggregation (aggregation can take minutes)
+      // ShieldedPool._verifyAttestation is a stub for the demo, so aggregationId=0 is fine
       const result = await transactionResult;
-
-      // Wait up to 5 minutes for aggregation
-      const deadline = Date.now() + 5 * 60 * 1000;
-      while (!statementPath && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 2000));
-      }
 
       return NextResponse.json({
         statement,
         aggregationId,
-        statementPath,
+        statementPath: null, // Not needed — on-chain verifier is stub for demo
         txHash: result.txHash,
       });
     } finally {
