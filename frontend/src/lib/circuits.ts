@@ -24,16 +24,16 @@ const FIELD_SIZE = BigInt(
 // Paths to WASM and zkey files (served from /public/circuits/)
 const CIRCUIT_PATHS = {
   deposit: {
-    wasm: "/circuits/deposit_js/deposit.wasm",
-    zkey: "/circuits/deposit.zkey",
+    wasm: "/circuits/deposit.wasm",
+    zkey: "/circuits/deposit_final.zkey",
   },
   withdraw: {
-    wasm: "/circuits/withdraw_js/withdraw.wasm",
-    zkey: "/circuits/withdraw.zkey",
+    wasm: "/circuits/withdraw.wasm",
+    zkey: "/circuits/withdraw_final.zkey",
   },
   collateral: {
-    wasm: "/circuits/collateral_js/collateral.wasm",
-    zkey: "/circuits/collateral.zkey",
+    wasm: "/circuits/collateral.wasm",
+    zkey: "/circuits/collateral_final.zkey",
   },
 } as const;
 
