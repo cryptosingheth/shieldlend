@@ -39,7 +39,7 @@ interface ICollateralVerifier {
         uint256[2] calldata _pA,
         uint256[2][2] calldata _pB,
         uint256[2] calldata _pC,
-        uint256[3] calldata _pubSignals // [borrowed, ratio, 1 (out=1 enforced by circuit)]
+        uint256[2] calldata _pubSignals // [borrowed, ratio] — collateral.circom has nPublic=2
     ) external view returns (bool);
 }
 
@@ -123,9 +123,10 @@ contract LendingPool {
         if (hasActiveLoan[noteNullifierHash]) revert NoteAlreadyUsedAsCollateral();
 
         // 2. Verify the collateral proof via collateral verifier contract
-        // Public signals: [borrowed, MIN_RATIO, 1]
-        // (the "1" is the output of gte.out === 1 from collateral.circom)
-        uint256[3] memory pubSignals = [borrowed, MIN_RATIO, 1];
+        // Public signals: [borrowed, MIN_RATIO]
+        // collateral.circom has nPublic=2: borrowed and ratio are public inputs.
+        // The range constraint (collateral >= ratio/10000 * borrowed) is enforced internally.
+        uint256[2] memory pubSignals = [borrowed, MIN_RATIO];
         if (!collateralVerifier.verifyProof(pA, pB, pC, pubSignals)) {
             revert InvalidCollateralProof();
         }
