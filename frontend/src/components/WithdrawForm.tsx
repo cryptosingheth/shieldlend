@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useAccount, usePublicClient } from "wagmi";
 import { type Address, type Log } from "viem";
 import { useWithdraw } from "@/lib/contracts";
@@ -10,6 +10,7 @@ import {
   type MerklePath,
 } from "@/lib/circuits";
 import { SHIELDED_POOL_ADDRESS, SHIELDED_POOL_ABI, fieldToBytes32 } from "@/lib/contracts";
+import { loadNotes, markNoteSpent, storedNoteToNote, noteLabel, type StoredNote } from "@/lib/noteStorage";
 
 // ShieldedPool was deployed at this block — avoids querying from genesis
 const DEPLOY_BLOCK = 39499000n;
@@ -43,6 +44,15 @@ type ZkVerifyResult = {
 export function WithdrawForm() {
   const { address } = useAccount();
   const publicClient = usePublicClient();
+
+  // Saved notes from vault
+  const [savedNotes, setSavedNotes] = useState<StoredNote[]>([]);
+  const [selectedNullifierHash, setSelectedNullifierHash] = useState<string>("");
+
+  useEffect(() => {
+    if (address) setSavedNotes(loadNotes(address).filter((n) => !n.spent));
+  }, [address]);
+
   const [noteJson, setNoteJson] = useState("");
   const [recipient, setRecipient] = useState(address ?? "");
   const [status, setStatus] = useState<
@@ -113,14 +123,16 @@ export function WithdrawForm() {
   }
 
   async function handleWithdraw() {
-    if (!noteJson.trim()) return setErrorMsg("Paste your note JSON");
+    const hasSelectedNote = !!selectedNullifierHash;
+    if (!hasSelectedNote && !noteJson.trim()) return setErrorMsg("Select a note or paste JSON");
     if (!recipient) return setErrorMsg("Enter recipient address");
 
     try {
       setErrorMsg("");
       setStatus("fetching-path");
 
-      const note = deserializeNote(noteJson);
+      const selectedStored = savedNotes.find((n) => n.nullifierHash === selectedNullifierHash);
+      const note = selectedStored ? storedNoteToNote(selectedStored) : deserializeNote(noteJson);
       if (!publicClient) throw new Error("No public client");
 
       // Get current root and leaf index from on-chain events
@@ -172,6 +184,11 @@ export function WithdrawForm() {
 
       setStatus("done");
       setTxHash(zkResult.txHash);
+      // Mark note as spent in vault so it won't appear in future dropdowns
+      if (address && (selectedNullifierHash || fieldToBytes32(note.nullifierHash))) {
+        markNoteSpent(address, selectedNullifierHash || fieldToBytes32(note.nullifierHash));
+        setSavedNotes((prev) => prev.filter((n) => n.nullifierHash !== selectedNullifierHash));
+      }
     } catch (err) {
       setStatus("error");
       setErrorMsg(err instanceof Error ? err.message : "Unknown error");
@@ -198,15 +215,33 @@ export function WithdrawForm() {
     <div className="space-y-5">
       <div>
         <label className="block text-sm text-zinc-400 mb-2">Note (from deposit)</label>
-        <textarea
-          value={noteJson}
-          onChange={(e) => setNoteJson(e.target.value)}
-          placeholder='{"nullifier":"...","secret":"...","amount":"...","commitment":"...","nullifierHash":"..."}'
-          disabled={isLoading}
-          rows={4}
-          className="w-full bg-zinc-900 border border-zinc-700 rounded-lg px-4 py-3 text-xs font-mono
-                     focus:outline-none focus:border-indigo-500 disabled:opacity-50 resize-none transition-colors"
-        />
+        {savedNotes.length > 0 && (
+          <select
+            value={selectedNullifierHash}
+            onChange={(e) => { setSelectedNullifierHash(e.target.value); setNoteJson(""); }}
+            disabled={isLoading}
+            className="w-full bg-zinc-900 border border-zinc-700 rounded-lg px-4 py-3 text-sm
+                       focus:outline-none focus:border-indigo-500 disabled:opacity-50 transition-colors mb-2"
+          >
+            <option value="">— Select a saved note —</option>
+            {savedNotes.map((n) => (
+              <option key={n.nullifierHash} value={n.nullifierHash}>
+                {noteLabel(n)}
+              </option>
+            ))}
+          </select>
+        )}
+        {!selectedNullifierHash && (
+          <textarea
+            value={noteJson}
+            onChange={(e) => setNoteJson(e.target.value)}
+            placeholder='{"nullifier":"...","secret":"...","amount":"...","commitment":"...","nullifierHash":"..."}'
+            disabled={isLoading}
+            rows={4}
+            className="w-full bg-zinc-900 border border-zinc-700 rounded-lg px-4 py-3 text-xs font-mono
+                       focus:outline-none focus:border-indigo-500 disabled:opacity-50 resize-none transition-colors"
+          />
+        )}
       </div>
 
       <div>
@@ -227,7 +262,7 @@ export function WithdrawForm() {
 
       <button
         onClick={handleWithdraw}
-        disabled={isLoading || !noteJson}
+        disabled={isLoading || (!noteJson && !selectedNullifierHash)}
         className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed
                    text-white font-medium py-3 rounded-lg transition-colors text-sm"
       >

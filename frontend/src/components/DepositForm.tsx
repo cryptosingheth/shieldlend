@@ -5,8 +5,11 @@ import { parseEther } from "viem";
 import { useDeposit } from "@/lib/contracts";
 import { createNote, serializeNote } from "@/lib/circuits";
 import { fieldToBytes32 } from "@/lib/contracts";
+import { saveNote } from "@/lib/noteStorage";
+import { useAccount } from "wagmi";
 
 export function DepositForm() {
+  const { address } = useAccount();
   const [amountEth, setAmountEth] = useState("");
   const [status, setStatus] = useState<"idle" | "generating" | "submitting" | "done" | "error">(
     "idle"
@@ -31,8 +34,9 @@ export function DepositForm() {
       const serialized = serializeNote(newNote);
       const commitment = fieldToBytes32(newNote.commitment);
 
-      // Save note immediately — user must back this up
+      // Save note to vault + legacy key for backwards compat
       setNote(serialized);
+      if (address) saveNote(address, newNote);
       localStorage.setItem(`shieldlend_note_${commitment}`, serialized);
 
       setStatus("submitting");
