@@ -17,8 +17,18 @@ import {CollateralVerifier} from "../src/verifiers/CollateralVerifier.sol";
  * Every test calls verifyProof with genuine BN128 curve points.
  * Anvil ships the BN128 precompiles (ecAdd, ecMul, ecPairing) so
  * the full pairing check runs in Foundry without any mocking.
+ *
+ * Unhappy paths:
+ *   - `publicSignal_notInScalarField_*` — public input ≥ BN254 scalar field order `r`.
+ *     The verifier’s assembly `checkField` rejects these before pairing (Groth16 public
+ *     inputs must lie in 𝔽_r). Forge coverage may still show 0% branch hit rate inside
+ *     `assembly { ... }` because instrumentation does not map Yul branches to Solidity.
  */
 contract Groth16VerifiersTest is Test {
+    /// @dev Same constant as `r` in snarkJS-generated verifiers (BN254 scalar field order).
+    uint256 internal constant BN254_SCALAR_FIELD_ORDER =
+        21888242871839275222246405745257275088548364400416034343698204186575808495617;
+
     DepositVerifier deposit;
     WithdrawVerifier withdraw;
     CollateralVerifier collateral;
@@ -100,6 +110,34 @@ contract Groth16VerifiersTest is Test {
         assertFalse(deposit.verifyProof(pA, pB, pC, pub), "Zero/dummy proof must fail");
     }
 
+    function test_deposit_publicSignal_notInScalarField_slot0() public view {
+        (uint[2] memory pA, uint[2][2] memory pB, uint[2] memory pC) = _depositValidProofTuple();
+        uint[3] memory pub = _depositValidPub();
+        pub[0] = BN254_SCALAR_FIELD_ORDER;
+        assertFalse(deposit.verifyProof(pA, pB, pC, pub), "pub[0] >= r must fail checkField");
+    }
+
+    function test_deposit_publicSignal_notInScalarField_slot1() public view {
+        (uint[2] memory pA, uint[2][2] memory pB, uint[2] memory pC) = _depositValidProofTuple();
+        uint[3] memory pub = _depositValidPub();
+        pub[1] = BN254_SCALAR_FIELD_ORDER;
+        assertFalse(deposit.verifyProof(pA, pB, pC, pub), "pub[1] >= r must fail checkField");
+    }
+
+    function test_deposit_publicSignal_notInScalarField_slot2() public view {
+        (uint[2] memory pA, uint[2][2] memory pB, uint[2] memory pC) = _depositValidProofTuple();
+        uint[3] memory pub = _depositValidPub();
+        pub[2] = BN254_SCALAR_FIELD_ORDER;
+        assertFalse(deposit.verifyProof(pA, pB, pC, pub), "pub[2] >= r must fail checkField");
+    }
+
+    function test_deposit_publicSignal_notInScalarField_aboveR() public view {
+        (uint[2] memory pA, uint[2][2] memory pB, uint[2] memory pC) = _depositValidProofTuple();
+        uint[3] memory pub = _depositValidPub();
+        pub[0] = BN254_SCALAR_FIELD_ORDER + 1;
+        assertFalse(deposit.verifyProof(pA, pB, pC, pub), "pub[0] > r must fail checkField");
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     //  WITHDRAW VERIFIER
     // ═══════════════════════════════════════════════════════════════════════════
@@ -173,6 +211,34 @@ contract Groth16VerifiersTest is Test {
         assertFalse(withdraw.verifyProof(pA, pB, pC, pub), "Zero/dummy proof must fail");
     }
 
+    function test_withdraw_publicSignal_notInScalarField_slot0() public view {
+        (uint[2] memory pA, uint[2][2] memory pB, uint[2] memory pC) = _withdrawValidProofTuple();
+        uint[4] memory pub = _withdrawValidPub();
+        pub[0] = BN254_SCALAR_FIELD_ORDER;
+        assertFalse(withdraw.verifyProof(pA, pB, pC, pub), "pub[0] >= r must fail checkField");
+    }
+
+    function test_withdraw_publicSignal_notInScalarField_slot1() public view {
+        (uint[2] memory pA, uint[2][2] memory pB, uint[2] memory pC) = _withdrawValidProofTuple();
+        uint[4] memory pub = _withdrawValidPub();
+        pub[1] = BN254_SCALAR_FIELD_ORDER;
+        assertFalse(withdraw.verifyProof(pA, pB, pC, pub), "pub[1] >= r must fail checkField");
+    }
+
+    function test_withdraw_publicSignal_notInScalarField_slot2() public view {
+        (uint[2] memory pA, uint[2][2] memory pB, uint[2] memory pC) = _withdrawValidProofTuple();
+        uint[4] memory pub = _withdrawValidPub();
+        pub[2] = BN254_SCALAR_FIELD_ORDER;
+        assertFalse(withdraw.verifyProof(pA, pB, pC, pub), "pub[2] >= r must fail checkField");
+    }
+
+    function test_withdraw_publicSignal_notInScalarField_slot3() public view {
+        (uint[2] memory pA, uint[2][2] memory pB, uint[2] memory pC) = _withdrawValidProofTuple();
+        uint[4] memory pub = _withdrawValidPub();
+        pub[3] = BN254_SCALAR_FIELD_ORDER;
+        assertFalse(withdraw.verifyProof(pA, pB, pC, pub), "pub[3] >= r must fail checkField");
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     //  COLLATERAL VERIFIER
     // ═══════════════════════════════════════════════════════════════════════════
@@ -237,5 +303,113 @@ contract Groth16VerifiersTest is Test {
         uint[2] memory pub = [uint256(0), uint256(0)];
 
         assertFalse(collateral.verifyProof(pA, pB, pC, pub), "Zero/dummy proof must fail");
+    }
+
+    function test_collateral_publicSignal_notInScalarField_slot0() public view {
+        (uint[2] memory pA, uint[2][2] memory pB, uint[2] memory pC) = _collateralValidProofTuple();
+        uint[2] memory pub = [uint256(1000), uint256(15000)];
+        pub[0] = BN254_SCALAR_FIELD_ORDER;
+        assertFalse(collateral.verifyProof(pA, pB, pC, pub), "pub[0] >= r must fail checkField");
+    }
+
+    function test_collateral_publicSignal_notInScalarField_slot1() public view {
+        (uint[2] memory pA, uint[2][2] memory pB, uint[2] memory pC) = _collateralValidProofTuple();
+        uint[2] memory pub = [uint256(1000), uint256(15000)];
+        pub[1] = BN254_SCALAR_FIELD_ORDER;
+        assertFalse(collateral.verifyProof(pA, pB, pC, pub), "pub[1] >= r must fail checkField");
+    }
+
+    // ── Shared fixtures (same values as the passing tests above) ─────────────
+
+    function _depositValidProofTuple()
+        internal
+        pure
+        returns (uint[2] memory pA, uint[2][2] memory pB, uint[2] memory pC)
+    {
+        pA = [
+            0x0a3c974adfc51d6e6e5c8134fe6fc10d8f64e5151b8346100f334ec10c8fdadb,
+            0x30237ef2843077d7026f73f8a68815b427209530f311e651041a6073cf62e489
+        ];
+        pB = [
+            [
+                0x1b886d354c485c6ffb2538f6447a33c2af339528793898ebb2ef5864fc4b58f2,
+                0x19f65d4114760b53fd4e2d8235a5fa80330902cf4a047cd9a3e9fe0d09b8c478
+            ],
+            [
+                0x0f3f2a681203dfd63f95447f43bcbb229ef0465ac1aa546c93aac75d2f5c741e,
+                0x2f188288970786a6e2624a0f641b75b251256417b442b4af10d713cc0ffaa4ca
+            ]
+        ];
+        pC = [
+            0x009e13c5ba22c24c8974231233935557ce685e314bada27013355ab59dce4519,
+            0x1284bdb9960ed9690f85dffe00eaa432fec51abf7dec754d03964f1ba2e61d18
+        ];
+    }
+
+    function _depositValidPub() internal pure returns (uint[3] memory) {
+        return [
+            uint256(0x179fedf5af8a0276d28600cc1cfd5324688dcd66029713234b6dab21500ed617),
+            uint256(0x15e57b5244f1786e69d887cf6ebc5e2b25f3fc0b7520583029bc377982a66536),
+            uint256(1000)
+        ];
+    }
+
+    function _withdrawValidProofTuple()
+        internal
+        pure
+        returns (uint[2] memory pA, uint[2][2] memory pB, uint[2] memory pC)
+    {
+        pA = [
+            0x0ea9ead11bbe1015bf0b28c0612b38ce24c169abbd03cec376bceb7713e3dd02,
+            0x25b2939925f5fcc99163677606e562cd814c9d622730a0c7dd39f2f1a4444241
+        ];
+        pB = [
+            [
+                0x1ad3a1d4fd40db2ba89912f9dbb8658146dc0b6c8bde6b0a9b70c9dbbb78428e,
+                0x2a4b1fa8d7a0ab3dbbbeb68a29a86538ea1f69b86e226211af2623bf6d023f24
+            ],
+            [
+                0x0419afdefcf1ee942d7baaa884c51e962cf794d5a6da456cc11969b31e74db69,
+                0x036768f54d47c7e41a6d43d3f68ce78d75ede42855758cc100fab4e1be22455c
+            ]
+        ];
+        pC = [
+            0x01c2fbb69d84c9c0ad8999c864ce21cca72baf981e84c0c73ea60d3af0c7f26b,
+            0x021ca30db18dbc51473cc4a1730a16c7f4e011ae2914e83cdec703033ca8ace0
+        ];
+    }
+
+    function _withdrawValidPub() internal pure returns (uint[4] memory) {
+        return [
+            uint256(0x27a838833c6fbb3b6b045366db4ab4fe9ab8345d4122937a4379d7dbd76a8bff),
+            uint256(0x15e57b5244f1786e69d887cf6ebc5e2b25f3fc0b7520583029bc377982a66536),
+            uint256(0xbc614e),
+            uint256(1000)
+        ];
+    }
+
+    function _collateralValidProofTuple()
+        internal
+        pure
+        returns (uint[2] memory pA, uint[2][2] memory pB, uint[2] memory pC)
+    {
+        pA = [
+            0x2294b7045b0ae406440157f7e30cc9e6f2de895a44906f0f65ec66861603fb78,
+            0x2ac32a317266990bc3e7b28c04f3a8ce40d9a6518d268f4620e8a39320c4008c
+        ];
+        pB = [
+            [
+                0x09af9a87f7b7746700018dee10d1d42d3aebc0ed953c6f855de89bd724701b08,
+                0x1ebd060f891094b7c5aca2e1ab6409fee675907e82ef768da038d7c4f7fcef76
+            ],
+            [
+                0x25d109144bc8749f3791d7bc7d89ef92a460f8c8c12f9e388c6c5197b07a659a,
+                0x04295e0d2ef3455b4212aaf1056efc8cbfa8b22d0970e842c3d71b84241b9734
+            ]
+        ];
+        pC = [
+            0x1d22ea8df8ab155649aa49774150c0694f0752a1f75a6afe95e0199a37263a2d,
+            0x01632f3a48ffa67024b2a96e6124dcb25bf3754af19196816a1dad22596e8858
+        ];
     }
 }
