@@ -60,12 +60,15 @@ function MetricCard({ label, value, sub }: { label: string; value: string; sub?:
 export function Dashboard() {
   const { address } = useAccount();
   const publicClient = usePublicClient();
+  const [mounted, setMounted] = useState(false);
 
   const [stats, setStats] = useState<PoolStats | null>(null);
   const [userLoans, setUserLoans] = useState<UserLoan[]>([]);
   const [savedNotes, setSavedNotes] = useState<StoredNote[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+
+  useEffect(() => { setMounted(true); }, []);
 
   useEffect(() => {
     if (address) setSavedNotes(loadNotes(address));
@@ -85,20 +88,24 @@ export function Dashboard() {
           functionName: "nextIndex",
         }) as number;
 
-        // Deposit events → aggregate TVL
-        const depositLogs = await getAllLogs(publicClient!, SHIELDED_POOL_ADDRESS);
+        // Event topic0 hashes (must match ShieldedPool events exactly)
+        const TOPIC_DEPOSIT    = "0x5371f021da83c329fcf7058e2039d7c7384459a19a13baed1a0d9efbfb9d0ee6";
+        const TOPIC_WITHDRAWAL = "0x4206db6775563d1043abfcf27cd0ecd19fcc464be574a1487fc95b24957a671a";
+
+        // TVL = sum(deposits) - sum(withdrawals)
+        const poolLogs = await getAllLogs(publicClient!, SHIELDED_POOL_ADDRESS);
         let tvl = 0n;
-        for (const log of depositLogs) {
-          // Deposit event: (bytes32 commitment, uint32 leafIndex, uint256 timestamp, uint256 amount)
-          if (log.topics.length >= 2 && log.data.length >= 130) {
-            // amount is the 4th field in data (3rd uint256 after leafIndex and timestamp)
-            // data layout: leafIndex(32) + timestamp(32) + amount(32)
-            const amountHex = log.data.slice(130, 194);
-            if (amountHex.length === 64) {
-              tvl += BigInt("0x" + amountHex);
-            }
+        for (const log of poolLogs) {
+          const t0 = log.topics[0] as string;
+          if (t0 === TOPIC_DEPOSIT && log.data.length >= 194) {
+            // Deposit data: [leafIndex(32B), timestamp(32B), amount(32B)] → slot 2
+            try { tvl += BigInt("0x" + log.data.slice(130, 194)); } catch {}
+          } else if (t0 === TOPIC_WITHDRAWAL && log.data.length >= 130) {
+            // Withdrawal data: [nullifierHash(32B), amount(32B)] → slot 1
+            try { tvl -= BigInt("0x" + log.data.slice(66, 130)); } catch {}
           }
         }
+        if (tvl < 0n) tvl = 0n; // guard against parsing errors
 
         // Borrowed events → aggregate active borrows (rough — doesn't subtract repaid)
         const borrowLogs = await getAllLogs(publicClient!, LENDING_POOL_ADDRESS);
@@ -155,6 +162,9 @@ export function Dashboard() {
 
   const activeNotes = savedNotes.filter((n) => !n.spent);
   const spentNotes = savedNotes.filter((n) => n.spent);
+
+  // Prevent hydration mismatch — wagmi address is only available client-side
+  if (!mounted) return null;
 
   return (
     <div className="space-y-8">

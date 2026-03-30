@@ -1,9 +1,9 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { parseEther } from "viem";
 import { useDeposit } from "@/lib/contracts";
-import { createNote, serializeNote } from "@/lib/circuits";
+import { createNote, serializeNote, type Note } from "@/lib/circuits";
 import { fieldToBytes32 } from "@/lib/contracts";
 import { saveNote } from "@/lib/noteStorage";
 import { useAccount } from "wagmi";
@@ -14,9 +14,22 @@ export function DepositForm() {
   const [status, setStatus] = useState<"idle" | "generating" | "submitting" | "done" | "error">(
     "idle"
   );
-  const [note, setNote] = useState<string | null>(null);
+  const [noteDisplay, setNoteDisplay] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState("");
-  const { deposit, isPending, isConfirming, isSuccess } = useDeposit();
+
+  // Hold pending note in a ref — survives re-renders, cleared after vault save
+  const pendingNote = useRef<Note | null>(null);
+
+  const { deposit, hash, isPending, isConfirming, isSuccess } = useDeposit();
+
+  // Save note to vault ONLY after tx is confirmed on-chain
+  useEffect(() => {
+    if (isSuccess && pendingNote.current && address) {
+      saveNote(address, pendingNote.current, hash);
+      pendingNote.current = null;
+      setStatus("done");
+    }
+  }, [isSuccess, address, hash]);
 
   async function handleDeposit() {
     if (!amountEth || isNaN(Number(amountEth)) || Number(amountEth) <= 0) {
@@ -29,21 +42,23 @@ export function DepositForm() {
       setErrorMsg("");
 
       const amount = parseEther(amountEth);
-      // createNote generates random nullifier + secret and computes commitment
       const newNote = await createNote(amount);
       const serialized = serializeNote(newNote);
-      const commitment = fieldToBytes32(newNote.commitment);
 
-      // Save note to vault + legacy key for backwards compat
-      setNote(serialized);
-      if (address) saveNote(address, newNote);
-      localStorage.setItem(`shieldlend_note_${commitment}`, serialized);
+      // Show note immediately so user can back it up while tx is in-flight
+      setNoteDisplay(serialized);
+      // Store in ref — saved to vault only after tx confirms
+      pendingNote.current = newNote;
 
       setStatus("submitting");
-      await deposit(commitment, amount);
+      await deposit(fieldToBytes32(newNote.commitment), amount);
+      // Note: vault save happens in the useEffect above when isSuccess fires
     } catch (err) {
       setStatus("error");
       setErrorMsg(err instanceof Error ? err.message : "Unknown error");
+      // Tx was rejected/failed — discard pending note, it was never deposited
+      pendingNote.current = null;
+      setNoteDisplay(null);
     }
   }
 
@@ -77,7 +92,7 @@ export function DepositForm() {
           : isPending
           ? "Confirm in wallet..."
           : isConfirming
-          ? "Confirming..."
+          ? "Confirming on-chain..."
           : "Deposit"}
       </button>
 
@@ -87,28 +102,32 @@ export function DepositForm() {
         </p>
       )}
 
-      {note && (
+      {/* Show note while tx is in-flight — user should back it up now */}
+      {noteDisplay && !isSuccess && (
         <div className="border border-amber-800 rounded-lg p-4 bg-amber-950/30">
           <p className="text-amber-400 text-xs font-semibold mb-2 uppercase tracking-wider">
-            Save your note — you cannot recover it
+            Back up your note now — waiting for confirmation
           </p>
           <textarea
             readOnly
-            value={note}
+            value={noteDisplay}
             className="w-full bg-transparent text-xs font-mono text-zinc-300 resize-none h-24
                        border border-zinc-800 rounded p-2 focus:outline-none"
           />
           <p className="text-xs text-zinc-500 mt-2">
-            This note is your proof of deposit. Store it securely — losing it means losing access
-            to your funds.
+            Copy this note before the transaction confirms. It will be auto-saved to your vault
+            once confirmed.
           </p>
         </div>
       )}
 
       {isSuccess && (
-        <p className="text-sm text-green-400">
-          Deposit confirmed. Your funds are now in the shielded pool.
-        </p>
+        <div className="border border-green-800 rounded-lg p-4 bg-green-950/20">
+          <p className="text-sm text-green-400 font-medium">Deposit confirmed.</p>
+          <p className="text-xs text-zinc-500 mt-1">
+            Your note has been saved to your vault. Funds are in the shielded pool.
+          </p>
+        </div>
       )}
     </div>
   );
