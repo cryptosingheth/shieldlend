@@ -153,6 +153,8 @@ Proves that collateral meets the minimum ratio requirement without revealing the
 
 See [`docs/circuits.md`](docs/circuits.md) for full signal definitions and constraint derivations.
 
+See [`docs/verification.md`](docs/verification.md) for Groth16 vs zkVerify verification, regenerating proofs (`scripts/gen_test_proofs.js`), and Foundry verifier tests.
+
 ---
 
 ## Smart Contracts

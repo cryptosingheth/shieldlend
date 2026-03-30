@@ -181,30 +181,92 @@ If `min_ratio = 150` (150% collateralization) and `borrowed_amount = 1000 USDC`:
 
 ---
 
-## Trusted Setup
+    ## Trusted Setup and Recompiling Circuits
 
 Groth16 requires a per-circuit trusted setup (unlike PLONK which uses a universal setup).
 
+### Prerequisites
+
+- [Circom](https://docs.circom.io/getting-started/installation/) (2.x; circuits use `pragma circom 2.1.6`)
+- [snarkjs](https://github.com/iden3/snarkjs) on your `PATH`
+- From the **repository root**: `npm install` (circuits include `circomlib` via `../node_modules/circomlib/...`, so compilation must be run from `circuits/` after dependencies are installed)
+
+All commands below assume your current working directory is **`circuits/`**.
+
+### One-time: Powers of Tau
+
+Use a Powers-of-Tau file whose size is **at least** your circuit’s constraint count (snarkjs will error if the `.ptau` is too small). `pot12_final.ptau` supports up to \(2^{12}\) constraints. If `withdraw` (or any circuit) exceeds that, download a larger Hermez final file (e.g. `powersOfTau28_hez_final_16.ptau` or higher) and point `snarkjs groth16 setup` at it instead.
+
 ```bash
-# Step 1: Download an existing Powers of Tau file (Hermez ceremony)
-# pot12_final.ptau supports circuits up to 2^12 = 4096 constraints
+mkdir -p build keys
 wget https://hermez.s3-eu-west-1.amazonaws.com/powersOfTau28_hez_final_12.ptau \
-     -O pot12_final.ptau
-
-# Step 2: Per-circuit setup
-circom deposit.circom --r1cs --wasm --sym -o build/
-snarkjs groth16 setup build/deposit.r1cs pot12_final.ptau keys/deposit_0000.zkey
-
-# Step 3: Export verification key
-snarkjs zkey export verificationkey keys/deposit_0000.zkey keys/deposit_vkey.json
-
-# Step 4: Export Solidity verifier
-snarkjs zkey export solidityverifier keys/deposit_0000.zkey contracts/src/DepositVerifier.sol
-
-# Repeat for withdraw.circom and collateral.circom
+     -O keys/pot12_final.ptau
 ```
 
+Keep this file and reuse it for every circuit; it is **not** circuit-specific.
+
+### Recompiling all circuits (full pipeline)
+
+After you change any `.circom` file, rerun **compile → setup → export** for that circuit. To refresh **everything** (artifacts + Solidity verifiers), run the following from `circuits/`.
+
+**1. Compile each circuit** (R1CS + WASM + symbols for debugging):
+
+```bash
+circom deposit.circom    --r1cs --wasm --sym -o build/
+circom withdraw.circom   --r1cs --wasm --sym -o build/
+circom collateral.circom --r1cs --wasm --sym -o build/
+```
+
+**2. Groth16 setup** (one new `.zkey` per circuit — replaces previous keys for that circuit):
+
+```bash
+snarkjs groth16 setup build/deposit.r1cs    keys/pot12_final.ptau keys/deposit_0000.zkey
+snarkjs groth16 setup build/withdraw.r1cs   keys/pot12_final.ptau keys/withdraw_0000.zkey
+snarkjs groth16 setup build/collateral.r1cs keys/pot12_final.ptau keys/collateral_0000.zkey
+```
+
+**3. Export verification keys** (JSON, for front-end / tooling):
+
+```bash
+snarkjs zkey export verificationkey keys/deposit_0000.zkey    keys/deposit_vkey.json
+snarkjs zkey export verificationkey keys/withdraw_0000.zkey   keys/withdraw_vkey.json
+snarkjs zkey export verificationkey keys/collateral_0000.zkey keys/collateral_vkey.json
+```
+
+**4. Export Solidity verifiers** (into this repo’s `contracts/src/verifiers/`):
+
+```bash
+snarkjs zkey export solidityverifier keys/deposit_0000.zkey    ../contracts/src/verifiers/DepositVerifier.sol
+snarkjs zkey export solidityverifier keys/withdraw_0000.zkey   ../contracts/src/verifiers/WithdrawVerifier.sol
+snarkjs zkey export solidityverifier keys/collateral_0000.zkey ../contracts/src/verifiers/CollateralVerifier.sol
+```
+
+**Outputs**
+
+| Stage | Location |
+|--------|-----------|
+| R1CS, WASM, `.sym` | `circuits/build/` |
+| Proving keys | `circuits/keys/<name>_0000.zkey` |
+| Verification key JSON | `circuits/keys/<name>_vkey.json` |
+| On-chain verifier contracts | `contracts/src/verifiers/*Verifier.sol` |
+
+**After regenerating verifiers**, redeploy those contracts (or upgrade your deployment) so on-chain bytecode matches the new verification keys. Old proofs or addresses from a previous setup will not match new `.zkey` / verifier bytecode.
+
+### Single-circuit refresh
+
+If only one circuit changed, run the `circom`, `snarkjs groth16 setup`, `export verificationkey`, and `export solidityverifier` lines for that circuit only.
+
 **Note on toxic waste**: In the `groth16 setup` command, if you use `snarkjs zkey contribute` to add randomness, the randomness used is "toxic waste" — if it leaks, the proof system is compromised. For the testnet MVP, a single-party setup is used. For production, a multi-party ceremony with public participants would be required.
+
+### Proof verification, test artifacts, and Foundry
+
+See **[verification.md](./verification.md)** for:
+
+- How **Groth16 `verifyProof`** works on-chain (public inputs, pairing, precompiles).
+- How **zkVerify aggregation** relates to `ShieldedPool` (statement leaf vs Solidity verifiers).
+- **`scripts/gen_test_proofs.js`**: regenerating `circuits/build/test_proofs.json` and Solidity calldata.
+- **`contracts/test/Groth16Verifiers.t.sol`**: running real verifier tests with `forge test`.
+- A full **compile → zkey → export verifier → generate proofs** checklist when circuits change.
 
 ---
 
