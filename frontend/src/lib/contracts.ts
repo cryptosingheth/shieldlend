@@ -34,9 +34,11 @@ export const SHIELDED_POOL_ABI = parseAbi([
   "function getLastRoot() view returns (bytes32)",
   "function isKnownRoot(bytes32 root) view returns (bool)",
   "function nextIndex() view returns (uint32)",
+  "function statementHash(uint256[] inputs) view returns (bytes32)",
   // Write
   "function deposit(bytes32 commitment) payable",
-  "function withdraw(bytes proof, bytes32 root, bytes32 nullifierHash, address recipient, uint256 amount, uint256 attestationId)",
+  // New withdraw signature (post-dev-merge): removed `bytes proof`, added aggregation proof params
+  "function withdraw(bytes32 root, bytes32 nullifierHash, address recipient, uint256 amount, uint256 domainId, uint256 aggregationId, bytes32[] merklePath, uint256 leafCount, uint256 leafIndex)",
   // Events
   "event Deposit(bytes32 indexed commitment, uint32 leafIndex, uint256 timestamp, uint256 amount)",
   "event Withdrawal(address indexed recipient, bytes32 nullifierHash, uint256 amount)",
@@ -126,22 +128,30 @@ export function useDeposit() {
 }
 
 export function useWithdraw() {
-  const { writeContract, data: hash, isPending, error } = useWriteContract();
+  const { writeContractAsync, data: hash, isPending, error } = useWriteContract();
   const { isLoading: isConfirming, isSuccess } = useWaitForTransactionReceipt({ hash });
+  const { switchChainAsync } = useSwitchChain();
+  const chainId = useChainId();
 
-  const withdraw = (
-    proof: `0x${string}`,
+  const withdraw = async (
     root: `0x${string}`,
     nullifierHash: `0x${string}`,
     recipient: Address,
     amount: bigint,
-    attestationId: bigint
+    domainId: bigint,
+    aggregationId: bigint,
+    merklePath: `0x${string}`[],
+    leafCount: bigint,
+    leafIndex: bigint
   ) => {
-    writeContract({
+    if (chainId !== baseSepolia.id) {
+      await switchChainAsync({ chainId: baseSepolia.id });
+    }
+    return writeContractAsync({
       address: SHIELDED_POOL_ADDRESS,
       abi: SHIELDED_POOL_ABI,
       functionName: "withdraw",
-      args: [proof, root, nullifierHash, recipient, amount, attestationId],
+      args: [root, nullifierHash, recipient, amount, domainId, aggregationId, merklePath, leafCount, leafIndex],
     });
   };
 

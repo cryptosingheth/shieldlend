@@ -33,7 +33,10 @@ async function getAllLogs(
 type ZkVerifyResult = {
   statement: string;
   aggregationId: number;
-  statementPath: unknown;
+  domainId: number;
+  merklePath: string[];
+  leafCount: number;
+  leafIndex: number;
   txHash: string;
 };
 
@@ -155,14 +158,16 @@ export function WithdrawForm() {
       setStatus("submitting");
       const nullifierHashHex = fieldToBytes32(note.nullifierHash);
 
-      // statementPath encodes the aggregation proof for on-chain verification
-      withdraw(
-        "0x" as `0x${string}`, // proof bytes (zkVerify handles verification via statementPath)
+      await withdraw(
         currentRoot,
         nullifierHashHex,
         recipient as Address,
         note.amount,
-        BigInt(zkResult.aggregationId)
+        BigInt(zkResult.domainId ?? 0),
+        BigInt(zkResult.aggregationId),
+        (zkResult.merklePath ?? []) as `0x${string}`[],
+        BigInt(zkResult.leafCount ?? 1),
+        BigInt(zkResult.leafIndex ?? 0)
       );
 
       setStatus("done");
