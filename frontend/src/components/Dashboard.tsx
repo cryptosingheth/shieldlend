@@ -12,12 +12,14 @@ const CHUNK_SIZE = 9000n;
 
 async function getAllLogs(
   publicClient: ReturnType<typeof usePublicClient>,
-  address: `0x${string}`
+  address: `0x${string}`,
+  signal?: AbortSignal
 ) {
   if (!publicClient) return [];
   const latest = await publicClient.getBlockNumber();
   const allLogs = [];
   for (let from = DEPLOY_BLOCK; from <= latest; from += CHUNK_SIZE) {
+    if (signal?.aborted) return [];
     const to = from + CHUNK_SIZE - 1n < latest ? from + CHUNK_SIZE - 1n : latest;
     const chunk = await publicClient.getLogs({ address, fromBlock: from, toBlock: to });
     allLogs.push(...chunk);
@@ -76,6 +78,8 @@ export function Dashboard() {
 
   useEffect(() => {
     if (!publicClient) return;
+    const controller = new AbortController();
+    const { signal } = controller;
 
     async function fetchStats() {
       try {
@@ -93,7 +97,7 @@ export function Dashboard() {
         const TOPIC_WITHDRAWAL = "0x4206db6775563d1043abfcf27cd0ecd19fcc464be574a1487fc95b24957a671a";
 
         // TVL = sum(deposits) - sum(withdrawals)
-        const poolLogs = await getAllLogs(publicClient!, SHIELDED_POOL_ADDRESS);
+        const poolLogs = await getAllLogs(publicClient!, SHIELDED_POOL_ADDRESS, signal);
         let tvl = 0n;
         for (const log of poolLogs) {
           const t0 = log.topics[0] as string;
@@ -108,7 +112,7 @@ export function Dashboard() {
         if (tvl < 0n) tvl = 0n; // guard against parsing errors
 
         // Borrowed events → aggregate active borrows (rough — doesn't subtract repaid)
-        const borrowLogs = await getAllLogs(publicClient!, LENDING_POOL_ADDRESS);
+        const borrowLogs = await getAllLogs(publicClient!, LENDING_POOL_ADDRESS, signal);
         let totalBorrowed = 0n;
         const loanIds: number[] = [];
         for (const log of borrowLogs) {
@@ -151,13 +155,15 @@ export function Dashboard() {
           setUserLoans(details);
         }
       } catch (err) {
+        if (err instanceof Error && err.name === "AbortError") return;
         setError(err instanceof Error ? err.message : "Failed to load stats");
       } finally {
-        setLoading(false);
+        if (!signal.aborted) setLoading(false);
       }
     }
 
     fetchStats();
+    return () => controller.abort();
   }, [publicClient, address]);
 
   const activeNotes = savedNotes.filter((n) => !n.spent);

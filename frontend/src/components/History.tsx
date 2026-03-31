@@ -22,12 +22,14 @@ const CHUNK_SIZE = 9000n;
 
 async function getAllLogs(
   publicClient: ReturnType<typeof usePublicClient>,
-  address: `0x${string}`
+  address: `0x${string}`,
+  signal?: AbortSignal
 ): Promise<RawLog[]> {
   if (!publicClient) return [];
   const latest = await publicClient.getBlockNumber();
   const all: RawLog[] = [];
   for (let from = DEPLOY_BLOCK; from <= latest; from += CHUNK_SIZE) {
+    if (signal?.aborted) return [];
     const to = from + CHUNK_SIZE - 1n < latest ? from + CHUNK_SIZE - 1n : latest;
     const chunk = await publicClient.getLogs({ address, fromBlock: from, toBlock: to });
     all.push(...(chunk as RawLog[]));
@@ -74,6 +76,8 @@ export function History() {
 
   useEffect(() => {
     if (!publicClient) return;
+    const controller = new AbortController();
+    const { signal } = controller;
 
     async function fetchHistory() {
       try {
@@ -81,7 +85,7 @@ export function History() {
         const collected: ProtocolEvent[] = [];
 
         // ── ShieldedPool logs ──────────────────────────────────────────────
-        const poolLogs = await getAllLogs(publicClient!, SHIELDED_POOL_ADDRESS);
+        const poolLogs = await getAllLogs(publicClient!, SHIELDED_POOL_ADDRESS, signal);
         for (const log of poolLogs) {
           const t0 = log.topics[0] as string;
 
@@ -111,7 +115,7 @@ export function History() {
         }
 
         // ── LendingPool logs ───────────────────────────────────────────────
-        const lendingLogs = await getAllLogs(publicClient!, LENDING_POOL_ADDRESS);
+        const lendingLogs = await getAllLogs(publicClient!, LENDING_POOL_ADDRESS, signal);
         for (const log of lendingLogs) {
           const t0 = log.topics[0] as string;
 
@@ -144,13 +148,15 @@ export function History() {
         collected.sort((a, b) => (b.blockNumber > a.blockNumber ? 1 : -1));
         setEvents(collected.slice(0, 50));
       } catch (err) {
+        if (err instanceof Error && err.name === "AbortError") return;
         setError(err instanceof Error ? err.message : "Failed to load history");
       } finally {
-        setLoading(false);
+        if (!signal.aborted) setLoading(false);
       }
     }
 
     fetchHistory();
+    return () => controller.abort();
   }, [publicClient]);
 
   if (loading) {
