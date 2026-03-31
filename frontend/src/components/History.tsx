@@ -15,7 +15,7 @@ const TOPIC_BORROWED    = "0xfee8aa84475025b266c50fc8a54f76b49eddc5d7b92c0061e92
 // cast sig-event "Repaid(uint256,uint256)"
 const TOPIC_REPAID      = "0x81472a96709c8315c82af40d41ef624a642ad53864b097e53af675593bb4e035";
 
-type RawLog = Log & { txHash: `0x${string}` | null };
+type RawLog = Log & { transactionHash: `0x${string}` | null };
 
 const DEPLOY_BLOCK = 39499000n;
 const CHUNK_SIZE = 9000n;
@@ -91,7 +91,7 @@ export function History() {
             const amount = readUint(log.data, 2); // slot 2 = amount
             collected.push({
               type: "deposit",
-              txHash: log.txHash ?? "",
+              txHash: log.transactionHash ?? "",
               blockNumber: log.blockNumber ?? 0n,
               amount,
               shortId: (log.topics[1] as string ?? "").slice(0, 10),
@@ -102,7 +102,7 @@ export function History() {
             const amount = readUint(log.data, 1); // slot 1 = amount
             collected.push({
               type: "withdrawal",
-              txHash: log.txHash ?? "",
+              txHash: log.transactionHash ?? "",
               blockNumber: log.blockNumber ?? 0n,
               amount,
               shortId: (log.topics[1] as string ?? "").slice(0, 10),
@@ -121,7 +121,7 @@ export function History() {
             const amount = readUint(log.data, 0);
             collected.push({
               type: "borrow",
-              txHash: log.txHash ?? "",
+              txHash: log.transactionHash ?? "",
               blockNumber: log.blockNumber ?? 0n,
               amount,
               shortId: (log.topics[1] as string ?? "").slice(0, 10),
@@ -132,7 +132,7 @@ export function History() {
             const amount = readUint(log.data, 0);
             collected.push({
               type: "repay",
-              txHash: log.txHash ?? "",
+              txHash: log.transactionHash ?? "",
               blockNumber: log.blockNumber ?? 0n,
               amount,
               shortId: (log.topics[1] as string ?? "").slice(0, 10),
