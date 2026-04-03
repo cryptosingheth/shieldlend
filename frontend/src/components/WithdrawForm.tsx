@@ -66,9 +66,11 @@ export function WithdrawForm() {
   >("idle");
   const [errorMsg, setErrorMsg] = useState("");
   const [txHash, setTxHash] = useState<string | null>(null);
-  const [pendingFlush, setPendingFlush] = useState(false);
-  // "unknown" = not yet checked, "checking" = fetching logs, "pending" = queued not flushed, "ready" = in tree
-  const [noteFlushStatus, setNoteFlushStatus] = useState<"unknown" | "checking" | "pending" | "ready">("unknown");
+  // Per-note flush status, keyed by nullifierHash.
+  // Built once when savedNotes loads (not per-selection), so switching notes is instant.
+  const [flushStatusMap, setFlushStatusMap] = useState<Map<string, "pending" | "ready">>(new Map());
+  const [checkingFlushStatus, setCheckingFlushStatus] = useState(false);
+
   const { withdraw, isPending, isConfirming, isSuccess } = useWithdraw();
   const { writeContractAsync } = useWriteContract();
 
@@ -79,34 +81,45 @@ export function WithdrawForm() {
     );
   }, [address, noteKey]);
 
-  // ── Note flush status check ───────────────────────────────────────────────
-  // When a note is selected, check whether it has been inserted into the
-  // Merkle tree (LeafInserted event exists) or is still pending epoch flush.
+  // ── Batch flush-status check (runs once per notes-load, not per selection) ──
+  // Fetches all LeafInserted logs once, then marks every saved note as
+  // "pending" or "ready". Switching notes in the dropdown is an O(1) map
+  // lookup — no extra RPC calls, no per-note "checking" delay.
   useEffect(() => {
-    if (!selectedNullifierHash || !publicClient) {
-      setNoteFlushStatus("unknown");
+    if (!publicClient || savedNotes.length === 0) {
+      setFlushStatusMap(new Map());
       return;
     }
-    const note = savedNotes.find((n) => n.nullifierHash === selectedNullifierHash);
-    if (!note) { setNoteFlushStatus("unknown"); return; }
+    let cancelled = false;
+    setCheckingFlushStatus(true);
 
-    setNoteFlushStatus("checking");
-    const commitment = ("0x" + note.commitment.padStart(64, "0")) as `0x${string}`;
+    publicClient.getBlockNumber()
+      .then((snapshotBlock) => getAllLogs(publicClient, SHIELDED_POOL_ADDRESS, snapshotBlock))
+      .then((logs) => {
+        if (cancelled) return;
+        const newMap = new Map<string, "pending" | "ready">();
+        for (const note of savedNotes) {
+          const commitment = ("0x" + note.commitment.padStart(64, "0")) as `0x${string}`;
+          const flushed = logs.some(
+            (l) =>
+              l.topics[0]?.toLowerCase() === LEAF_INSERTED_TOPIC &&
+              l.topics[1]?.toLowerCase() === commitment.toLowerCase()
+          );
+          newMap.set(note.nullifierHash, flushed ? "ready" : "pending");
+        }
+        setFlushStatusMap(newMap);
+        setCheckingFlushStatus(false);
+      })
+      .catch(() => { if (!cancelled) setCheckingFlushStatus(false); });
 
-    // Snapshot the current block number first, then query up to it.
-    // This prevents a race where the latest block advances between
-    // when we start the check and when getLogs executes.
-    publicClient.getBlockNumber().then((snapshotBlock) =>
-      getAllLogs(publicClient, SHIELDED_POOL_ADDRESS, snapshotBlock)
-    ).then((logs) => {
-      const flushed = logs.some(
-        (l) =>
-          l.topics[0]?.toLowerCase() === LEAF_INSERTED_TOPIC &&
-          l.topics[1]?.toLowerCase() === commitment.toLowerCase()
-      );
-      setNoteFlushStatus(flushed ? "ready" : "pending");
-    }).catch(() => setNoteFlushStatus("unknown"));
-  }, [selectedNullifierHash, savedNotes, publicClient]);
+    return () => { cancelled = true; };
+  }, [savedNotes, publicClient]);
+
+  // Derived status for the currently selected note (instant map lookup)
+  const noteFlushStatus: "unknown" | "checking" | "pending" | "ready" =
+    checkingFlushStatus      ? "checking"
+    : !selectedNullifierHash ? "unknown"
+    : (flushStatusMap.get(selectedNullifierHash) ?? "unknown");
 
   // ── Auto-settle preview ────────────────────────────────────────────────────
   // If the selected note has an active loan, show how much the user will receive
@@ -254,6 +267,16 @@ export function WithdrawForm() {
         // LeafInserted event if the node hasn't indexed the new block yet.
         const flushReceipt = await publicClient.waitForTransactionReceipt({ hash: flushTxHash });
 
+        // Mark this note as flushed in the map NOW — before the log re-fetch.
+        // After flush, lastEpochBlock updates to the flush block, which would
+        // reset the pending banner countdown to ~50 blocks. Clearing "pending"
+        // here prevents that banner from reappearing during the slow getAllLogs call.
+        setFlushStatusMap((prev) => {
+          const next = new Map(prev);
+          next.set(selectedNullifierHash, "ready");
+          return next;
+        });
+
         setStatus("fetching-path");
         const freshLogs = await getAllLogs(publicClient, SHIELDED_POOL_ADDRESS, flushReceipt.blockNumber);
         resolvedLeafLog = freshLogs.find((l) =>
@@ -262,8 +285,6 @@ export function WithdrawForm() {
         ) ?? null;
 
         if (!resolvedLeafLog) throw new Error("Flush succeeded but LeafInserted event not found. Try withdrawing again.");
-        setNoteFlushStatus("ready");
-        setPendingFlush(false);
       }
 
       const leafIndex = parseInt(resolvedLeafLog.data.slice(2, 66), 16);
@@ -342,7 +363,12 @@ export function WithdrawForm() {
         {savedNotes.length > 0 && (
           <select
             value={selectedNullifierHash}
-            onChange={(e) => { setSelectedNullifierHash(e.target.value); setNoteJson(""); }}
+            onChange={(e) => {
+              setSelectedNullifierHash(e.target.value);
+              setNoteJson("");
+              setStatus("idle");
+              setErrorMsg("");
+            }}
             disabled={isLoading}
             className="w-full bg-zinc-900 border border-zinc-700 rounded-lg px-4 py-3 text-sm
                        focus:outline-none focus:border-indigo-500 disabled:opacity-50 transition-colors mb-2"
