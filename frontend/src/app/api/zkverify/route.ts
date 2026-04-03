@@ -42,7 +42,7 @@ const ZK_AGG_ABI = parseAbi([
 
 export async function POST(req: NextRequest) {
   try {
-    const { circuit, proof, publicSignals } = await req.json();
+    const { circuit, proof, publicSignals, recipient, amount } = await req.json();
 
     if (!VALID_CIRCUITS.includes(circuit as CircuitName)) {
       return NextResponse.json(
@@ -109,12 +109,27 @@ export async function POST(req: NextRequest) {
           transport: http("https://sepolia.base.org"),
         });
 
-        const inputs = (publicSignals as string[]).map((s) => BigInt(s));
+        // withdraw_ring.circom public signal order: [ring[0..15], nullifierHash, root]
+        // Indices: 0-15 = ring, 16 = nullifierHash, 17 = root
+        const sigs = publicSignals as string[];
+        const rootVal = BigInt(sigs[17]);
+        const nullifierHashVal = BigInt(sigs[16]);
+
+        // Build the 4-input statement that _verifyAttestation computes on-chain:
+        //   statementHash([root, nullifierHash, uint160(recipient), amount])
+        // MUST match exactly — any difference causes verifyProofAggregation to reject.
+        const contractInputs = [
+          rootVal,
+          nullifierHashVal,
+          BigInt(recipient) & ((1n << 160n) - 1n),
+          BigInt(amount),
+        ];
+
         const leaf = await publicClient.readContract({
           address: POOL_ADDRESS,
           abi: SHIELDED_POOL_ABI,
           functionName: "statementHash",
-          args: [inputs],
+          args: [contractInputs],
         });
 
         const aggRoot = keccak256(encodePacked(["bytes32"], [leaf as `0x${string}`]));

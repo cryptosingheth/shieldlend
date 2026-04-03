@@ -29,7 +29,11 @@ async function getAllLogs(
   address: `0x${string}`,
   upToBlock?: bigint  // if provided, ensures logs include this block (avoids race after flush)
 ): Promise<Log[]> {
-  const latest = upToBlock ?? await publicClient.getBlockNumber();
+  // Subtract a 2-block safety margin: eth_blockNumber may return a value
+  // slightly ahead of what the node has indexed for eth_getLogs, causing
+  // "block range extends beyond current head block" on the last chunk.
+  const rawLatest = upToBlock ?? await publicClient.getBlockNumber();
+  const latest = rawLatest > 2n ? rawLatest - 2n : rawLatest;
   const allLogs: Log[] = [];
   for (let from = DEPLOY_BLOCK; from <= latest; from += CHUNK_SIZE) {
     const to = from + CHUNK_SIZE - 1n < latest ? from + CHUNK_SIZE - 1n : latest;
@@ -306,7 +310,13 @@ export function WithdrawForm() {
       const zkRes = await fetch("/api/zkverify", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ circuit: "withdraw_ring", proof, publicSignals }),
+        body: JSON.stringify({
+          circuit: "withdraw_ring",
+          proof,
+          publicSignals,
+          recipient,
+          amount: note.amount.toString(),
+        }),
       });
       if (!zkRes.ok) throw new Error(`zkVerify failed: ${await zkRes.text()}`);
       const zkResult: ZkVerifyResult = await zkRes.json();
