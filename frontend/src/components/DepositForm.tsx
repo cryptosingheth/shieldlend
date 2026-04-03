@@ -2,7 +2,8 @@
 
 import { useState, useEffect, useRef } from "react";
 import { parseEther } from "viem";
-import { useDeposit } from "@/lib/contracts";
+import { useBlockNumber } from "wagmi";
+import { useDeposit, useEpochStatus } from "@/lib/contracts";
 import { createNote, serializeNote, type Note } from "@/lib/circuits";
 import { fieldToBytes32 } from "@/lib/contracts";
 import { saveNote } from "@/lib/noteStorage";
@@ -12,6 +13,8 @@ import { useNoteKey } from "@/lib/noteKeyContext";
 export function DepositForm() {
   const { address } = useAccount();
   const { noteKey } = useNoteKey();
+  const { lastEpochBlock, epochBlocks } = useEpochStatus();
+  const { data: currentBlock } = useBlockNumber({ watch: true });
   const DENOMINATIONS = ["0.001", "0.005", "0.01", "0.05", "0.1", "0.5"];
   const [amountEth, setAmountEth] = useState("");
   const [status, setStatus] = useState<"idle" | "generating" | "submitting" | "done" | "error">(
@@ -130,14 +133,48 @@ export function DepositForm() {
         </div>
       )}
 
-      {isSuccess && (
-        <div className="border border-green-800 rounded-lg p-4 bg-green-950/20">
-          <p className="text-sm text-green-400 font-medium">Deposit confirmed.</p>
-          <p className="text-xs text-zinc-500 mt-1">
-            Your note has been saved to your vault. Funds are in the shielded pool.
-          </p>
-        </div>
-      )}
+      {isSuccess && (() => {
+        // Compute how many blocks remain until this deposit can be flushed into the tree.
+        // lastEpochBlock is updated by the contract after each flush.
+        // After a deposit, lastEpochBlock still reflects the previous flush,
+        // so blocksRemaining = (lastEpochBlock + EPOCH_BLOCKS) - currentBlock.
+        const flushAtBlock =
+          lastEpochBlock !== undefined && epochBlocks !== undefined
+            ? lastEpochBlock + epochBlocks
+            : undefined;
+        const blocksLeft =
+          flushAtBlock !== undefined && currentBlock !== undefined
+            ? Number(flushAtBlock) - Number(currentBlock)
+            : undefined;
+        const canFlushNow = blocksLeft !== undefined && blocksLeft <= 0;
+        const secsLeft = blocksLeft !== undefined && blocksLeft > 0 ? blocksLeft * 2 : 0;
+
+        return (
+          <div className="border border-green-800 rounded-lg p-4 bg-green-950/20 space-y-2">
+            <p className="text-sm text-green-400 font-medium">Deposit confirmed — queued for Merkle insertion.</p>
+            {canFlushNow ? (
+              <p className="text-xs text-zinc-400">
+                The epoch is ready to flush. Go to{" "}
+                <span className="text-indigo-400 font-medium">Withdraw</span>, select this note,
+                and click <span className="font-medium text-amber-400">Flush Epoch</span> to insert
+                it into the Merkle tree before withdrawing.
+              </p>
+            ) : (
+              <p className="text-xs text-zinc-400">
+                Withdrawal will be available in approximately{" "}
+                <span className="text-white font-medium">
+                  {blocksLeft !== undefined ? `${blocksLeft} blocks` : "~50 blocks"}
+                </span>{" "}
+                (~{secsLeft > 0 ? `${secsLeft}s` : "soon"} on Base Sepolia).
+                Your note is saved — come back once the epoch flushes.
+              </p>
+            )}
+            <p className="text-xs text-zinc-600">
+              This delay is intentional: deposits are batched and shuffled together for privacy.
+            </p>
+          </div>
+        );
+      })()}
     </div>
   );
 }

@@ -1,9 +1,9 @@
 "use client";
 
-import { useState, useEffect } from "react";
-import { useAccount, usePublicClient, useWriteContract } from "wagmi";
+import { useState, useEffect, useCallback } from "react";
+import { useAccount, usePublicClient, useWriteContract, useBlockNumber } from "wagmi";
 import { type Address, type Log, formatEther } from "viem";
-import { useWithdraw, useGetOwed } from "@/lib/contracts";
+import { useWithdraw, useGetOwed, useEpochStatus } from "@/lib/contracts";
 import {
   deserializeNote,
   generateWithdrawProof,
@@ -53,6 +53,9 @@ export function WithdrawForm() {
   const publicClient = usePublicClient();
   const { noteKey } = useNoteKey();
 
+  const { lastEpochBlock, epochBlocks } = useEpochStatus();
+  const { data: currentBlock } = useBlockNumber({ watch: true });
+
   const [savedNotes, setSavedNotes] = useState<StoredNote[]>([]);
   const [selectedNullifierHash, setSelectedNullifierHash] = useState<string>("");
   const [noteJson, setNoteJson] = useState("");
@@ -63,6 +66,8 @@ export function WithdrawForm() {
   const [errorMsg, setErrorMsg] = useState("");
   const [txHash, setTxHash] = useState<string | null>(null);
   const [pendingFlush, setPendingFlush] = useState(false);
+  // "unknown" = not yet checked, "checking" = fetching logs, "pending" = queued not flushed, "ready" = in tree
+  const [noteFlushStatus, setNoteFlushStatus] = useState<"unknown" | "checking" | "pending" | "ready">("unknown");
   const { withdraw, isPending, isConfirming, isSuccess } = useWithdraw();
   const { writeContractAsync } = useWriteContract();
 
@@ -72,6 +77,30 @@ export function WithdrawForm() {
       setSavedNotes(notes.filter((n) => !n.spent))
     );
   }, [address, noteKey]);
+
+  // ── Note flush status check ───────────────────────────────────────────────
+  // When a note is selected, check whether it has been inserted into the
+  // Merkle tree (LeafInserted event exists) or is still pending epoch flush.
+  useEffect(() => {
+    if (!selectedNullifierHash || !publicClient) {
+      setNoteFlushStatus("unknown");
+      return;
+    }
+    const note = savedNotes.find((n) => n.nullifierHash === selectedNullifierHash);
+    if (!note) { setNoteFlushStatus("unknown"); return; }
+
+    setNoteFlushStatus("checking");
+    const commitment = ("0x" + note.commitment.padStart(64, "0")) as `0x${string}`;
+
+    getAllLogs(publicClient, SHIELDED_POOL_ADDRESS).then((logs) => {
+      const flushed = logs.some(
+        (l) =>
+          l.topics[0]?.toLowerCase() === LEAF_INSERTED_TOPIC &&
+          l.topics[1]?.toLowerCase() === commitment.toLowerCase()
+      );
+      setNoteFlushStatus(flushed ? "ready" : "pending");
+    }).catch(() => setNoteFlushStatus("unknown"));
+  }, [selectedNullifierHash, savedNotes, publicClient]);
 
   // ── Auto-settle preview ────────────────────────────────────────────────────
   // If the selected note has an active loan, show how much the user will receive
@@ -332,13 +361,83 @@ export function WithdrawForm() {
         </p>
       </div>
 
+      {/* Pending epoch banner — shown immediately when a queued note is selected */}
+      {noteFlushStatus === "pending" && (() => {
+        const flushAtBlock =
+          lastEpochBlock !== undefined && epochBlocks !== undefined
+            ? lastEpochBlock + epochBlocks
+            : undefined;
+        const blocksLeft =
+          flushAtBlock !== undefined && currentBlock !== undefined
+            ? Math.max(0, Number(flushAtBlock) - Number(currentBlock))
+            : undefined;
+        const canFlushNow = blocksLeft !== undefined && blocksLeft === 0;
+        const secsLeft = blocksLeft !== undefined && blocksLeft > 0 ? blocksLeft * 2 : 0;
+
+        return (
+          <div className="border border-amber-900/60 rounded-lg p-4 bg-amber-900/10 space-y-3">
+            <div className="flex items-start gap-3">
+              <span className="text-amber-400 text-lg leading-none">⏳</span>
+              <div className="space-y-1">
+                <p className="text-sm text-amber-400 font-medium">Deposit pending epoch flush</p>
+                {canFlushNow ? (
+                  <p className="text-xs text-zinc-400">
+                    The epoch is ready — click <span className="text-amber-400 font-medium">Flush Epoch</span> below
+                    to insert your deposit into the Merkle tree, then withdraw.
+                  </p>
+                ) : (
+                  <p className="text-xs text-zinc-400">
+                    Withdrawal available in approximately{" "}
+                    <span className="text-white font-medium">
+                      {blocksLeft !== undefined ? `${blocksLeft} blocks` : "~50 blocks"}
+                    </span>
+                    {secsLeft > 0 && (
+                      <span className="text-zinc-500"> (~{secsLeft}s on Base Sepolia)</span>
+                    )}
+                    . Deposits are batched for privacy before entering the Merkle tree.
+                  </p>
+                )}
+              </div>
+            </div>
+            {canFlushNow && (
+              <button
+                onClick={async () => {
+                  try {
+                    await writeContractAsync({
+                      address: SHIELDED_POOL_ADDRESS,
+                      abi: SHIELDED_POOL_ABI,
+                      functionName: "flushEpoch",
+                    });
+                    setNoteFlushStatus("unknown"); // triggers re-check
+                    setPendingFlush(false);
+                  } catch (e) {
+                    setErrorMsg(e instanceof Error ? e.message : "Flush failed");
+                  }
+                }}
+                className="w-full bg-amber-700 hover:bg-amber-600 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+              >
+                Flush Epoch
+              </button>
+            )}
+          </div>
+        );
+      })()}
+
+      {noteFlushStatus === "checking" && (
+        <p className="text-xs text-zinc-500 text-center">Checking deposit status...</p>
+      )}
+
       <button
         onClick={handleWithdraw}
-        disabled={isLoading || (!noteJson && !selectedNullifierHash)}
+        disabled={isLoading || (!noteJson && !selectedNullifierHash) || noteFlushStatus === "pending" || noteFlushStatus === "checking"}
         className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed
                    text-white font-medium py-3 rounded-lg transition-colors text-sm"
       >
-        {statusMessages[status]}
+        {noteFlushStatus === "pending"
+          ? "Awaiting epoch flush..."
+          : noteFlushStatus === "checking"
+          ? "Checking note status..."
+          : statusMessages[status]}
         {isLoading && (
           <span className="ml-2 inline-block w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin align-middle" />
         )}
@@ -348,35 +447,6 @@ export function WithdrawForm() {
         <p className="text-sm text-red-400 border border-red-900 rounded-lg px-4 py-3">
           {errorMsg}
         </p>
-      )}
-
-      {/* Flush button — shown when deposit is queued but epoch not yet flushed */}
-      {pendingFlush && (
-        <div className="border border-amber-900/60 rounded-lg p-4 bg-amber-900/10 space-y-3">
-          <p className="text-xs text-amber-400">
-            Your deposit is in the queue. Once 50 blocks have passed since the last flush,
-            anyone can call <code className="font-mono">flushEpoch()</code> to insert it into
-            the Merkle tree. Click below to flush, then wait for confirmation and retry.
-          </p>
-          <button
-            onClick={async () => {
-              try {
-                await writeContractAsync({
-                  address: SHIELDED_POOL_ADDRESS,
-                  abi: SHIELDED_POOL_ABI,
-                  functionName: "flushEpoch",
-                });
-                setPendingFlush(false);
-                setErrorMsg("Epoch flushed. Your deposit is now in the Merkle tree — try withdrawing again.");
-              } catch (e) {
-                setErrorMsg(e instanceof Error ? e.message : "Flush failed");
-              }
-            }}
-            className="w-full bg-amber-700 hover:bg-amber-600 text-white text-sm font-medium py-2 rounded-lg transition-colors"
-          >
-            Flush Epoch
-          </button>
-        </div>
       )}
 
       {isSuccess && (
