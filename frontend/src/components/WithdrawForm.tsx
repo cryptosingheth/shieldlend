@@ -93,7 +93,12 @@ export function WithdrawForm() {
     setNoteFlushStatus("checking");
     const commitment = ("0x" + note.commitment.padStart(64, "0")) as `0x${string}`;
 
-    getAllLogs(publicClient, SHIELDED_POOL_ADDRESS).then((logs) => {
+    // Snapshot the current block number first, then query up to it.
+    // This prevents a race where the latest block advances between
+    // when we start the check and when getLogs executes.
+    publicClient.getBlockNumber().then((snapshotBlock) =>
+      getAllLogs(publicClient, SHIELDED_POOL_ADDRESS, snapshotBlock)
+    ).then((logs) => {
       const flushed = logs.some(
         (l) =>
           l.topics[0]?.toLowerCase() === LEAF_INSERTED_TOPIC &&
