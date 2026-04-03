@@ -26,9 +26,10 @@ const LEAF_INSERTED_TOPIC = "0xa4e4458df45cfeb7eebc696f262212e6721fac69466bfc59f
 
 async function getAllLogs(
   publicClient: NonNullable<ReturnType<typeof usePublicClient>>,
-  address: `0x${string}`
+  address: `0x${string}`,
+  upToBlock?: bigint  // if provided, ensures logs include this block (avoids race after flush)
 ): Promise<Log[]> {
-  const latest = await publicClient.getBlockNumber();
+  const latest = upToBlock ?? await publicClient.getBlockNumber();
   const allLogs: Log[] = [];
   for (let from = DEPLOY_BLOCK; from <= latest; from += CHUNK_SIZE) {
     const to = from + CHUNK_SIZE - 1n < latest ? from + CHUNK_SIZE - 1n : latest;
@@ -237,15 +238,19 @@ export function WithdrawForm() {
 
         // Epoch is ready. Auto-flush — user confirms one MetaMask tx, then proof continues.
         setStatus("flushing");
-        await writeContractAsync({
+        const flushTxHash = await writeContractAsync({
           address: SHIELDED_POOL_ADDRESS,
           abi: SHIELDED_POOL_ABI,
           functionName: "flushEpoch",
         });
 
-        // Re-fetch logs after flush to get the LeafInserted event.
+        // Wait for the flush receipt so we know the exact block it landed in.
+        // getAllLogs must query UP TO that block — otherwise it may miss the
+        // LeafInserted event if the node hasn't indexed the new block yet.
+        const flushReceipt = await publicClient.waitForTransactionReceipt({ hash: flushTxHash });
+
         setStatus("fetching-path");
-        const freshLogs = await getAllLogs(publicClient, SHIELDED_POOL_ADDRESS);
+        const freshLogs = await getAllLogs(publicClient, SHIELDED_POOL_ADDRESS, flushReceipt.blockNumber);
         resolvedLeafLog = freshLogs.find((l) =>
           l.topics[0]?.toLowerCase() === LEAF_INSERTED_TOPIC &&
           l.topics[1]?.toLowerCase() === noteCommitment.toLowerCase()
