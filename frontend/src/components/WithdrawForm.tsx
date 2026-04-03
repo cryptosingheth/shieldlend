@@ -61,7 +61,7 @@ export function WithdrawForm() {
   const [noteJson, setNoteJson] = useState("");
   const [recipient, setRecipient] = useState(address ?? "");
   const [status, setStatus] = useState<
-    "idle" | "fetching-path" | "proving" | "zkverify" | "submitting" | "done" | "error"
+    "idle" | "flushing" | "fetching-path" | "proving" | "zkverify" | "submitting" | "done" | "error"
   >("idle");
   const [errorMsg, setErrorMsg] = useState("");
   const [txHash, setTxHash] = useState<string | null>(null);
@@ -212,18 +212,60 @@ export function WithdrawForm() {
         l.topics[1]?.toLowerCase() === noteCommitment.toLowerCase()
       );
 
-      if (!leafLog) {
-        // Deposit is queued but epoch hasn't been flushed yet.
-        setPendingFlush(true);
-        throw new Error(
-          "Deposit is queued but not yet in the Merkle tree. " +
-          "Click 'Flush Epoch' below to insert it, then try again."
-        );
-      }
-      setPendingFlush(false);
+      let resolvedLeafLog = leafLog;
 
-      const leafIndex = parseInt(leafLog.data.slice(2, 66), 16);
-      const merklePath = await fetchMerklePath(leafIndex, currentRoot);
+      if (!resolvedLeafLog) {
+        // Deposit is queued. Check whether the epoch is ready to flush.
+        const lastEpochBlockOnChain = await publicClient.readContract({
+          address: SHIELDED_POOL_ADDRESS,
+          abi: SHIELDED_POOL_ABI,
+          functionName: "lastEpochBlock",
+        }) as bigint;
+        const epochBlocksOnChain = await publicClient.readContract({
+          address: SHIELDED_POOL_ADDRESS,
+          abi: SHIELDED_POOL_ABI,
+          functionName: "EPOCH_BLOCKS",
+        }) as bigint;
+        const blockNow = await publicClient.getBlockNumber();
+        const blocksLeft = Number(lastEpochBlockOnChain + epochBlocksOnChain) - Number(blockNow);
+
+        if (blocksLeft > 0) {
+          throw new Error(
+            `Deposit is queued — epoch flushes in ~${blocksLeft} blocks (~${blocksLeft * 2}s). Come back then.`
+          );
+        }
+
+        // Epoch is ready. Auto-flush — user confirms one MetaMask tx, then proof continues.
+        setStatus("flushing");
+        await writeContractAsync({
+          address: SHIELDED_POOL_ADDRESS,
+          abi: SHIELDED_POOL_ABI,
+          functionName: "flushEpoch",
+        });
+
+        // Re-fetch logs after flush to get the LeafInserted event.
+        setStatus("fetching-path");
+        const freshLogs = await getAllLogs(publicClient, SHIELDED_POOL_ADDRESS);
+        resolvedLeafLog = freshLogs.find((l) =>
+          l.topics[0]?.toLowerCase() === LEAF_INSERTED_TOPIC &&
+          l.topics[1]?.toLowerCase() === noteCommitment.toLowerCase()
+        ) ?? null;
+
+        if (!resolvedLeafLog) throw new Error("Flush succeeded but LeafInserted event not found. Try withdrawing again.");
+        setNoteFlushStatus("ready");
+        setPendingFlush(false);
+      }
+
+      const leafIndex = parseInt(resolvedLeafLog.data.slice(2, 66), 16);
+
+      // Fetch fresh root after potential flush
+      const freshRoot = (await publicClient.readContract({
+        address: SHIELDED_POOL_ADDRESS,
+        abi: SHIELDED_POOL_ABI,
+        functionName: "getLastRoot",
+      })) as `0x${string}`;
+
+      const merklePath = await fetchMerklePath(leafIndex, freshRoot);
 
       setStatus("proving");
       // V2: circuit name is "withdraw_ring" — server maps to withdraw_ring_vkey.json
@@ -269,6 +311,7 @@ export function WithdrawForm() {
 
   const statusMessages: Record<typeof status, string> = {
     idle: "Withdraw",
+    flushing: "Inserting into Merkle tree...",
     "fetching-path": "Fetching Merkle path...",
     proving: "Generating ring ZK proof (~25s)...",
     zkverify: "Submitting to zkVerify...",
@@ -278,7 +321,7 @@ export function WithdrawForm() {
   };
 
   const isLoading =
-    ["fetching-path", "proving", "zkverify", "submitting"].includes(status) ||
+    ["flushing", "fetching-path", "proving", "zkverify", "submitting"].includes(status) ||
     isPending ||
     isConfirming;
 
@@ -361,7 +404,7 @@ export function WithdrawForm() {
         </p>
       </div>
 
-      {/* Pending epoch banner — shown immediately when a queued note is selected */}
+      {/* Pending epoch banner — countdown only, no manual action needed */}
       {noteFlushStatus === "pending" && (() => {
         const flushAtBlock =
           lastEpochBlock !== undefined && epochBlocks !== undefined
@@ -371,54 +414,32 @@ export function WithdrawForm() {
           flushAtBlock !== undefined && currentBlock !== undefined
             ? Math.max(0, Number(flushAtBlock) - Number(currentBlock))
             : undefined;
-        const canFlushNow = blocksLeft !== undefined && blocksLeft === 0;
         const secsLeft = blocksLeft !== undefined && blocksLeft > 0 ? blocksLeft * 2 : 0;
+        const canFlushNow = blocksLeft !== undefined && blocksLeft === 0;
 
         return (
-          <div className="border border-amber-900/60 rounded-lg p-4 bg-amber-900/10 space-y-3">
+          <div className="border border-amber-900/60 rounded-lg p-4 bg-amber-900/10">
             <div className="flex items-start gap-3">
               <span className="text-amber-400 text-lg leading-none">⏳</span>
               <div className="space-y-1">
-                <p className="text-sm text-amber-400 font-medium">Deposit pending epoch flush</p>
+                <p className="text-sm text-amber-400 font-medium">Deposit queued — not yet in Merkle tree</p>
                 {canFlushNow ? (
                   <p className="text-xs text-zinc-400">
-                    The epoch is ready — click <span className="text-amber-400 font-medium">Flush Epoch</span> below
-                    to insert your deposit into the Merkle tree, then withdraw.
+                    Ready. Click <span className="text-white font-medium">Withdraw</span> — the deposit
+                    will be inserted automatically before your proof is generated.
                   </p>
                 ) : (
                   <p className="text-xs text-zinc-400">
-                    Withdrawal available in approximately{" "}
+                    Available in{" "}
                     <span className="text-white font-medium">
-                      {blocksLeft !== undefined ? `${blocksLeft} blocks` : "~50 blocks"}
+                      ~{blocksLeft ?? 50} blocks
                     </span>
-                    {secsLeft > 0 && (
-                      <span className="text-zinc-500"> (~{secsLeft}s on Base Sepolia)</span>
-                    )}
-                    . Deposits are batched for privacy before entering the Merkle tree.
+                    {secsLeft > 0 && <span className="text-zinc-500"> (~{secsLeft}s)</span>}
+                    . Deposits are batched for privacy before entering the tree.
                   </p>
                 )}
               </div>
             </div>
-            {canFlushNow && (
-              <button
-                onClick={async () => {
-                  try {
-                    await writeContractAsync({
-                      address: SHIELDED_POOL_ADDRESS,
-                      abi: SHIELDED_POOL_ABI,
-                      functionName: "flushEpoch",
-                    });
-                    setNoteFlushStatus("unknown"); // triggers re-check
-                    setPendingFlush(false);
-                  } catch (e) {
-                    setErrorMsg(e instanceof Error ? e.message : "Flush failed");
-                  }
-                }}
-                className="w-full bg-amber-700 hover:bg-amber-600 text-white text-sm font-medium py-2 rounded-lg transition-colors"
-              >
-                Flush Epoch
-              </button>
-            )}
           </div>
         );
       })()}
@@ -429,13 +450,14 @@ export function WithdrawForm() {
 
       <button
         onClick={handleWithdraw}
-        disabled={isLoading || (!noteJson && !selectedNullifierHash) || noteFlushStatus === "pending" || noteFlushStatus === "checking"}
+        disabled={isLoading || (!noteJson && !selectedNullifierHash) || noteFlushStatus === "checking" || (noteFlushStatus === "pending" && (() => {
+          const flushAt = lastEpochBlock !== undefined && epochBlocks !== undefined ? lastEpochBlock + epochBlocks : undefined;
+          return flushAt !== undefined && currentBlock !== undefined && Number(currentBlock) < Number(flushAt);
+        })())}
         className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed
                    text-white font-medium py-3 rounded-lg transition-colors text-sm"
       >
-        {noteFlushStatus === "pending"
-          ? "Awaiting epoch flush..."
-          : noteFlushStatus === "checking"
+        {noteFlushStatus === "checking"
           ? "Checking note status..."
           : statusMessages[status]}
         {isLoading && (
