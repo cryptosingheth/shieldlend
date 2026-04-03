@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { useAccount, usePublicClient } from "wagmi";
+import { useAccount, usePublicClient, useWriteContract } from "wagmi";
 import { type Address, type Log, formatEther } from "viem";
 import { useWithdraw, useGetOwed } from "@/lib/contracts";
 import {
@@ -16,8 +16,13 @@ import { useNoteKey } from "@/lib/noteKeyContext";
 // V2: LEVELS=24 — matches ShieldedPool and withdraw_ring.circom
 const LEVELS = 24;
 
-const DEPLOY_BLOCK = 39499000n;
+// Updated to actual deployment block of the V2 contracts on Base Sepolia
+const DEPLOY_BLOCK = 39731476n;
 const CHUNK_SIZE = 9000n;
+
+// keccak256("LeafInserted(bytes32,uint32)") — used to filter only flushEpoch events,
+// not Deposit events (both have commitment as topics[1] so we must check topics[0])
+const LEAF_INSERTED_TOPIC = "0xa4e4458df45cfeb7eebc696f262212e6721fac69466bfc59f43b6040425afce6";
 
 async function getAllLogs(
   publicClient: NonNullable<ReturnType<typeof usePublicClient>>,
@@ -57,7 +62,9 @@ export function WithdrawForm() {
   >("idle");
   const [errorMsg, setErrorMsg] = useState("");
   const [txHash, setTxHash] = useState<string | null>(null);
+  const [pendingFlush, setPendingFlush] = useState(false);
   const { withdraw, isPending, isConfirming, isSuccess } = useWithdraw();
+  const { writeContractAsync } = useWriteContract();
 
   useEffect(() => {
     if (!address) return;
@@ -89,13 +96,14 @@ export function WithdrawForm() {
 
     const logs = await getAllLogs(publicClient, SHIELDED_POOL_ADDRESS);
 
-    // Build commitMap from LeafInserted events (emitted by _insert during flushEpoch).
-    // Each LeafInserted has: topics[1] = indexed commitment, data = uint32 leafIndex.
-    // We match ALL events with a topics[1] (indexed bytes32) and a data field.
+    // Build commitMap ONLY from LeafInserted events (topics[0] = LEAF_INSERTED_TOPIC).
+    // Deposit events also have topics[1] = indexed commitment but their data encodes
+    // (queue position, timestamp, amount) — NOT the final tree index after shuffle.
+    // Filtering by topics[0] ensures we only read post-flush tree positions.
     const commitMap = new Map<number, bigint>();
     for (const log of logs) {
+      if (log.topics[0]?.toLowerCase() !== LEAF_INSERTED_TOPIC) continue;
       if (log.topics.length < 2) continue;
-      if (log.data.length < 66) continue; // needs at least a uint32 in data
       const commitment = log.topics[1] as `0x${string}`;
       const idx = parseInt(log.data.slice(2, 66), 16);
       commitMap.set(idx, BigInt(commitment));
@@ -159,26 +167,31 @@ export function WithdrawForm() {
         functionName: "getLastRoot",
       })) as `0x${string}`;
 
-      // V2: Use LeafInserted events (from flushEpoch) for the real Merkle tree index.
-      // The Deposit event's leafIndex is just the queue position — NOT the tree index.
-      const LEAF_INSERTED_TOPIC = "0x" + "LeafInserted(bytes32,uint32)".split("").reduce(
-        (h) => h, "" // placeholder — we match by topic[1] = commitment
-      );
-
       const logs = await getAllLogs(publicClient, SHIELDED_POOL_ADDRESS);
       const noteCommitment = fieldToBytes32(note.commitment);
 
-      // Look for a LeafInserted event where topics[1] matches our commitment.
-      // LeafInserted(bytes32 indexed commitment, uint32 leafIndex) emits
-      // topics[0] = event sig, topics[1] = indexed commitment, data = leafIndex.
-      const leafInsertedSig = "0x1a35e5ce42984c4d411adf232a3f7f7be3f1de1fdd1e1db9d93a0e81f8e7f0a1"; // fallback
+      // Check if deposit exists on-chain at all (Deposit event, any topics[1] match)
+      const depositLog = logs.find((l) =>
+        l.topics[1]?.toLowerCase() === noteCommitment.toLowerCase()
+      );
+      if (!depositLog) throw new Error("Deposit not found on-chain. Wrong network or address?");
+
+      // Look specifically for LeafInserted (topics[0] = LEAF_INSERTED_TOPIC).
+      // Deposit events also have topics[1] = commitment but store queue position, not tree index.
       const leafLog = logs.find((l) =>
-        l.topics[1]?.toLowerCase() === noteCommitment.toLowerCase() &&
-        l.data.length >= 66 // has leafIndex in data
+        l.topics[0]?.toLowerCase() === LEAF_INSERTED_TOPIC &&
+        l.topics[1]?.toLowerCase() === noteCommitment.toLowerCase()
       );
 
-      // Fallback: try Deposit event (works for pre-fix deployments where queue index == tree index)
-      if (!leafLog) throw new Error("Note not found on-chain. Was it deposited and flushed?");
+      if (!leafLog) {
+        // Deposit is queued but epoch hasn't been flushed yet.
+        setPendingFlush(true);
+        throw new Error(
+          "Deposit is queued but not yet in the Merkle tree. " +
+          "Click 'Flush Epoch' below to insert it, then try again."
+        );
+      }
+      setPendingFlush(false);
 
       const leafIndex = parseInt(leafLog.data.slice(2, 66), 16);
       const merklePath = await fetchMerklePath(leafIndex, currentRoot);
@@ -336,6 +349,36 @@ export function WithdrawForm() {
           {errorMsg}
         </p>
       )}
+
+      {/* Flush button — shown when deposit is queued but epoch not yet flushed */}
+      {pendingFlush && (
+        <div className="border border-amber-900/60 rounded-lg p-4 bg-amber-900/10 space-y-3">
+          <p className="text-xs text-amber-400">
+            Your deposit is in the queue. Once 50 blocks have passed since the last flush,
+            anyone can call <code className="font-mono">flushEpoch()</code> to insert it into
+            the Merkle tree. Click below to flush, then wait for confirmation and retry.
+          </p>
+          <button
+            onClick={async () => {
+              try {
+                await writeContractAsync({
+                  address: SHIELDED_POOL_ADDRESS,
+                  abi: SHIELDED_POOL_ABI,
+                  functionName: "flushEpoch",
+                });
+                setPendingFlush(false);
+                setErrorMsg("Epoch flushed. Your deposit is now in the Merkle tree — try withdrawing again.");
+              } catch (e) {
+                setErrorMsg(e instanceof Error ? e.message : "Flush failed");
+              }
+            }}
+            className="w-full bg-amber-700 hover:bg-amber-600 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+          >
+            Flush Epoch
+          </button>
+        </div>
+      )}
+
       {isSuccess && (
         <p className="text-sm text-green-400">
           Withdrawal confirmed. Funds sent to {recipient.slice(0, 8)}...
