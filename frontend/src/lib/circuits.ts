@@ -138,7 +138,11 @@ function buildRing(commitment: bigint): { ring: bigint[]; ringIndex: number } {
  * Generate a V2 withdrawal proof via withdraw_ring.circom.
  *
  * Private: secret, nullifier, ring_index, pathElements, pathIndices
- * Public:  ring[16], root, nullifierHash, recipient, relayer, fee
+ * Public:  ring[16], root, nullifierHash
+ *
+ * Note: recipient is accepted as a parameter for future use (e.g. passing to
+ * the contract call) but is NOT a circuit signal — withdraw_ring.circom has no
+ * recipient/relayer/fee inputs.
  */
 export async function generateWithdrawProof(
   note: Note,
@@ -167,9 +171,6 @@ export async function generateWithdrawProof(
     ring:         ring.map((r) => r.toString()),
     root:         merklePath.root.toString(),
     nullifierHash: note.nullifierHash.toString(),
-    recipient:    BigInt(recipient).toString(),
-    relayer:      "0",
-    fee:          "0",
   };
 
   const { proof, publicSignals } = await snarkjs.groth16.fullProve(
