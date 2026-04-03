@@ -1,14 +1,20 @@
 /**
- * ShieldLend Note Storage
- * ========================
- * Stores deposit notes in browser localStorage, keyed by nullifierHash.
+ * ShieldLend Note Storage — V2
+ * =============================
+ * Stores deposit notes in browser localStorage with AES-256-GCM encryption.
  *
- * Security model: localStorage is NOT encrypted. Notes are stored in plaintext.
- * This is acceptable for a testnet demo — in production you would derive a
- * symmetric key from the user's signature (e.g. MetaMask personal_sign) and
- * encrypt notes with AES-GCM before storing.
+ * Key derivation:
+ *   1. User signs a fixed message with MetaMask → deterministic bytes per address.
+ *   2. HKDF(SHA-256) derives a 256-bit AES-GCM key from those bytes.
+ *   3. Each note record is encrypted individually (fresh IV per write).
  *
- * Key structure: `shieldlend_notes_<address>` → JSON array of StoredNote
+ * Security model:
+ *   - XSS cannot extract notes without triggering a wallet signature.
+ *   - localStorage forensics yields only ciphertext.
+ *   - The key is ephemeral (only in memory for the session).
+ *   - A null key falls back to unencrypted plaintext (testnet-only path).
+ *
+ * Key structure: `shieldlend_notes_<address>` → JSON array of EncryptedNote | StoredNote
  */
 
 import { type Note } from "./circuits";
@@ -26,24 +32,113 @@ export interface StoredNote {
   label?: string;            // optional user-set label
 }
 
+/** Encrypted wrapper stored in localStorage when a key is present */
+interface EncryptedNote {
+  _enc: true;
+  iv: string;          // hex-encoded 12-byte IV
+  ct: string;          // hex-encoded ciphertext
+}
+
+type NoteRecord = StoredNote | EncryptedNote;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Crypto helpers (Web Crypto API — available in all modern browsers)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Derive an AES-256-GCM CryptoKey from arbitrary bytes via HKDF. */
+export async function deriveNoteKey(
+  keyMaterial: Uint8Array,
+  address: string
+): Promise<CryptoKey> {
+  const baseKey = await crypto.subtle.importKey(
+    "raw",
+    keyMaterial,
+    { name: "HKDF" },
+    false,
+    ["deriveKey"]
+  );
+
+  const salt = new TextEncoder().encode(`shieldlend-note-salt-${address.toLowerCase()}`);
+  const info = new TextEncoder().encode("shieldlend-note-encryption-v2");
+
+  return crypto.subtle.deriveKey(
+    { name: "HKDF", hash: "SHA-256", salt, info },
+    baseKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
+async function encryptNote(note: StoredNote, key: CryptoKey): Promise<EncryptedNote> {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const plaintext = new TextEncoder().encode(JSON.stringify(note));
+  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plaintext);
+
+  return {
+    _enc: true,
+    iv: Buffer.from(iv).toString("hex"),
+    ct: Buffer.from(ct).toString("hex"),
+  };
+}
+
+async function decryptNote(record: EncryptedNote, key: CryptoKey): Promise<StoredNote> {
+  const iv = Buffer.from(record.iv, "hex");
+  const ct = Buffer.from(record.ct, "hex");
+  const plaintext = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ct);
+  return JSON.parse(new TextDecoder().decode(plaintext)) as StoredNote;
+}
+
+function isEncrypted(r: NoteRecord): r is EncryptedNote {
+  return (r as EncryptedNote)._enc === true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Storage key
+// ─────────────────────────────────────────────────────────────────────────────
+
 const STORAGE_KEY = (address: string) =>
   `shieldlend_notes_${address.toLowerCase()}`;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Read / Write
+// Read / Write (async — key may be null for plaintext fallback)
 // ─────────────────────────────────────────────────────────────────────────────
 
-export function loadNotes(address: string): StoredNote[] {
+export async function loadNotes(
+  address: string,
+  key: CryptoKey | null = null
+): Promise<StoredNote[]> {
   if (typeof window === "undefined") return [];
   try {
     const raw = localStorage.getItem(STORAGE_KEY(address));
-    return raw ? (JSON.parse(raw) as StoredNote[]) : [];
+    if (!raw) return [];
+    const records = JSON.parse(raw) as NoteRecord[];
+
+    const notes: StoredNote[] = [];
+    for (const r of records) {
+      if (isEncrypted(r)) {
+        if (!key) continue; // skip encrypted records when no key
+        try {
+          notes.push(await decryptNote(r, key));
+        } catch {
+          // Decryption failure — wrong key or corrupted record; skip silently
+        }
+      } else {
+        notes.push(r as StoredNote);
+      }
+    }
+    return notes;
   } catch {
     return [];
   }
 }
 
-export function saveNote(address: string, note: Note, depositTx?: string): StoredNote {
+export async function saveNote(
+  address: string,
+  note: Note,
+  key: CryptoKey | null = null,
+  depositTx?: string
+): Promise<StoredNote> {
   const stored: StoredNote = {
     nullifierHash: fieldToBytes32(note.nullifierHash),
     commitment: fieldToBytes32(note.commitment),
@@ -55,27 +150,60 @@ export function saveNote(address: string, note: Note, depositTx?: string): Store
     spent: false,
   };
 
-  const existing = loadNotes(address);
-  // Deduplicate by nullifierHash
-  const without = existing.filter((n) => n.nullifierHash !== stored.nullifierHash);
-  localStorage.setItem(STORAGE_KEY(address), JSON.stringify([stored, ...without]));
+  const raw = localStorage.getItem(STORAGE_KEY(address));
+  const existing: NoteRecord[] = raw ? (JSON.parse(raw) as NoteRecord[]) : [];
+
+  // Remove any existing record with the same nullifierHash (plaintext or encrypted)
+  const withoutDup: NoteRecord[] = [];
+  for (const r of existing) {
+    if (isEncrypted(r)) {
+      withoutDup.push(r); // keep — can't inspect without key
+    } else {
+      if ((r as StoredNote).nullifierHash !== stored.nullifierHash) withoutDup.push(r);
+    }
+  }
+
+  const toStore: NoteRecord = key ? await encryptNote(stored, key) : stored;
+  localStorage.setItem(STORAGE_KEY(address), JSON.stringify([toStore, ...withoutDup]));
   return stored;
 }
 
-export function markNoteSpent(address: string, nullifierHash: string): void {
-  const notes = loadNotes(address).map((n) =>
+export async function markNoteSpent(
+  address: string,
+  nullifierHash: string,
+  key: CryptoKey | null = null
+): Promise<void> {
+  const notes = await loadNotes(address, key);
+  const updated = notes.map((n) =>
     n.nullifierHash.toLowerCase() === nullifierHash.toLowerCase()
       ? { ...n, spent: true }
       : n
   );
-  localStorage.setItem(STORAGE_KEY(address), JSON.stringify(notes));
+
+  if (key) {
+    const encrypted = await Promise.all(updated.map((n) => encryptNote(n, key)));
+    localStorage.setItem(STORAGE_KEY(address), JSON.stringify(encrypted));
+  } else {
+    localStorage.setItem(STORAGE_KEY(address), JSON.stringify(updated));
+  }
 }
 
-export function deleteNote(address: string, nullifierHash: string): void {
-  const notes = loadNotes(address).filter(
+export async function deleteNote(
+  address: string,
+  nullifierHash: string,
+  key: CryptoKey | null = null
+): Promise<void> {
+  const notes = await loadNotes(address, key);
+  const filtered = notes.filter(
     (n) => n.nullifierHash.toLowerCase() !== nullifierHash.toLowerCase()
   );
-  localStorage.setItem(STORAGE_KEY(address), JSON.stringify(notes));
+
+  if (key) {
+    const encrypted = await Promise.all(filtered.map((n) => encryptNote(n, key)));
+    localStorage.setItem(STORAGE_KEY(address), JSON.stringify(encrypted));
+  } else {
+    localStorage.setItem(STORAGE_KEY(address), JSON.stringify(filtered));
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -96,7 +224,7 @@ export function storedNoteToNote(s: StoredNote): Note {
 /** Short display label for a note */
 export function noteLabel(note: StoredNote): string {
   if (note.label) return note.label;
-  const eth = (BigInt(note.amount) * 10000n / BigInt(1e18)) ;
+  const eth = (BigInt(note.amount) * 10000n / BigInt(1e18));
   const ethDisplay = (Number(eth) / 10000).toFixed(4);
   const ts = new Date(note.depositedAt).toLocaleDateString();
   return `${ethDisplay} ETH · ${ts}`;

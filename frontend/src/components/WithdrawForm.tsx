@@ -2,8 +2,8 @@
 
 import { useState, useEffect } from "react";
 import { useAccount, usePublicClient } from "wagmi";
-import { type Address, type Log } from "viem";
-import { useWithdraw } from "@/lib/contracts";
+import { type Address, type Log, formatEther } from "viem";
+import { useWithdraw, useGetOwed } from "@/lib/contracts";
 import {
   deserializeNote,
   generateWithdrawProof,
@@ -11,12 +11,14 @@ import {
 } from "@/lib/circuits";
 import { SHIELDED_POOL_ADDRESS, SHIELDED_POOL_ABI, fieldToBytes32 } from "@/lib/contracts";
 import { loadNotes, markNoteSpent, storedNoteToNote, noteLabel, type StoredNote } from "@/lib/noteStorage";
+import { useNoteKey } from "@/lib/noteKeyContext";
 
-// ShieldedPool was deployed at this block — avoids querying from genesis
+// V2: LEVELS=24 — matches ShieldedPool and withdraw_ring.circom
+const LEVELS = 24;
+
 const DEPLOY_BLOCK = 39499000n;
 const CHUNK_SIZE = 9000n;
 
-// Fetch all logs in chunks to stay within RPC's 10,000-block getLogs limit
 async function getAllLogs(
   publicClient: NonNullable<ReturnType<typeof usePublicClient>>,
   address: `0x${string}`
@@ -44,15 +46,10 @@ type ZkVerifyResult = {
 export function WithdrawForm() {
   const { address } = useAccount();
   const publicClient = usePublicClient();
+  const { noteKey } = useNoteKey();
 
-  // Saved notes from vault
   const [savedNotes, setSavedNotes] = useState<StoredNote[]>([]);
   const [selectedNullifierHash, setSelectedNullifierHash] = useState<string>("");
-
-  useEffect(() => {
-    if (address) setSavedNotes(loadNotes(address).filter((n) => !n.spent));
-  }, [address]);
-
   const [noteJson, setNoteJson] = useState("");
   const [recipient, setRecipient] = useState(address ?? "");
   const [status, setStatus] = useState<
@@ -62,12 +59,36 @@ export function WithdrawForm() {
   const [txHash, setTxHash] = useState<string | null>(null);
   const { withdraw, isPending, isConfirming, isSuccess } = useWithdraw();
 
+  useEffect(() => {
+    if (!address) return;
+    loadNotes(address, noteKey).then((notes) =>
+      setSavedNotes(notes.filter((n) => !n.spent))
+    );
+  }, [address, noteKey]);
+
+  // ── Auto-settle preview ────────────────────────────────────────────────────
+  // If the selected note has an active loan, show how much the user will receive
+  // after the auto-repayment in ShieldedPool.withdraw().
+  const nullifierHashHex = selectedNullifierHash
+    ? (selectedNullifierHash as `0x${string}`)
+    : undefined;
+
+  const { data: owedWei } = useGetOwed(nullifierHashHex);
+
+  const selectedNote = savedNotes.find((n) => n.nullifierHash === selectedNullifierHash);
+  const noteAmountWei = selectedNote ? BigInt(selectedNote.amount) : 0n;
+  const netReceived =
+    owedWei && owedWei > 0n && noteAmountWei > 0n
+      ? noteAmountWei > owedWei
+        ? noteAmountWei - owedWei
+        : 0n
+      : null;
+
   async function fetchMerklePath(leafIndex: number, root: `0x${string}`): Promise<MerklePath> {
     if (!publicClient) throw new Error("No public client");
 
     const logs = await getAllLogs(publicClient, SHIELDED_POOL_ADDRESS);
 
-    // Build sparse commitments map: leafIndex → commitment value
     const commitMap = new Map<number, bigint>();
     for (const log of logs) {
       if (log.topics.length < 2) continue;
@@ -79,36 +100,30 @@ export function WithdrawForm() {
     const { buildPoseidon } = await import("circomlibjs");
     const poseidon = await buildPoseidon();
     const F = poseidon.F;
-    const LEVELS = 20;
 
-    // Precompute zero hashes for each level — O(20) instead of O(2^20)
-    // zeros[0] = empty leaf, zeros[i] = Poseidon(zeros[i-1], zeros[i-1])
+    // Precompute zero hashes up to LEVELS=24
     const zeros: bigint[] = [0n];
     for (let i = 0; i < LEVELS; i++) {
       zeros.push(F.toObject(poseidon([zeros[i], zeros[i]])) as bigint);
     }
 
-    // Sparse path computation — only compute nodes along the proof path
-    // At each level, track only the non-zero nodes needed to compute siblings
     const pathElements: bigint[] = [];
     const pathIndices: number[] = [];
 
     let currentLevel = new Map<number, bigint>(commitMap);
-
     let idx = leafIndex;
+
     for (let level = 0; level < LEVELS; level++) {
       const isRight = idx % 2;
       const siblingIdx = isRight ? idx - 1 : idx + 1;
 
-      // Sibling is either a known non-zero node or a zero subtree
       pathElements.push(currentLevel.get(siblingIdx) ?? zeros[level]);
       pathIndices.push(isRight);
 
-      // Compute parent level — only for non-zero nodes
       const nextLevel = new Map<number, bigint>();
       for (const [nodeIdx, val] of currentLevel) {
         const parentIdx = Math.floor(nodeIdx / 2);
-        if (nextLevel.has(parentIdx)) continue; // already computed from sibling
+        if (nextLevel.has(parentIdx)) continue;
         const sibIdx = nodeIdx % 2 === 0 ? nodeIdx + 1 : nodeIdx - 1;
         const sibVal = currentLevel.get(sibIdx) ?? zeros[level];
         const left = nodeIdx % 2 === 0 ? val : sibVal;
@@ -123,8 +138,7 @@ export function WithdrawForm() {
   }
 
   async function handleWithdraw() {
-    const hasSelectedNote = !!selectedNullifierHash;
-    if (!hasSelectedNote && !noteJson.trim()) return setErrorMsg("Select a note or paste JSON");
+    if (!selectedNullifierHash && !noteJson.trim()) return setErrorMsg("Select a note or paste JSON");
     if (!recipient) return setErrorMsg("Enter recipient address");
 
     try {
@@ -135,16 +149,13 @@ export function WithdrawForm() {
       const note = selectedStored ? storedNoteToNote(selectedStored) : deserializeNote(noteJson);
       if (!publicClient) throw new Error("No public client");
 
-      // Get current root and leaf index from on-chain events
       const currentRoot = (await publicClient.readContract({
         address: SHIELDED_POOL_ADDRESS,
         abi: SHIELDED_POOL_ABI,
         functionName: "getLastRoot",
       })) as `0x${string}`;
 
-      // Get deposit event for this note to find leafIndex
       const logs = await getAllLogs(publicClient, SHIELDED_POOL_ADDRESS);
-
       const noteCommitment = fieldToBytes32(note.commitment);
       const depositLog = logs.find((l) =>
         l.topics[1]?.toLowerCase() === noteCommitment.toLowerCase()
@@ -155,14 +166,14 @@ export function WithdrawForm() {
       const merklePath = await fetchMerklePath(leafIndex, currentRoot);
 
       setStatus("proving");
+      // V2: circuit name is "withdraw_ring" — server maps to withdraw_ring_vkey.json
       const { proof, publicSignals } = await generateWithdrawProof(note, merklePath, recipient);
 
       setStatus("zkverify");
-      // Submit to zkVerify API route (server-side — keeps seed phrase off client)
       const zkRes = await fetch("/api/zkverify", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ circuit: "withdraw", proof, publicSignals }),
+        body: JSON.stringify({ circuit: "withdraw_ring", proof, publicSignals }),
       });
       if (!zkRes.ok) throw new Error(`zkVerify failed: ${await zkRes.text()}`);
       const zkResult: ZkVerifyResult = await zkRes.json();
@@ -184,9 +195,10 @@ export function WithdrawForm() {
 
       setStatus("done");
       setTxHash(zkResult.txHash);
-      // Mark note as spent in vault so it won't appear in future dropdowns
-      if (address && (selectedNullifierHash || fieldToBytes32(note.nullifierHash))) {
-        markNoteSpent(address, selectedNullifierHash || fieldToBytes32(note.nullifierHash));
+
+      if (address) {
+        const nhex = selectedNullifierHash || fieldToBytes32(note.nullifierHash);
+        await markNoteSpent(address, nhex, noteKey);
         setSavedNotes((prev) => prev.filter((n) => n.nullifierHash !== selectedNullifierHash));
       }
     } catch (err) {
@@ -198,7 +210,7 @@ export function WithdrawForm() {
   const statusMessages: Record<typeof status, string> = {
     idle: "Withdraw",
     "fetching-path": "Fetching Merkle path...",
-    proving: "Generating ZK proof (~20s)...",
+    proving: "Generating ring ZK proof (~25s)...",
     zkverify: "Submitting to zkVerify...",
     submitting: "Confirm in wallet...",
     done: "Withdrawn",
@@ -206,10 +218,9 @@ export function WithdrawForm() {
   };
 
   const isLoading =
-    status !== "idle" && status !== "done" && status !== "error" &&
-    (["fetching-path", "proving", "zkverify", "submitting"].includes(status) ||
+    ["fetching-path", "proving", "zkverify", "submitting"].includes(status) ||
     isPending ||
-    isConfirming);
+    isConfirming;
 
   return (
     <div className="space-y-5">
@@ -244,6 +255,36 @@ export function WithdrawForm() {
         )}
       </div>
 
+      {/* ── Auto-settle preview ────────────────────────────────────────────── */}
+      {owedWei && owedWei > 0n && (
+        <div className="border border-amber-900/60 rounded-lg p-4 bg-amber-900/10 text-xs space-y-2">
+          <p className="text-amber-400 font-medium">Collateral note — loan will be auto-settled</p>
+          <div className="flex justify-between text-zinc-400">
+            <span>Loan repayment (deducted)</span>
+            <span className="font-mono text-red-400">- {parseFloat(formatEther(owedWei)).toFixed(6)} ETH</span>
+          </div>
+          {noteAmountWei > 0n && (
+            <div className="flex justify-between text-zinc-400">
+              <span>Note denomination</span>
+              <span className="font-mono">{formatEther(noteAmountWei)} ETH</span>
+            </div>
+          )}
+          {netReceived !== null && (
+            <div className="flex justify-between border-t border-amber-900/40 pt-2 text-zinc-200 font-medium">
+              <span>You will receive</span>
+              <span className={`font-mono ${netReceived > 0n ? "text-green-400" : "text-red-400"}`}>
+                {parseFloat(formatEther(netReceived)).toFixed(6)} ETH
+              </span>
+            </div>
+          )}
+          {netReceived === 0n && (
+            <p className="text-red-400 text-xs pt-1">
+              Loan amount exceeds note value — nothing will be returned after settlement.
+            </p>
+          )}
+        </div>
+      )}
+
       <div>
         <label className="block text-sm text-zinc-400 mb-2">Recipient address</label>
         <input
@@ -256,7 +297,7 @@ export function WithdrawForm() {
                      focus:outline-none focus:border-indigo-500 disabled:opacity-50 transition-colors"
         />
         <p className="text-xs text-zinc-600 mt-1">
-          Send to any address — it won't be linked to your deposit
+          Send to any address — it won't be linked to your deposit. Use a stealth address for maximum privacy.
         </p>
       </div>
 

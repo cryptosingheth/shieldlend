@@ -12,21 +12,26 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import { baseSepolia } from "viem/chains";
 
-// Server-side zkVerify submission — keeps seed phrase off the browser
+// Server-side zkVerify submission — keeps seed phrase off the browser.
 //
-// Flow (post-dev-merge):
-//  1. Submit Groth16 proof to zkVerify Volta → verified on their chain
-//  2. Compute statement leaf = ShieldedPool.statementHash(publicSignals)
-//  3. Build single-leaf aggregation root = keccak256(leaf)
-//  4. Post root to our ZkVerifyAggregation contract (deployer is operator)
-//  5. Return { aggregationId, domainId, merklePath, leafCount, leafIndex, txHash }
+// V2 changes from V1:
+//   - "collateral" → "collateral_ring" (maps to collateral_ring_vkey.json)
+//   - "withdraw"   → "withdraw_ring"   (maps to withdraw_ring_vkey.json)
+//   - submitAggregation path now also runs for "collateral_ring" (borrow proofs
+//     verified on Volta before borrow() is called — no on-chain verifier needed)
 //
-// The frontend uses aggregationId + merklePath to call ShieldedPool.withdraw()
-// which verifies Merkle inclusion on-chain.
+// Flow:
+//  1. Submit Groth16 proof to zkVerify Volta → verified on their chain.
+//  2. For withdraw_ring: compute statement leaf, post single-leaf agg root to
+//     ZkVerifyAggregation contract so ShieldedPool._verifyAttestation() passes.
+//  3. Return { aggregationId, domainId, merklePath, leafCount, leafIndex, txHash }.
 
 const DOMAIN_ID = 0;
 
-// Minimal ABI for the two contracts we interact with
+// Valid circuit names (V2)
+const VALID_CIRCUITS = ["deposit", "withdraw_ring", "collateral_ring"] as const;
+type CircuitName = typeof VALID_CIRCUITS[number];
+
 const SHIELDED_POOL_ABI = parseAbi([
   "function statementHash(uint256[] memory inputs) external view returns (bytes32)",
 ]);
@@ -39,8 +44,11 @@ export async function POST(req: NextRequest) {
   try {
     const { circuit, proof, publicSignals } = await req.json();
 
-    if (!["deposit", "withdraw", "collateral"].includes(circuit)) {
-      return NextResponse.json({ error: "Invalid circuit" }, { status: 400 });
+    if (!VALID_CIRCUITS.includes(circuit as CircuitName)) {
+      return NextResponse.json(
+        { error: `Invalid circuit. Expected one of: ${VALID_CIRCUITS.join(", ")}` },
+        { status: 400 }
+      );
     }
 
     const SEED_PHRASE = process.env.ZKVERIFY_SEED_PHRASE;
@@ -51,7 +59,12 @@ export async function POST(req: NextRequest) {
     const { zkVerifySession, ZkVerifyEvents, Library, CurveType } = await import("zkverifyjs");
 
     const keysDir = path.join(process.cwd(), "..", "circuits", "keys");
-    const vkey = JSON.parse(fs.readFileSync(path.join(keysDir, `${circuit}_vkey.json`), "utf8"));
+    // V2: circuit names map directly to vkey filenames
+    // withdraw_ring → withdraw_ring_vkey.json
+    // collateral_ring → collateral_ring_vkey.json
+    // deposit → deposit_vkey.json (unchanged)
+    const vkeyPath = path.join(keysDir, `${circuit}_vkey.json`);
+    const vkey = JSON.parse(fs.readFileSync(vkeyPath, "utf8"));
 
     const session = await zkVerifySession.start().Volta().withAccount(SEED_PHRASE);
 
@@ -73,17 +86,12 @@ export async function POST(req: NextRequest) {
         aggregationId = eventData.aggregationId ?? 0;
       });
 
-      // Wait for proof verification on Volta (not aggregation — that takes minutes)
       const result = await transactionResult;
 
-      // ── Post aggregation root to our ZkVerifyAggregation contract ────────────
-      // This makes the on-chain verification path work without waiting for the
-      // real Volta aggregation relayer (which may take 5+ minutes on testnet).
-      //
-      // We compute the same leaf that ShieldedPool._verifyAttestation() will check:
-      //   leaf = ShieldedPool.statementHash(publicSignals)
-      // Then wrap it in a single-leaf tree and post as an aggregation root.
-
+      // ── Post aggregation root for withdraw_ring proofs ────────────────────
+      // collateral_ring proofs are verified by zkVerify before borrow() is called;
+      // they don't need an on-chain aggregation root since V2 LendingPool doesn't
+      // call _verifyAttestation(). Only withdraw_ring needs the agg root.
       const DEPLOYER_KEY = process.env.DEPLOYER_PRIVATE_KEY;
       const ZK_AGG_ADDRESS = process.env.ZKVERIFY_AGGREGATION_ADDRESS as `0x${string}` | undefined;
       const POOL_ADDRESS = process.env.NEXT_PUBLIC_SHIELDED_POOL_ADDRESS as `0x${string}` | undefined;
@@ -92,14 +100,15 @@ export async function POST(req: NextRequest) {
       const leafCount = 1;
       const leafIndex = 0;
 
-      if (DEPLOYER_KEY && ZK_AGG_ADDRESS && POOL_ADDRESS && circuit === "withdraw") {
+      if (
+        circuit === "withdraw_ring" &&
+        DEPLOYER_KEY && ZK_AGG_ADDRESS && POOL_ADDRESS
+      ) {
         const publicClient = createPublicClient({
           chain: baseSepolia,
           transport: http("https://sepolia.base.org"),
         });
 
-        // Compute the statement leaf by calling ShieldedPool.statementHash on-chain.
-        // This guarantees exact match with what _verifyAttestation() will verify.
         const inputs = (publicSignals as string[]).map((s) => BigInt(s));
         const leaf = await publicClient.readContract({
           address: POOL_ADDRESS,
@@ -108,12 +117,7 @@ export async function POST(req: NextRequest) {
           args: [inputs],
         });
 
-        // Single-leaf aggregation root: keccak256(abi.encodePacked(leaf))
-        // Matches Merkle.sol's single-leaf logic in ZkVerifyAggregation tests
         const aggRoot = keccak256(encodePacked(["bytes32"], [leaf as `0x${string}`]));
-
-        // Derive a unique aggregation ID — use Volta's aggregationId if available,
-        // otherwise fall back to a timestamp-based ID
         const finalAggId = aggregationId !== 0 ? aggregationId : Math.floor(Date.now() / 1000);
 
         const account = privateKeyToAccount(DEPLOYER_KEY as `0x${string}`);

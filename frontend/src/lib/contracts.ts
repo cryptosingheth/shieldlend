@@ -1,12 +1,17 @@
 /**
- * ShieldLend Contract Interface
- * ==============================
- * Typed wrappers around ShieldedPool and LendingPool contract calls using wagmi/viem.
+ * ShieldLend Contract Interface — V2
+ * =====================================
+ * Typed wrappers around ShieldedPool, LendingPool, and NullifierRegistry using wagmi/viem.
+ *
+ * V2 changes vs V1:
+ *   - LENDING_POOL_ABI.borrow: removed Groth16 proof args (pA/pB/pC); collateral verified off-chain via zkVerify
+ *   - Added getOwed() read hook
+ *   - Added NULLIFIER_REGISTRY_ADDRESS + NULLIFIER_REGISTRY_ABI + useIsSpent hook
+ *   - Borrowed event: only emits loanId (no amount / recipient — privacy)
  */
 
-import { type Address, parseAbi, formatEther } from "viem";
+import { type Address, parseAbi } from "viem";
 import { baseSepolia } from "wagmi/chains";
-// wagmi write hooks
 import {
   useReadContract,
   useWriteContract,
@@ -25,6 +30,9 @@ export const SHIELDED_POOL_ADDRESS = (process.env.NEXT_PUBLIC_SHIELDED_POOL_ADDR
 export const LENDING_POOL_ADDRESS = (process.env.NEXT_PUBLIC_LENDING_POOL_ADDRESS ||
   "0x0000000000000000000000000000000000000000") as Address;
 
+export const NULLIFIER_REGISTRY_ADDRESS = (process.env.NEXT_PUBLIC_NULLIFIER_REGISTRY_ADDRESS ||
+  "0x0000000000000000000000000000000000000000") as Address;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ABIs (minimal — only what the frontend needs)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -37,7 +45,6 @@ export const SHIELDED_POOL_ABI = parseAbi([
   "function statementHash(uint256[] inputs) view returns (bytes32)",
   // Write
   "function deposit(bytes32 commitment) payable",
-  // New withdraw signature (post-dev-merge): removed `bytes proof`, added aggregation proof params
   "function withdraw(bytes32 root, bytes32 nullifierHash, address recipient, uint256 amount, uint256 domainId, uint256 aggregationId, bytes32[] merklePath, uint256 leafCount, uint256 leafIndex)",
   // Events
   "event Deposit(bytes32 indexed commitment, uint32 leafIndex, uint256 timestamp, uint256 amount)",
@@ -49,12 +56,17 @@ export const LENDING_POOL_ABI = parseAbi([
   "function getLoanDetails(uint256 loanId) view returns (bytes32 collateralNullifierHash, uint256 borrowed, uint256 currentInterest, uint256 totalOwed, bool repaid)",
   "function hasActiveLoan(bytes32 noteNullifierHash) view returns (bool)",
   "function activeLoanByNote(bytes32 noteNullifierHash) view returns (uint256)",
-  // Write
-  "function borrow(uint256[2] pA, uint256[2][2] pB, uint256[2] pC, bytes32 noteNullifierHash, uint256 borrowed, address recipient, uint256 zkVerifyAttestationId) payable",
+  "function getOwed(bytes32 nullifierHash) view returns (uint256)",
+  // V2 borrow: no Groth16 proof args — collateral verified off-chain via zkVerify
+  "function borrow(bytes32 noteNullifierHash, uint256 borrowed, uint256 collateralAmount, address recipient)",
   "function repay(uint256 loanId) payable",
-  // Events
-  "event Borrowed(uint256 indexed loanId, bytes32 indexed collateralNullifierHash, uint256 amount, address recipient)",
+  // Events — V2: Borrowed emits only loanId for privacy
+  "event Borrowed(uint256 indexed loanId)",
   "event Repaid(uint256 indexed loanId, uint256 totalRepaid)",
+]);
+
+export const NULLIFIER_REGISTRY_ABI = parseAbi([
+  "function isSpent(bytes32 nullifierHash) view returns (bool)",
 ]);
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -98,6 +110,34 @@ export function useLoanDetails(loanId: bigint | undefined) {
     functionName: "getLoanDetails",
     args: [loanId ?? 0n],
     query: { enabled: loanId !== undefined },
+  });
+}
+
+/**
+ * Get the total owed (principal + interest) for a collateral nullifier.
+ * Used by WithdrawForm to show auto-settle preview.
+ */
+export function useGetOwed(nullifierHash: `0x${string}` | undefined) {
+  return useReadContract({
+    address: LENDING_POOL_ADDRESS,
+    abi: LENDING_POOL_ABI,
+    functionName: "getOwed",
+    args: [nullifierHash ?? "0x0000000000000000000000000000000000000000000000000000000000000000"],
+    query: { enabled: !!nullifierHash },
+  });
+}
+
+/**
+ * Check if a nullifier has been spent on-chain.
+ * Used by Dashboard to sync local note state with NullifierRegistry.
+ */
+export function useIsSpent(nullifierHash: `0x${string}` | undefined) {
+  return useReadContract({
+    address: NULLIFIER_REGISTRY_ADDRESS,
+    abi: NULLIFIER_REGISTRY_ABI,
+    functionName: "isSpent",
+    args: [nullifierHash ?? "0x0000000000000000000000000000000000000000000000000000000000000000"],
+    query: { enabled: !!nullifierHash },
   });
 }
 

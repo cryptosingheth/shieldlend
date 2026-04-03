@@ -2,15 +2,16 @@
 
 import { useState, useEffect } from "react";
 import { parseEther, formatEther } from "viem";
-import { useAccount, usePublicClient, useWriteContract, useWaitForTransactionReceipt } from "wagmi";
-import { type Address } from "viem";
+import { useAccount, useWriteContract, useWaitForTransactionReceipt } from "wagmi";
 import { deserializeNote, generateCollateralProof } from "@/lib/circuits";
 import { useHasActiveLoan, useLoanDetails, fieldToBytes32, LENDING_POOL_ADDRESS, LENDING_POOL_ABI } from "@/lib/contracts";
 import { loadNotes, storedNoteToNote, noteLabel, type StoredNote } from "@/lib/noteStorage";
+import { useNoteKey } from "@/lib/noteKeyContext";
 
-const COLLATERAL_RATIO = 15000n; // 150% in BPS
+// V2: MIN_HEALTH_FACTOR_BPS = 11000 (110%) in LendingPool.sol
+const MIN_HEALTH_FACTOR_BPS = 11000n;
+const BPS_DENOMINATOR = 10000n;
 
-// Health factor color: green > 2.0, yellow 1.5–2.0, red < 1.5
 function healthColor(hf: number): string {
   if (hf >= 2.0) return "text-green-400";
   if (hf >= 1.5) return "text-amber-400";
@@ -25,17 +26,19 @@ function healthLabel(hf: number): string {
 
 export function BorrowForm() {
   const { address } = useAccount();
-  const publicClient = usePublicClient();
+  const { noteKey } = useNoteKey();
 
   // ── Note selection ────────────────────────────────────────────────────────
   const [savedNotes, setSavedNotes] = useState<StoredNote[]>([]);
   const [selectedNullifierHash, setSelectedNullifierHash] = useState<string>("");
-  const [noteJson, setNoteJson] = useState(""); // fallback manual paste
+  const [noteJson, setNoteJson] = useState("");
 
-  // Load saved notes on mount / address change
   useEffect(() => {
-    if (address) setSavedNotes(loadNotes(address).filter((n) => !n.spent));
-  }, [address]);
+    if (!address) return;
+    loadNotes(address, noteKey).then((notes) =>
+      setSavedNotes(notes.filter((n) => !n.spent))
+    );
+  }, [address, noteKey]);
 
   const selectedNote = savedNotes.find((n) => n.nullifierHash === selectedNullifierHash);
 
@@ -55,7 +58,9 @@ export function BorrowForm() {
   // ── Contract read hooks ───────────────────────────────────────────────────
   const nullifierHashHex =
     selectedNote?.nullifierHash ??
-    (noteJson ? (() => { try { return fieldToBytes32(deserializeNote(noteJson).nullifierHash); } catch { return undefined; } })() : undefined);
+    (noteJson
+      ? (() => { try { return fieldToBytes32(deserializeNote(noteJson).nullifierHash); } catch { return undefined; } })()
+      : undefined);
 
   const { data: hasLoan } = useHasActiveLoan(nullifierHashHex as `0x${string}` | undefined);
 
@@ -64,7 +69,6 @@ export function BorrowForm() {
     : undefined;
   const { data: loanDetails } = useLoanDetails(repayLoanIdBig);
 
-  // ── Repay wagmi hooks ─────────────────────────────────────────────────────
   const { writeContractAsync } = useWriteContract();
 
   // ── Derived: health factor preview ───────────────────────────────────────
@@ -73,14 +77,18 @@ export function BorrowForm() {
     : (() => { try { return deserializeNote(noteJson); } catch { return null; } })();
 
   const collateral = noteForCalc?.amount ?? 0n;
-  const borrowWei = borrowEth ? (() => { try { return parseEther(borrowEth); } catch { return 0n; } })() : 0n;
+  const borrowWei = borrowEth
+    ? (() => { try { return parseEther(borrowEth); } catch { return 0n; } })()
+    : 0n;
+
+  // HF = (collateral / borrowed) × 10000 / MIN_HEALTH_FACTOR_BPS
   const healthFactor =
     borrowWei > 0n && collateral > 0n
-      ? Number((collateral * 10000n) / (COLLATERAL_RATIO * borrowWei / 10000n)) / 10000
+      ? Number((collateral * BPS_DENOMINATOR) / (MIN_HEALTH_FACTOR_BPS * borrowWei / BPS_DENOMINATOR)) / 10000
       : null;
 
   const maxBorrowable = collateral > 0n
-    ? formatEther((collateral * 10000n) / COLLATERAL_RATIO)
+    ? formatEther((collateral * BPS_DENOMINATOR) / MIN_HEALTH_FACTOR_BPS)
     : null;
 
   // ── Borrow handler ────────────────────────────────────────────────────────
@@ -94,42 +102,45 @@ export function BorrowForm() {
       setBorrowError("");
       const borrowAmount = parseEther(borrowEth);
 
-      if (note.amount * 10000n < COLLATERAL_RATIO * borrowAmount) {
-        const minCollateral = formatEther((COLLATERAL_RATIO * borrowAmount) / 10000n);
+      // Client-side health check: collateral * 10000 >= borrowed * MIN_HEALTH_FACTOR_BPS
+      if (note.amount * BPS_DENOMINATOR < borrowAmount * MIN_HEALTH_FACTOR_BPS) {
+        const minCollateral = formatEther((MIN_HEALTH_FACTOR_BPS * borrowAmount) / BPS_DENOMINATOR);
         throw new Error(`Insufficient collateral. Need ${minCollateral} ETH, have ${formatEther(note.amount)} ETH`);
       }
 
       setBorrowStatus("proving");
+      // V2: circuit name is "collateral_ring" — server maps to collateral_ring_vkey.json
       const { proof, publicSignals } = await generateCollateralProof(
         note.amount,
         borrowAmount,
-        COLLATERAL_RATIO
+        MIN_HEALTH_FACTOR_BPS  // pass as minRatioBps
       );
 
       setBorrowStatus("zkverify");
       const zkRes = await fetch("/api/zkverify", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ circuit: "collateral", proof, publicSignals }),
+        body: JSON.stringify({ circuit: "collateral_ring", proof, publicSignals }),
       });
       if (!zkRes.ok) throw new Error(`zkVerify failed: ${await zkRes.text()}`);
-      const zkResult = await zkRes.json();
+      // zkVerify result confirmed — contract call below does not pass proof args (V2)
+      await zkRes.json();
 
       setBorrowStatus("submitting");
-      const res = await fetch("/api/borrow", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          proof,
-          publicSignals,
-          noteNullifierHash: fieldToBytes32(note.nullifierHash),
-          borrowed: borrowAmount.toString(),
-          recipient: address,
-          zkVerifyAttestationId: zkResult.aggregationId,
-        }),
+      // V2 borrow signature: (noteNullifierHash, borrowed, collateralAmount, recipient)
+      // No Groth16 proof args — collateral verified off-chain by zkVerify.
+      const txHash = await writeContractAsync({
+        address: LENDING_POOL_ADDRESS,
+        abi: LENDING_POOL_ABI,
+        functionName: "borrow",
+        args: [
+          fieldToBytes32(note.nullifierHash),
+          borrowAmount,
+          note.amount,           // collateralAmount — public signal from the circuit
+          address as `0x${string}`,
+        ],
       });
-      if (!res.ok) throw new Error(await res.text());
-      const { txHash } = await res.json();
+
       setBorrowTxHash(txHash);
       setBorrowStatus("done");
     } catch (err) {
@@ -144,15 +155,13 @@ export function BorrowForm() {
     try {
       setRepayError("");
       setRepayStatus("submitting");
-      // loanDetails is a named tuple: [collateralNullifierHash, borrowed, currentInterest, totalOwed, repaid]
       const d = loanDetails as unknown as { totalOwed: bigint };
-      const totalOwed = d.totalOwed;
       await writeContractAsync({
         address: LENDING_POOL_ADDRESS,
         abi: LENDING_POOL_ABI,
         functionName: "repay",
         args: [repayLoanIdBig!],
-        value: totalOwed,
+        value: d.totalOwed,
       });
       setRepayStatus("done");
     } catch (err) {
@@ -165,7 +174,7 @@ export function BorrowForm() {
 
   const borrowLabel: Record<typeof borrowStatus, string> = {
     idle: "Borrow",
-    proving: "Generating collateral proof (~15s)...",
+    proving: "Generating collateral ring proof (~25s)...",
     zkverify: "Submitting to zkVerify...",
     submitting: "Confirming borrow...",
     done: "Borrowed",
@@ -174,12 +183,11 @@ export function BorrowForm() {
 
   return (
     <div className="space-y-8">
-
       {/* ── Borrow section ────────────────────────────────────────────────── */}
       <div className="space-y-5">
         <div className="border border-zinc-800 rounded-lg p-4 bg-zinc-900/40 text-xs text-zinc-400 space-y-1">
-          <p>Prove collateral &gt; 150% of borrow amount using a ZK range proof.</p>
-          <p>Your collateral amount is never revealed on-chain — only the proof.</p>
+          <p>Prove collateral &gt; 110% of borrow amount (MIN_HEALTH_FACTOR_BPS = 11000) using a ZK ring proof.</p>
+          <p>Collateral amount and which note you own are never revealed on-chain.</p>
         </div>
 
         {/* Note selection */}
@@ -215,7 +223,6 @@ export function BorrowForm() {
             />
           )}
 
-          {/* Collateral summary */}
           {collateral > 0n && (
             <div className="mt-2 flex items-center gap-4 text-xs text-zinc-500">
               <span>Collateral: <span className="text-zinc-300 font-mono">{formatEther(collateral)} ETH</span></span>
@@ -247,14 +254,13 @@ export function BorrowForm() {
                        focus:outline-none focus:border-indigo-500 disabled:opacity-50 transition-colors"
           />
 
-          {/* Health factor preview */}
           {healthFactor !== null && (
             <div className="mt-2 flex items-center gap-2 text-xs">
               <span className="text-zinc-500">Health factor:</span>
               <span className={`font-semibold font-mono ${healthColor(healthFactor)}`}>
                 {healthFactor.toFixed(2)}
               </span>
-              <span className={`${healthColor(healthFactor)}`}>
+              <span className={healthColor(healthFactor)}>
                 · {healthLabel(healthFactor)}
               </span>
             </div>
@@ -283,7 +289,6 @@ export function BorrowForm() {
         )}
       </div>
 
-      {/* ── Divider ────────────────────────────────────────────────────────── */}
       <div className="border-t border-zinc-800" />
 
       {/* ── Repay section ─────────────────────────────────────────────────── */}
@@ -304,7 +309,6 @@ export function BorrowForm() {
           />
         </div>
 
-        {/* Loan details */}
         {loanDetails && (
           <div className="border border-zinc-800 rounded-lg p-4 bg-zinc-900/40 text-xs space-y-2">
             {(() => {
