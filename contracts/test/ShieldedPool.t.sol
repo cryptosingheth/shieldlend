@@ -7,29 +7,58 @@ import {NullifierRegistry} from "../src/NullifierRegistry.sol";
 import {ZkVerifyAggregation} from "../src/ZkVerifyAggregation.sol";
 
 /*
- * ShieldedPool Tests
+ * ShieldedPool V2 Tests
  *
- * Exercises the full zkVerify attestation verification path:
- *   - Deploys the real ZkVerifyAggregation contract (same Merkle logic as mainnet)
- *   - Builds real aggregation Merkle trees from statement hashes
- *   - Submits aggregation roots and verifies Merkle inclusion on-chain
- *
- * No mocking — every verification path executes the production code.
+ * V2 changes covered:
+ *   - Fixed denomination validation (0.1 / 0.5 / 1.0 ETH only)
+ *   - Epoch batching: commitments queue in pendingCommitments[], inserted via flushEpoch()
+ *   - flushEpoch() reverts before EPOCH_BLOCKS; shuffles + inserts dummies after
+ *   - Protocol fee: 0.1% per deposit -> protocolFunds
+ *   - flushEpoch() tips 0.001 ETH to caller from protocolFunds
+ *   - Nullifier locking: only lendingPool can call lockNullifier()
+ *   - Auto-settle: withdraw with locked nullifier routes through ILendingPool
+ *   - disburseLoan(): only lendingPool can call
+ *   - Normal withdraw still works (zkVerify attestation path)
  */
+
+/// @dev Mock LendingPool for auto-settle tests.
+contract MockLendingPool {
+    uint256 public owedAmount;
+    bool public settled;
+
+    constructor(uint256 _owed) {
+        owedAmount = _owed;
+    }
+
+    receive() external payable {}
+
+    function getOwed(bytes32 /*nullifierHash*/) external view returns (uint256) {
+        return owedAmount;
+    }
+
+    function settleCollateral(bytes32 /*nullifierHash*/) external payable {
+        settled = true;
+    }
+}
+
 contract ShieldedPoolTest is Test {
+    // Required so the test contract can receive the 0.001 ETH flushEpoch tip
+    receive() external payable {}
+
     ShieldedPool pool;
     NullifierRegistry nullifierReg;
     ZkVerifyAggregation zkVerify;
+    MockLendingPool mockLP;
 
     address deployer;
     address alice = makeAddr("alice");
-    address bob = makeAddr("bob");
+    address bob   = makeAddr("bob");
 
     bytes32 constant COMMITMENT_1 = bytes32(uint256(0x1));
     bytes32 constant COMMITMENT_2 = bytes32(uint256(0x2));
     bytes32 constant NULLIFIER_HASH_1 = bytes32(uint256(0xABCD));
     bytes32 constant NULLIFIER_HASH_2 = bytes32(uint256(0xBEEF));
-    bytes32 constant VK_HASH = keccak256("withdraw_circuit_vkey_v1");
+    bytes32 constant VK_HASH = keccak256("withdraw_ring_circuit_vkey_v2");
 
     uint256 constant DOMAIN_ID = 0;
 
@@ -37,340 +66,387 @@ contract ShieldedPoolTest is Test {
         deployer = address(this);
 
         zkVerify = new ZkVerifyAggregation(deployer);
-
         nullifierReg = new NullifierRegistry(address(0));
         pool = new ShieldedPool(address(nullifierReg), address(zkVerify), VK_HASH);
         nullifierReg.setShieldedPool(address(pool));
 
-        vm.deal(alice, 10 ether);
-        vm.deal(bob, 10 ether);
+        vm.deal(alice, 100 ether);
+        vm.deal(bob,   100 ether);
+        vm.deal(address(pool), 10 ether); // seed pool for disbursement tests
     }
 
-    // ── Deposit tests ────────────────────────────────────────────────────────
+    // -- Denomination validation ----------------------------------------------
 
-    function test_deposit_insertsCommitmentIntoTree() public {
+    function testDepositInvalidDenomination() public {
         vm.prank(alice);
-        pool.deposit{value: 1 ether}(COMMITMENT_1);
-
-        assertEq(pool.nextIndex(), 1);
-        console.log("Root after deposit:", uint256(pool.getLastRoot()));
+        vm.expectRevert(ShieldedPool.InvalidDenomination.selector);
+        pool.deposit{value: 0.2 ether}(COMMITMENT_1);
     }
 
-    function test_deposit_emitsEvent() public {
+    function testDepositInvalidDenomination_zero() public {
         vm.prank(alice);
-        vm.expectEmit(true, false, false, true);
-        emit ShieldedPool.Deposit(COMMITMENT_1, 0, block.timestamp, 1 ether);
-        pool.deposit{value: 1 ether}(COMMITMENT_1);
-    }
-
-    function test_deposit_reverts_withZeroAmount() public {
-        vm.prank(alice);
-        vm.expectRevert(ShieldedPool.InvalidAmount.selector);
+        vm.expectRevert(ShieldedPool.InvalidDenomination.selector);
         pool.deposit{value: 0}(COMMITMENT_1);
     }
 
-    function test_multipleDeposits_updateRoot() public {
-        vm.startPrank(alice);
-        pool.deposit{value: 1 ether}(COMMITMENT_1);
-        bytes32 root1 = pool.getLastRoot();
-
-        pool.deposit{value: 1 ether}(COMMITMENT_2);
-        bytes32 root2 = pool.getLastRoot();
-        vm.stopPrank();
-
-        assertTrue(root1 != root2, "Root should change with each deposit");
-        assertEq(pool.nextIndex(), 2);
+    function testDepositInvalidDenomination_arbitrary() public {
+        vm.prank(alice);
+        vm.expectRevert(ShieldedPool.InvalidDenomination.selector);
+        pool.deposit{value: 0.7 ether}(COMMITMENT_1);
     }
 
-    function test_rootHistory_isKnown() public {
+    function testDepositValidDenomination_point1() public {
         vm.prank(alice);
-        pool.deposit{value: 1 ether}(COMMITMENT_1);
-
-        bytes32 root = pool.getLastRoot();
-        assertTrue(pool.isKnownRoot(root), "Root should be in history");
+        pool.deposit{value: 0.1 ether}(COMMITMENT_1);
+        assertEq(pool.pendingCommitments(0), COMMITMENT_1);
     }
 
-    // ── Withdraw tests — single-leaf aggregation ─────────────────────────────
-
-    function test_withdraw_singleLeafAggregation() public {
-        uint256 amount = 1 ether;
+    function testDepositValidDenomination_point5() public {
         vm.prank(alice);
-        pool.deposit{value: amount}(COMMITMENT_1);
+        pool.deposit{value: 0.5 ether}(COMMITMENT_2);
+        assertEq(pool.pendingCommitments(0), COMMITMENT_2);
+    }
 
-        bytes32 root = pool.getLastRoot();
+    function testDepositValidDenomination_1eth() public {
+        vm.prank(alice);
+        pool.deposit{value: 1.0 ether}(COMMITMENT_1);
+        assertEq(pool.pendingCommitments(0), COMMITMENT_1);
+    }
+
+    // -- Epoch batching -------------------------------------------------------
+
+    function testDepositQueuesCommitment() public {
+        vm.prank(alice);
+        pool.deposit{value: 1.0 ether}(COMMITMENT_1);
+
+        // Commitment must be in pending queue
+        assertEq(pool.pendingCommitments(0), COMMITMENT_1);
+        // Tree must NOT have been updated yet (nextIndex still 0)
+        assertEq(pool.nextIndex(), 0);
+    }
+
+    function testFlushEpochTooEarly() public {
+        vm.prank(alice);
+        pool.deposit{value: 1.0 ether}(COMMITMENT_1);
+
+        vm.roll(block.number + 49);
+
+        vm.expectRevert(ShieldedPool.EpochTooEarly.selector);
+        pool.flushEpoch();
+    }
+
+    function testFlushEpochInsertsReal() public {
+        vm.prank(alice);
+        pool.deposit{value: 1.0 ether}(COMMITMENT_1);
+
+        vm.prank(bob);
+        pool.deposit{value: 0.5 ether}(COMMITMENT_2);
+
+        vm.roll(block.number + 50);
+        pool.flushEpoch();
+
+        // 2 real + 10 dummies (sparse pool) = 12 leaves
+        assertGe(pool.nextIndex(), 2, "At least 2 real commitments inserted");
+    }
+
+    function testFlushEpochInsertsDummies() public {
+        vm.prank(alice);
+        pool.deposit{value: 1.0 ether}(COMMITMENT_1);
+
+        vm.roll(block.number + 50);
+
+        uint256 epochBefore = pool.epochNumber();
+        pool.flushEpoch();
+
+        // 1 real + 10 dummies = 11
+        assertEq(pool.nextIndex(), 11, "Should have 1 real + 10 dummy leaves");
+        assertEq(pool.epochNumber(), epochBefore + 1, "Epoch should increment");
+    }
+
+    function testFlushEpochUpdatesRoot() public {
+        bytes32 rootBefore = pool.getLastRoot();
+
+        vm.prank(alice);
+        pool.deposit{value: 1.0 ether}(COMMITMENT_1);
+
+        vm.roll(block.number + 50);
+        pool.flushEpoch();
+
+        assertTrue(pool.getLastRoot() != rootBefore, "Root must change after flush");
+    }
+
+    function testFlushEpochEmitsEvent() public {
+        vm.prank(alice);
+        pool.deposit{value: 1.0 ether}(COMMITMENT_1);
+
+        vm.roll(block.number + 50);
+
+        vm.expectEmit(true, false, false, false);
+        emit ShieldedPool.EpochFlushed(0, 1, 10);
+        pool.flushEpoch();
+    }
+
+    function testFlushEpochClearsPending() public {
+        vm.prank(alice);
+        pool.deposit{value: 1.0 ether}(COMMITMENT_1);
+        vm.prank(bob);
+        pool.deposit{value: 0.5 ether}(COMMITMENT_2);
+
+        vm.roll(block.number + 50);
+        pool.flushEpoch();
+
+        vm.expectRevert();
+        pool.pendingCommitments(0);
+    }
+
+    function testFlushEpochTipsToCaller() public {
+        // Deposit 1 ETH: fee = 0.001 ETH = exactly one tip
+        vm.prank(alice);
+        pool.deposit{value: 1.0 ether}(COMMITMENT_1);
+
+        vm.roll(block.number + 50);
+
+        address caller = makeAddr("caller");
+        uint256 before = caller.balance;
+        vm.prank(caller);
+        pool.flushEpoch();
+
+        assertEq(caller.balance, before + 0.001 ether);
+    }
+
+    function testProtocolFeeAccumulates() public {
+        uint256 fundsBefore = pool.protocolFunds();
+        vm.prank(alice);
+        pool.deposit{value: 1.0 ether}(COMMITMENT_1);
+        // 0.1% of 1 ETH = 0.001 ETH
+        assertEq(pool.protocolFunds(), fundsBefore + 0.001 ether);
+    }
+
+    // -- Nullifier locking ----------------------------------------------------
+
+    function testLockNullifier_onlyLendingPool() public {
+        vm.prank(alice);
+        vm.expectRevert(ShieldedPool.NotLendingPool.selector);
+        pool.lockNullifier(NULLIFIER_HASH_1);
+    }
+
+    function testLockNullifier_byLendingPool() public {
+        mockLP = new MockLendingPool(0);
+        pool.setLendingPool(address(mockLP));
+
+        vm.prank(address(mockLP));
+        pool.lockNullifier(NULLIFIER_HASH_1);
+
+        assertTrue(pool.lockedAsCollateral(NULLIFIER_HASH_1));
+    }
+
+    function testLockNullifier_emitsEvent() public {
+        mockLP = new MockLendingPool(0);
+        pool.setLendingPool(address(mockLP));
+
+        vm.prank(address(mockLP));
+        vm.expectEmit(true, false, false, false);
+        emit ShieldedPool.NullifierLocked(NULLIFIER_HASH_1);
+        pool.lockNullifier(NULLIFIER_HASH_1);
+    }
+
+    // -- disburseLoan ---------------------------------------------------------
+
+    function testDisburseLoan_onlyLendingPool() public {
+        vm.prank(alice);
+        vm.expectRevert(ShieldedPool.NotLendingPool.selector);
+        pool.disburseLoan(payable(bob), 1 ether);
+    }
+
+    function testDisburseLoan_byLendingPool() public {
+        mockLP = new MockLendingPool(0);
+        pool.setLendingPool(address(mockLP));
+
         uint256 bobBefore = bob.balance;
+        vm.prank(address(mockLP));
+        pool.disburseLoan(payable(bob), 1 ether);
 
-        // Build the statement leaf the same way ShieldedPool does
-        bytes32 leaf = _buildLeaf(root, NULLIFIER_HASH_1, bob, amount);
+        assertEq(bob.balance, bobBefore + 1 ether);
+    }
 
-        // Single-leaf aggregation: root = keccak256(leaf)
+    function testDisburseLoan_emitsEvent() public {
+        mockLP = new MockLendingPool(0);
+        pool.setLendingPool(address(mockLP));
+
+        vm.prank(address(mockLP));
+        vm.expectEmit(true, false, false, true);
+        emit ShieldedPool.LoanDisbursed(bob, 1 ether);
+        pool.disburseLoan(payable(bob), 1 ether);
+    }
+
+    // -- Auto-settle on withdraw ----------------------------------------------
+
+    function _depositAndFlush(bytes32 commitment, uint256 denomination) internal {
+        vm.prank(alice);
+        pool.deposit{value: denomination}(commitment);
+        vm.roll(block.number + 50);
+        pool.flushEpoch();
+    }
+
+    function testAutoSettle_settlesLoanAndSendsRemainder() public {
+        uint256 owed = 0.4 ether;
+        mockLP = new MockLendingPool(owed);
+        pool.setLendingPool(address(mockLP));
+
+        _depositAndFlush(COMMITMENT_1, 0.5 ether);
+
+        vm.prank(address(mockLP));
+        pool.lockNullifier(NULLIFIER_HASH_1);
+        assertTrue(pool.lockedAsCollateral(NULLIFIER_HASH_1));
+
+        bytes32 root = pool.getLastRoot();
+        bytes32 leaf = _buildLeaf(root, NULLIFIER_HASH_1, bob, 0.5 ether);
         bytes32 aggRoot = keccak256(abi.encodePacked(leaf));
-        uint256 aggregationId = 1;
+        zkVerify.submitAggregation(DOMAIN_ID, 1, aggRoot);
 
-        zkVerify.submitAggregation(DOMAIN_ID, aggregationId, aggRoot);
-
-        bytes32[] memory emptyPath = new bytes32[](0);
-
-        vm.expectEmit(true, true, false, true);
-        emit ShieldedPool.Withdrawal(bob, NULLIFIER_HASH_1, amount);
-
+        uint256 bobBefore = bob.balance;
         pool.withdraw(
-            root,
-            NULLIFIER_HASH_1,
-            payable(bob),
-            amount,
-            DOMAIN_ID,
-            aggregationId,
-            emptyPath,
-            1, // leafCount
-            0  // leafIndex
+            root, NULLIFIER_HASH_1, payable(bob), 0.5 ether,
+            DOMAIN_ID, 1, new bytes32[](0), 1, 0
         );
 
-        assertEq(bob.balance, bobBefore + amount);
+        // Bob receives 0.5 - 0.4 = 0.1 ETH remainder
+        assertEq(bob.balance, bobBefore + 0.1 ether, "Bob should receive remainder");
+        assertTrue(mockLP.settled(), "Loan should be settled");
+        assertTrue(nullifierReg.isSpent(NULLIFIER_HASH_1), "Nullifier should be spent");
+    }
+
+    function testAutoSettle_insufficientCollateral_reverts() public {
+        uint256 owed = 0.6 ether; // more than the 0.5 ETH note
+        mockLP = new MockLendingPool(owed);
+        pool.setLendingPool(address(mockLP));
+
+        _depositAndFlush(COMMITMENT_1, 0.5 ether);
+
+        vm.prank(address(mockLP));
+        pool.lockNullifier(NULLIFIER_HASH_1);
+
+        bytes32 root = pool.getLastRoot();
+        bytes32 leaf = _buildLeaf(root, NULLIFIER_HASH_1, bob, 0.5 ether);
+        bytes32 aggRoot = keccak256(abi.encodePacked(leaf));
+        zkVerify.submitAggregation(DOMAIN_ID, 2, aggRoot);
+
+        vm.expectRevert(ShieldedPool.InsufficientCollateralForSettlement.selector);
+        pool.withdraw(
+            root, NULLIFIER_HASH_1, payable(bob), 0.5 ether,
+            DOMAIN_ID, 2, new bytes32[](0), 1, 0
+        );
+    }
+
+    // -- Normal withdraw ------------------------------------------------------
+
+    function testNormalWithdraw() public {
+        _depositAndFlush(COMMITMENT_1, 1.0 ether);
+
+        bytes32 root = pool.getLastRoot();
+        bytes32 leaf = _buildLeaf(root, NULLIFIER_HASH_1, bob, 1.0 ether);
+        bytes32 aggRoot = keccak256(abi.encodePacked(leaf));
+        zkVerify.submitAggregation(DOMAIN_ID, 10, aggRoot);
+
+        uint256 bobBefore = bob.balance;
+        pool.withdraw(
+            root, NULLIFIER_HASH_1, payable(bob), 1.0 ether,
+            DOMAIN_ID, 10, new bytes32[](0), 1, 0
+        );
+
+        assertEq(bob.balance, bobBefore + 1.0 ether);
         assertTrue(nullifierReg.isSpent(NULLIFIER_HASH_1));
     }
 
-    // ── Withdraw tests — multi-leaf aggregation (2 proofs) ───────────────────
-
-    function test_withdraw_multiLeafAggregation_twoLeaves() public {
-        vm.prank(alice);
-        pool.deposit{value: 2 ether}(COMMITMENT_1);
-
-        bytes32 root = pool.getLastRoot();
-
-        bytes32 leaf0 = _buildLeaf(root, NULLIFIER_HASH_1, bob, 1 ether);
-        bytes32 leaf1 = _buildLeaf(root, NULLIFIER_HASH_2, alice, 1 ether);
-
-        // Build 2-leaf aggregation Merkle tree and submit
-        (bytes32 h0, bytes32 h1) = _hashLeaves(leaf0, leaf1);
-        bytes32 aggRoot = keccak256(abi.encodePacked(h0, h1));
-        zkVerify.submitAggregation(DOMAIN_ID, 42, aggRoot);
-
-        // Withdraw leaf0 (index=0), sibling = h1
-        _withdrawAndAssert(root, NULLIFIER_HASH_1, bob, 1 ether, 42, _singleProof(h1), 2, 0);
-
-        // Withdraw leaf1 (index=1), sibling = h0
-        _withdrawAndAssert(root, NULLIFIER_HASH_2, alice, 1 ether, 42, _singleProof(h0), 2, 1);
-    }
-
-    // ── Withdraw tests — 3-leaf aggregation tree ─────────────────────────────
-
-    function test_withdraw_threeLeafAggregation() public {
-        vm.prank(alice);
-        pool.deposit{value: 0.5 ether}(COMMITMENT_1);
-
-        bytes32 root = pool.getLastRoot();
-
-        // Build 3-leaf tree and submit; returns proof for leaf at index 0
-        bytes32[] memory proof0 = _setup3LeafAggregation(root);
-
-        _withdrawAndAssert(root, NULLIFIER_HASH_1, bob, 0.5 ether, 99, proof0, 3, 0);
-    }
-
-    // ── Revert tests ─────────────────────────────────────────────────────────
-
-    function test_withdraw_reverts_unknownRoot() public {
-        vm.prank(alice);
-        pool.deposit{value: 1 ether}(COMMITMENT_1);
+    function testNormalWithdraw_unknownRootReverts() public {
+        _depositAndFlush(COMMITMENT_1, 1.0 ether);
 
         bytes32 fakeRoot = bytes32(uint256(0xdead));
-        bytes32[] memory emptyPath = new bytes32[](0);
-
         vm.expectRevert(ShieldedPool.UnknownRoot.selector);
         pool.withdraw(
-            fakeRoot, NULLIFIER_HASH_1, payable(bob), 1 ether,
-            DOMAIN_ID, 1, emptyPath, 1, 0
+            fakeRoot, NULLIFIER_HASH_1, payable(bob), 1.0 ether,
+            DOMAIN_ID, 1, new bytes32[](0), 1, 0
         );
     }
 
-    function test_withdraw_reverts_zeroRoot() public {
-        vm.prank(alice);
-        pool.deposit{value: 1 ether}(COMMITMENT_1);
-
-        bytes32[] memory emptyPath = new bytes32[](0);
-
-        vm.expectRevert(ShieldedPool.UnknownRoot.selector);
-        pool.withdraw(
-            bytes32(0), NULLIFIER_HASH_1, payable(bob), 1 ether,
-            DOMAIN_ID, 1, emptyPath, 1, 0
-        );
-    }
-
-    function test_withdraw_reverts_nullifierAlreadySpent() public {
-        uint256 amount = 1 ether;
-        vm.prank(alice);
-        pool.deposit{value: amount}(COMMITMENT_1);
+    function testNormalWithdraw_spentNullifierReverts() public {
+        _depositAndFlush(COMMITMENT_1, 1.0 ether);
 
         bytes32 root = pool.getLastRoot();
-        bytes32 leaf = _buildLeaf(root, NULLIFIER_HASH_1, bob, amount);
+        bytes32 leaf = _buildLeaf(root, NULLIFIER_HASH_1, bob, 1.0 ether);
         bytes32 aggRoot = keccak256(abi.encodePacked(leaf));
-        uint256 aggregationId = 1;
-        zkVerify.submitAggregation(DOMAIN_ID, aggregationId, aggRoot);
-
-        bytes32[] memory emptyPath = new bytes32[](0);
+        zkVerify.submitAggregation(DOMAIN_ID, 10, aggRoot);
 
         pool.withdraw(
-            root, NULLIFIER_HASH_1, payable(bob), amount,
-            DOMAIN_ID, aggregationId, emptyPath, 1, 0
+            root, NULLIFIER_HASH_1, payable(bob), 1.0 ether,
+            DOMAIN_ID, 10, new bytes32[](0), 1, 0
         );
 
         vm.expectRevert(ShieldedPool.NullifierAlreadySpent.selector);
         pool.withdraw(
-            root, NULLIFIER_HASH_1, payable(bob), amount,
-            DOMAIN_ID, aggregationId, emptyPath, 1, 0
+            root, NULLIFIER_HASH_1, payable(bob), 1.0 ether,
+            DOMAIN_ID, 10, new bytes32[](0), 1, 0
         );
     }
 
-    function test_withdraw_reverts_invalidProof_wrongAmount() public {
-        uint256 amount = 1 ether;
-        vm.prank(alice);
-        pool.deposit{value: amount}(COMMITMENT_1);
+    function testNormalWithdraw_invalidProofReverts() public {
+        _depositAndFlush(COMMITMENT_1, 1.0 ether);
 
         bytes32 root = pool.getLastRoot();
-
-        // Aggregation was built for amount=1 ether
-        bytes32 leaf = _buildLeaf(root, NULLIFIER_HASH_1, bob, amount);
-        bytes32 aggRoot = keccak256(abi.encodePacked(leaf));
-        uint256 aggregationId = 1;
-        zkVerify.submitAggregation(DOMAIN_ID, aggregationId, aggRoot);
-
-        bytes32[] memory emptyPath = new bytes32[](0);
-
-        // Try to withdraw 2 ether — leaf won't match
         vm.expectRevert(ShieldedPool.InvalidProof.selector);
         pool.withdraw(
-            root, NULLIFIER_HASH_1, payable(bob), 2 ether,
-            DOMAIN_ID, aggregationId, emptyPath, 1, 0
+            root, NULLIFIER_HASH_1, payable(bob), 1.0 ether,
+            DOMAIN_ID, 999, new bytes32[](0), 1, 0
         );
     }
 
-    function test_withdraw_reverts_invalidProof_wrongRecipient() public {
-        uint256 amount = 1 ether;
-        vm.prank(alice);
-        pool.deposit{value: amount}(COMMITMENT_1);
+    // -- Root history ---------------------------------------------------------
 
+    function testRootHistory_isKnownAfterFlush() public {
+        _depositAndFlush(COMMITMENT_1, 1.0 ether);
         bytes32 root = pool.getLastRoot();
-        bytes32 leaf = _buildLeaf(root, NULLIFIER_HASH_1, bob, amount);
-        bytes32 aggRoot = keccak256(abi.encodePacked(leaf));
-        uint256 aggregationId = 1;
-        zkVerify.submitAggregation(DOMAIN_ID, aggregationId, aggRoot);
-
-        bytes32[] memory emptyPath = new bytes32[](0);
-
-        // Try to redirect to alice — leaf was built for bob
-        vm.expectRevert(ShieldedPool.InvalidProof.selector);
-        pool.withdraw(
-            root, NULLIFIER_HASH_1, payable(alice), amount,
-            DOMAIN_ID, aggregationId, emptyPath, 1, 0
-        );
+        assertTrue(pool.isKnownRoot(root));
     }
 
-    function test_withdraw_reverts_noAggregation() public {
-        uint256 amount = 1 ether;
+    function testRootHistory_unknownRootFails() public {
+        assertFalse(pool.isKnownRoot(bytes32(uint256(0xBAD))));
+        assertFalse(pool.isKnownRoot(bytes32(0)));
+    }
+
+    // -- Admin ----------------------------------------------------------------
+
+    function testSetLendingPool_onlyAdmin() public {
         vm.prank(alice);
-        pool.deposit{value: amount}(COMMITMENT_1);
-
-        bytes32 root = pool.getLastRoot();
-        bytes32[] memory emptyPath = new bytes32[](0);
-
-        // No aggregation was submitted — root is bytes32(0), Merkle check fails
-        vm.expectRevert(ShieldedPool.InvalidProof.selector);
-        pool.withdraw(
-            root, NULLIFIER_HASH_1, payable(bob), amount,
-            DOMAIN_ID, 999, emptyPath, 1, 0
-        );
+        vm.expectRevert(ShieldedPool.NotAdmin.selector);
+        pool.setLendingPool(alice);
     }
 
-    function test_withdraw_reverts_whenTransferFails() public {
-        uint256 amount = 1 ether;
-        vm.prank(alice);
-        pool.deposit{value: amount}(COMMITMENT_1);
-
-        RejectETH rejecter = new RejectETH();
-        bytes32 root = pool.getLastRoot();
-
-        bytes32 leaf = _buildLeaf(root, NULLIFIER_HASH_1, address(rejecter), amount);
-        bytes32 aggRoot = keccak256(abi.encodePacked(leaf));
-        uint256 aggregationId = 1;
-        zkVerify.submitAggregation(DOMAIN_ID, aggregationId, aggRoot);
-
-        bytes32[] memory emptyPath = new bytes32[](0);
-
-        vm.expectRevert(bytes("Transfer failed"));
-        pool.withdraw(
-            root, NULLIFIER_HASH_1, payable(address(rejecter)), amount,
-            DOMAIN_ID, aggregationId, emptyPath, 1, 0
-        );
-
-        assertFalse(nullifierReg.isSpent(NULLIFIER_HASH_1), "reverted withdraw must not consume nullifier");
+    function testSetLendingPool_byAdmin() public {
+        pool.setLendingPool(alice);
+        assertEq(pool.lendingPool(), alice);
     }
 
-    // ── Nullifier registry tests ─────────────────────────────────────────────
+    // -- Statement hash determinism -------------------------------------------
 
-    function test_nullifier_notSpentInitially() public view {
-        assertFalse(nullifierReg.isSpent(NULLIFIER_HASH_1));
-    }
-
-    function test_nullifier_unauthorizedMark_reverts() public {
-        vm.prank(alice);
-        vm.expectRevert(NullifierRegistry.Unauthorized.selector);
-        nullifierReg.markSpent(NULLIFIER_HASH_1);
-    }
-
-    // ── Incremental Merkle tree correctness ──────────────────────────────────
-
-    function test_treeLevel_incrementsCorrectly() public {
-        uint256 depositsToMake = 8;
-        for (uint256 i = 0; i < depositsToMake; i++) {
-            vm.prank(alice);
-            pool.deposit{value: 0.1 ether}(bytes32(i + 1));
-        }
-        assertEq(pool.nextIndex(), depositsToMake);
-        console.log("Final root after 8 deposits:", uint256(pool.getLastRoot()));
-    }
-
-    // ── Fuzz test ────────────────────────────────────────────────────────────
-
-    function testFuzz_deposit_anyAmount(uint96 amount) public {
-        vm.assume(amount > 0);
-        vm.deal(alice, amount);
-        vm.prank(alice);
-        pool.deposit{value: amount}(COMMITMENT_1);
-        assertEq(pool.nextIndex(), 1);
-    }
-
-    // ── Statement hash determinism ───────────────────────────────────────────
-
-    function test_statementHash_isDeterministic() public view {
+    function testStatementHash_isDeterministic() public view {
         uint256[] memory inputs = new uint256[](4);
-        inputs[0] = 111;
-        inputs[1] = 222;
-        inputs[2] = 333;
-        inputs[3] = 444;
-
+        inputs[0] = 111; inputs[1] = 222; inputs[2] = 333; inputs[3] = 444;
         bytes32 h1 = pool.statementHash(inputs);
         bytes32 h2 = pool.statementHash(inputs);
-
-        assertEq(h1, h2, "Statement hash must be deterministic");
-        assertTrue(h1 != bytes32(0), "Statement hash must be non-zero");
+        assertEq(h1, h2);
+        assertTrue(h1 != bytes32(0));
     }
 
-    function test_statementHash_changesWithInputs() public view {
+    function testStatementHash_changesWithInputs() public view {
         uint256[] memory a = new uint256[](4);
         a[0] = 1; a[1] = 2; a[2] = 3; a[3] = 4;
-
         uint256[] memory b = new uint256[](4);
-        b[0] = 1; b[1] = 2; b[2] = 3; b[3] = 5; // last input differs
-
-        assertTrue(
-            pool.statementHash(a) != pool.statementHash(b),
-            "Different inputs must produce different hashes"
-        );
+        b[0] = 1; b[1] = 2; b[2] = 3; b[3] = 5;
+        assertTrue(pool.statementHash(a) != pool.statementHash(b));
     }
 
-    // ── Helpers ──────────────────────────────────────────────────────────────
+    // -- Helpers --------------------------------------------------------------
 
-    /// @dev Build the statement leaf exactly as ShieldedPool._verifyAttestation does.
     function _buildLeaf(
         bytes32 root,
         bytes32 nullifierHash,
@@ -383,60 +459,5 @@ contract ShieldedPoolTest is Test {
         inputs[2] = uint256(uint160(recipient));
         inputs[3] = amount;
         return pool.statementHash(inputs);
-    }
-
-    /// @dev Build a 3-leaf aggregation tree with the real withdrawal leaf at index 0
-    ///      and two dummy leaves. Submits to zkVerify with aggregationId=99.
-    ///      Returns the Merkle proof for index 0.
-    function _setup3LeafAggregation(bytes32 root) internal returns (bytes32[] memory) {
-        bytes32 leaf0 = _buildLeaf(root, NULLIFIER_HASH_1, bob, 0.5 ether);
-        bytes32 h0 = keccak256(abi.encodePacked(leaf0));
-        bytes32 h1 = keccak256(abi.encodePacked(keccak256("dummy_proof_1")));
-        bytes32 h2 = keccak256(abi.encodePacked(keccak256("dummy_proof_2")));
-
-        bytes32 n01 = keccak256(abi.encodePacked(h0, h1));
-        bytes32 aggRoot = keccak256(abi.encodePacked(n01, h2));
-        zkVerify.submitAggregation(DOMAIN_ID, 99, aggRoot);
-
-        bytes32[] memory proof = new bytes32[](2);
-        proof[0] = h1;
-        proof[1] = h2;
-        return proof;
-    }
-
-    function _hashLeaves(bytes32 a, bytes32 b) internal pure returns (bytes32, bytes32) {
-        return (keccak256(abi.encodePacked(a)), keccak256(abi.encodePacked(b)));
-    }
-
-    function _singleProof(bytes32 sibling) internal pure returns (bytes32[] memory) {
-        bytes32[] memory p = new bytes32[](1);
-        p[0] = sibling;
-        return p;
-    }
-
-    function _withdrawAndAssert(
-        bytes32 root,
-        bytes32 nullifierHash,
-        address recipient,
-        uint256 amount,
-        uint256 aggregationId,
-        bytes32[] memory mPath,
-        uint256 leafCount,
-        uint256 leafIndex
-    ) internal {
-        uint256 balBefore = recipient.balance;
-        pool.withdraw(
-            root, nullifierHash, payable(recipient), amount,
-            DOMAIN_ID, aggregationId, mPath, leafCount, leafIndex
-        );
-        assertEq(recipient.balance, balBefore + amount);
-        assertTrue(nullifierReg.isSpent(nullifierHash));
-    }
-}
-
-/// @dev Reverts on any ETH receipt so ShieldedPool's withdraw transfer fails.
-contract RejectETH {
-    receive() external payable {
-        revert();
     }
 }

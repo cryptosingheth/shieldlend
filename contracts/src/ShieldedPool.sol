@@ -6,37 +6,29 @@ import {PoseidonT3} from "poseidon-solidity/PoseidonT3.sol";
 import {IZkVerifyAggregation} from "./interfaces/IZkVerifyAggregation.sol";
 
 /*
- * ShieldedPool — ShieldLend
+ * ShieldedPool — ShieldLend V2
  *
- * Maintains an incremental Merkle tree of deposit commitments.
- * Handles private deposits and withdrawals via ZK proof verification.
- *
- * Architecture:
- *   1. User computes commitment = Poseidon(nullifier, secret, amount) off-chain
- *   2. User calls deposit(commitment) with msg.value = amount
- *   3. Commitment is inserted into the Merkle tree
- *   4. To withdraw, user generates a ZK proof (withdraw.circom) and calls withdraw()
- *   5. ShieldedPool verifies the proof via zkVerify attestation
- *   6. NullifierRegistry marks the nullifierHash as spent
- *   7. Funds sent to recipient
- *
- * Revision note — Incremental Merkle Tree:
- *   A standard Merkle tree requires rebuilding the entire tree when a leaf is added.
- *   An incremental Merkle tree maintains O(log N) "filledSubTrees" — partial hashes
- *   at each level — allowing O(log N) insertion without touching the rest of the tree.
- *   This is the standard pattern used by Tornado Cash and all privacy protocols.
- *
- * zkVerify integration:
- *   Instead of verifying the ZK proof on-chain (costly: ~500K gas for Groth16),
- *   ShieldedPool accepts a zkVerify aggregation proof.
- *   The aggregation is an on-chain Merkle root that zkVerify has already verified.
- *   ShieldedPool recomputes the proof's statement hash from the withdrawal's public
- *   inputs and verifies Merkle inclusion against the aggregation root.
- *   This costs ~10-50K gas instead of ~500K gas (91% cheaper).
+ * V2 changes vs V1:
+ *   - LEVELS = 24 (depth-24 Merkle tree, 16M leaves — accommodates dummy commitments)
+ *   - Fixed denominations: 0.1, 0.5, 1.0 ETH only
+ *   - Epoch batching: commitments queue in pendingCommitments[], inserted via flushEpoch()
+ *     every EPOCH_BLOCKS=50 blocks. Fisher-Yates shuffle with prevrandao before insertion.
+ *   - Dummy commitments inserted each epoch (adaptive count) for metadata privacy
+ *   - Protocol fee: 0.1% per deposit -> protocolFunds (used to tip flushEpoch callers)
+ *   - Nullifier locking: LendingPool calls lockNullifier() to mark a note as collateral
+ *   - Auto-settle: withdraw() automatically repays the active loan when collateral is locked
+ *   - disburseLoan(): ETH disbursement for loans, only callable by LendingPool
+ *   - ShieldedPool is the sole ETH vault; LendingPool is accounting-only
  */
+
+interface ILendingPool {
+    function getOwed(bytes32 nullifierHash) external view returns (uint256);
+    function settleCollateral(bytes32 nullifierHash) external payable;
+}
+
 contract ShieldedPool {
-    // ── Constants ────────────────────────────────────────────────────────────
-    uint32 public constant LEVELS = 20;    // 2^20 = ~1M possible deposits
+    // -- Constants ------------------------------------------------------------
+    uint32 public constant LEVELS = 24;    // 2^24 = ~16M possible deposits
     uint256 public constant FIELD_SIZE =   // BabyJubJub field prime (used by Poseidon in circomlib)
         21888242871839275222246405745257275088548364400416034343698204186575808495617;
 
@@ -44,22 +36,46 @@ contract ShieldedPool {
     bytes32 public constant PROVING_SYSTEM_ID = keccak256(abi.encodePacked("groth16"));
     bytes32 public constant VERSION_HASH = sha256(abi.encodePacked(""));
 
-    // ── State ─────────────────────────────────────────────────────────────────
+    // Epoch constants
+    uint256 public constant EPOCH_BLOCKS = 50;
+    uint256 public constant DUMMIES_PER_EPOCH = 10;
+
+    // Protocol fee: 0.1% (10 BPS)
+    uint256 public constant PROTOCOL_FEE_BPS = 10;
+
+    // -- State ----------------------------------------------------------------
+    address public admin;
+    address public lendingPool;
+
     NullifierRegistry public immutable nullifierRegistry;
     IZkVerifyAggregation public immutable zkVerifyAggregation;
-    bytes32 public immutable vkHash; // keccak256 of the withdraw circuit verification key
+    bytes32 public immutable vkHash; // keccak256 of the withdraw_ring circuit verification key
 
     // Incremental Merkle tree state
     bytes32[LEVELS] public filledSubTrees; // partial hashes at each tree level
     bytes32 public currentRoot;            // current Merkle root
     uint32 public nextIndex;               // index of the next empty leaf slot
 
-    // Roots history — allows withdrawals during root transitions (e.g., if root changes between proof generation and submission)
+    // Roots history: allows withdrawals during root transitions
     uint32 public constant ROOT_HISTORY_SIZE = 100;
     bytes32[ROOT_HISTORY_SIZE] public roots;
     uint32 public currentRootIndex;
 
-    // ── Events ────────────────────────────────────────────────────────────────
+    // Epoch batching
+    bytes32[] public pendingCommitments;
+    uint256 public lastEpochBlock;
+    uint256 public epochNumber;
+
+    // Nullifier locking (for collateral)
+    mapping(bytes32 => bool) public lockedAsCollateral;
+
+    // Protocol funds (fees + tips)
+    uint256 public protocolFunds;
+
+    // ZEROS: Poseidon hashes of empty subtrees at each level
+    bytes32[LEVELS] public ZEROS;
+
+    // -- Events ---------------------------------------------------------------
     event Deposit(
         bytes32 indexed commitment,
         uint32 leafIndex,
@@ -71,33 +87,44 @@ contract ShieldedPool {
         bytes32 nullifierHash,
         uint256 amount
     );
+    event EpochFlushed(uint256 indexed epochNumber, uint256 realCount, uint256 dummyCount);
+    event NullifierLocked(bytes32 indexed nullifierHash);
+    event LoanDisbursed(address indexed recipient, uint256 amount);
 
-    // ── Errors ────────────────────────────────────────────────────────────────
+    // -- Errors ---------------------------------------------------------------
     error TreeFull();
-    error CommitmentAlreadyInserted();
     error InvalidProof();
     error NullifierAlreadySpent();
     error UnknownRoot();
-    error InvalidAmount();
+    error InvalidDenomination();
+    error InsufficientCollateralForSettlement();
+    error EpochTooEarly();
+    error NotAdmin();
+    error NotLendingPool();
 
-    // ── Initialization ────────────────────────────────────────────────────────
-    // ZEROS: Poseidon hashes of empty subtrees at each level
-    // zeros[i] = Poseidon hash of a subtree at level i with all-zero leaves
-    // These are precomputed constants (same as used by Tornado Cash with Poseidon)
-    bytes32[LEVELS] public ZEROS;
+    // -- Modifiers ------------------------------------------------------------
+    modifier onlyAdmin() {
+        if (msg.sender != admin) revert NotAdmin();
+        _;
+    }
 
+    modifier onlyLendingPool() {
+        if (msg.sender != lendingPool) revert NotLendingPool();
+        _;
+    }
+
+    // -- Initialization -------------------------------------------------------
     constructor(
         address _nullifierRegistry,
         address _zkVerifyAggregation,
         bytes32 _vkHash
     ) {
+        admin = msg.sender;
         nullifierRegistry = NullifierRegistry(_nullifierRegistry);
         zkVerifyAggregation = IZkVerifyAggregation(_zkVerifyAggregation);
         vkHash = _vkHash;
 
         // Initialize ZEROS: zero leaf at level 0, then hash up
-        // In production, these are precomputed Poseidon hashes of the empty tree
-        // For now: zero bytes (will be replaced by actual Poseidon zero hashes in setup)
         bytes32 currentZero = bytes32(0);
         for (uint32 i = 0; i < LEVELS; i++) {
             ZEROS[i] = currentZero;
@@ -107,36 +134,99 @@ contract ShieldedPool {
 
         currentRoot = currentZero;
         roots[0] = currentRoot;
+        lastEpochBlock = block.number;
     }
 
-    // ── Core: Deposit ─────────────────────────────────────────────────────────
+    // -- Admin ----------------------------------------------------------------
+    function setLendingPool(address _lp) external onlyAdmin {
+        lendingPool = _lp;
+    }
+
+    // -- Core: Deposit --------------------------------------------------------
     /*
-     * Insert a commitment into the Merkle tree.
-     * commitment = Poseidon(nullifier, secret, amount) — computed off-chain
-     * msg.value must equal the amount committed to in the circuit.
+     * Queue a commitment for the next epoch flush.
+     * Only fixed denominations accepted: 0.1, 0.5, or 1.0 ETH.
+     * 0.1% protocol fee withheld from each deposit.
      */
     function deposit(bytes32 commitment) external payable {
-        if (msg.value == 0) revert InvalidAmount();
-        if (nextIndex >= 2 ** LEVELS) revert TreeFull();
+        if (
+            msg.value != 0.1 ether &&
+            msg.value != 0.5 ether &&
+            msg.value != 1.0 ether
+        ) revert InvalidDenomination();
 
-        uint32 insertedIndex = _insert(commitment);
+        uint256 fee = (msg.value * PROTOCOL_FEE_BPS) / 10000;
+        protocolFunds += fee;
 
-        emit Deposit(commitment, insertedIndex, block.timestamp, msg.value);
+        pendingCommitments.push(commitment);
+
+        emit Deposit(commitment, uint32(pendingCommitments.length - 1), block.timestamp, msg.value);
     }
 
-    // ── Core: Withdraw ────────────────────────────────────────────────────────
+    // -- Core: Epoch flush ----------------------------------------------------
+    /*
+     * Flush the pending commitments queue into the Merkle tree.
+     * Callable by anyone after EPOCH_BLOCKS have passed since last flush.
+     * Fisher-Yates shuffle with prevrandao seed before insertion decouples
+     * deposit order from leaf index, breaking timing correlation.
+     * Dummy commitments are appended after real ones for anonymity set inflation.
+     * Caller receives 0.001 ETH tip from protocolFunds.
+     */
+    function flushEpoch() external {
+        if (block.number < lastEpochBlock + EPOCH_BLOCKS) revert EpochTooEarly();
+
+        uint256 realCount = pendingCommitments.length;
+        uint256 dummyCount = _dummiesForEpoch();
+
+        // Fisher-Yates shuffle using prevrandao as entropy source
+        uint256 seed = block.prevrandao;
+        bytes32[] memory shuffled = new bytes32[](realCount);
+        for (uint256 i = 0; i < realCount; i++) {
+            shuffled[i] = pendingCommitments[i];
+        }
+        for (uint256 i = realCount; i > 1; i--) {
+            uint256 j = uint256(keccak256(abi.encodePacked(seed, i))) % i;
+            bytes32 tmp = shuffled[i - 1];
+            shuffled[i - 1] = shuffled[j];
+            shuffled[j] = tmp;
+        }
+
+        // Insert shuffled real commitments
+        for (uint256 i = 0; i < realCount; i++) {
+            if (nextIndex >= 2 ** LEVELS) revert TreeFull();
+            _insert(shuffled[i]);
+        }
+
+        // Insert dummy commitments (indistinguishable from real ones on-chain)
+        for (uint256 d = 0; d < dummyCount; d++) {
+            if (nextIndex >= 2 ** LEVELS) break;
+            bytes32 dummy = keccak256(abi.encodePacked(block.prevrandao, epochNumber, d));
+            _insert(dummy);
+        }
+
+        delete pendingCommitments;
+
+        // Tip to incentivize keepers
+        uint256 tip = 0.001 ether;
+        if (protocolFunds >= tip) {
+            protocolFunds -= tip;
+            (bool ok,) = msg.sender.call{value: tip}("");
+            require(ok, "Tip transfer failed");
+        }
+
+        emit EpochFlushed(epochNumber, realCount, dummyCount);
+
+        lastEpochBlock = block.number;
+        epochNumber++;
+    }
+
+    // -- Core: Withdraw -------------------------------------------------------
     /*
      * Process a withdrawal backed by a zkVerify aggregation proof.
-     *
-     * @param root           Merkle root used in the ZK proof
-     * @param nullifierHash  Poseidon(nullifier) — marks this deposit as spent
-     * @param recipient      Address to receive the funds
-     * @param amount         Amount to withdraw (must match deposited amount in commitment)
-     * @param domainId       zkVerify domain ID
-     * @param aggregationId  zkVerify aggregation batch ID
-     * @param merklePath     Merkle siblings from leaf to aggregation root
-     * @param leafCount      Total leaves in the aggregation tree
-     * @param leafIndex      Position of this proof's leaf in the aggregation tree
+     * If the nullifier is locked as collateral, auto-settles the loan first:
+     *   - deducts totalOwed from the withdrawal amount
+     *   - sends remainder to recipient
+     *   - loan is atomically closed in a single tx
      */
     function withdraw(
         bytes32 root,
@@ -149,13 +239,21 @@ contract ShieldedPool {
         uint256 leafCount,
         uint256 leafIndex
     ) external {
-        // 1. Check root is known (within last ROOT_HISTORY_SIZE insertions)
-        if (!isKnownRoot(root)) revert UnknownRoot();
+        // Auto-settle path: locked note withdraws repay the loan atomically
+        if (lockedAsCollateral[nullifierHash]) {
+            uint256 totalOwed = ILendingPool(lendingPool).getOwed(nullifierHash);
+            if (amount < totalOwed) revert InsufficientCollateralForSettlement();
+            ILendingPool(lendingPool).settleCollateral{value: totalOwed}(nullifierHash);
+            (bool ok,) = recipient.call{value: amount - totalOwed}("");
+            require(ok, "Transfer failed");
+            nullifierRegistry.markSpent(nullifierHash);
+            emit Withdrawal(recipient, nullifierHash, amount - totalOwed);
+            return;
+        }
 
-        // 2. Check nullifier hasn't been spent
+        if (!isKnownRoot(root)) revert UnknownRoot();
         if (nullifierRegistry.isSpent(nullifierHash)) revert NullifierAlreadySpent();
 
-        // 3. Verify zkVerify aggregation proof
         if (
             !_verifyAttestation(
                 root, nullifierHash, recipient, amount,
@@ -165,17 +263,30 @@ contract ShieldedPool {
             revert InvalidProof();
         }
 
-        // 4. Mark nullifier as spent (prevents double-withdrawal)
         nullifierRegistry.markSpent(nullifierHash);
 
-        // 5. Send funds to recipient
         (bool success, ) = recipient.call{value: amount}("");
         require(success, "Transfer failed");
 
         emit Withdrawal(recipient, nullifierHash, amount);
     }
 
-    // ── View: Root history ───────────────────────────────────────────────────
+    // -- LendingPool interface -------------------------------------------------
+
+    /// @notice Lock a nullifier as active collateral. Only callable by LendingPool.
+    function lockNullifier(bytes32 nullifierHash) external onlyLendingPool {
+        lockedAsCollateral[nullifierHash] = true;
+        emit NullifierLocked(nullifierHash);
+    }
+
+    /// @notice Disburse ETH for a loan. Only callable by LendingPool.
+    function disburseLoan(address payable recipient, uint256 amount) external onlyLendingPool {
+        (bool ok,) = recipient.call{value: amount}("");
+        require(ok, "Disbursement failed");
+        emit LoanDisbursed(recipient, amount);
+    }
+
+    // -- View: Root history ---------------------------------------------------
     function getLastRoot() public view returns (bytes32) {
         return roots[currentRootIndex];
     }
@@ -191,10 +302,10 @@ contract ShieldedPool {
         return false;
     }
 
-    // ── View: Leaf / statement hash helpers (useful for off-chain tooling) ───
+    // -- View: Statement hash -------------------------------------------------
 
     /// @notice Compute the zkVerify statement hash for a set of public inputs.
-    ///         Off-chain callers can use this to build the aggregation leaf.
+    ///         Off-chain callers use this to build the aggregation leaf.
     function statementHash(uint256[] memory inputs) public view returns (bytes32) {
         return keccak256(
             abi.encodePacked(
@@ -206,7 +317,15 @@ contract ShieldedPool {
         );
     }
 
-    // ── Internal: Incremental Merkle tree ────────────────────────────────────
+    // -- Internal: Dummy count ------------------------------------------------
+    function _dummiesForEpoch() internal view returns (uint256) {
+        uint256 realCount = nextIndex > 0 ? nextIndex - epochNumber * DUMMIES_PER_EPOCH : 0;
+        if (realCount < 200) return 10;
+        if (realCount < 1000) return 5;
+        return 2;
+    }
+
+    // -- Internal: Incremental Merkle tree ------------------------------------
     function _insert(bytes32 leaf) internal returns (uint32 index) {
         uint32 currentIndex = nextIndex;
         bytes32 currentLevelHash = leaf;
@@ -215,12 +334,10 @@ contract ShieldedPool {
 
         for (uint32 i = 0; i < LEVELS; i++) {
             if (currentIndex % 2 == 0) {
-                // Left child: save current hash, fill right with zero
                 left = currentLevelHash;
                 right = ZEROS[i];
                 filledSubTrees[i] = currentLevelHash;
             } else {
-                // Right child: use saved left sibling
                 left = filledSubTrees[i];
                 right = currentLevelHash;
             }
@@ -235,27 +352,12 @@ contract ShieldedPool {
         return nextIndex - 1;
     }
 
-    /*
-     * Poseidon hash of two children — matches the hash used in withdraw.circom.
-     * PoseidonT3.hash([left, right]) computes Poseidon permutation with t=3
-     * (2 inputs + 1 capacity element), identical to circomlib's Poseidon(2) template.
-     *
-     * This alignment is critical: if the contract uses a different hash than the circuit,
-     * the Merkle roots won't match and every withdrawal proof will be invalid.
-     */
+    /// @dev Poseidon(left, right) -- matches withdraw_ring.circom MerkleTreeChecker.
     function hashLeftRight(bytes32 left, bytes32 right) internal pure returns (bytes32) {
         return bytes32(PoseidonT3.hash([uint256(left), uint256(right)]));
     }
 
-    // ── Internal: zkVerify attestation check ──────────────────────────────────
-    /*
-     * Reconstruct the statement hash from the withdrawal's public inputs and
-     * verify Merkle inclusion against the zkVerify aggregation contract.
-     *
-     * The statement hash binds: proving system (groth16) + verification key +
-     * version + all public inputs.  An attacker cannot substitute different
-     * inputs because the leaf would differ from what zkVerify attested.
-     */
+    // -- Internal: zkVerify attestation check ---------------------------------
     function _verifyAttestation(
         bytes32 root,
         bytes32 nullifierHash,
@@ -267,7 +369,6 @@ contract ShieldedPool {
         uint256 leafCount,
         uint256 leafIndex
     ) internal view returns (bool) {
-        // Reconstruct the public inputs array matching the withdraw circuit's signal order
         uint256[] memory inputs = new uint256[](4);
         inputs[0] = uint256(root);
         inputs[1] = uint256(nullifierHash);
@@ -281,10 +382,10 @@ contract ShieldedPool {
         );
     }
 
-    // ── Internal: Groth16 public-input encoding ──────────────────────────────
+    // -- Internal: Groth16 public-input encoding ------------------------------
 
     /// @dev Encode public inputs in the byte order used by zkVerify's Groth16 pallet.
-    ///      Each field element is byte-reversed (EVM big-endian → Substrate little-endian).
+    ///      Each field element is byte-reversed (EVM big-endian to Substrate little-endian).
     function _encodePublicInputs(uint256[] memory inputs) internal pure returns (bytes memory) {
         uint256 n = inputs.length;
         bytes32[] memory encoded = new bytes32[](n);
@@ -295,9 +396,7 @@ contract ShieldedPool {
         return abi.encodePacked(encoded);
     }
 
-    /// @dev Reverse byte order of a 256-bit word.
-    ///      zkVerify's Groth16 verifier pallet serialises field elements in
-    ///      little-endian, while the EVM stores uint256 in big-endian.
+    /// @dev Reverse byte order of a 256-bit word (big-endian to little-endian).
     function _changeEndianness(uint256 input) internal pure returns (bytes32 v) {
         v = bytes32(input);
         v = ((v & 0xff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00) >> 8)
@@ -310,4 +409,7 @@ contract ShieldedPool {
           | ((v & 0x0000000000000000ffffffffffffffff0000000000000000ffffffffffffffff) << 64);
         v = (v >> 128) | (v << 128);
     }
+
+    // -- Receive ETH ----------------------------------------------------------
+    receive() external payable {}
 }
