@@ -41,7 +41,7 @@ PTAU_FILE="$KEYS_DIR/pot17_final.ptau"
 if [ ! -f "$PTAU_FILE" ]; then
   echo "Downloading Powers of Tau (2^17, Hermez)..."
   curl -L -o "$PTAU_FILE" \
-    "https://hermez.s3-eu-west-1.amazonaws.com/powersOfTau28_hez_final_17.ptau"
+    "https://storage.googleapis.com/zkevm/ptau/powersOfTau28_hez_final_17.ptau"
   echo "Downloaded ptau file."
 else
   echo "Using existing ptau file: $PTAU_FILE"
@@ -127,7 +127,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 
-const keysDir = path.join(__dirname, "..", "keys");
+const keysDir = path.join(process.cwd(), "keys");
 
 for (const circuit of ["withdraw_ring"]) {
   const vkey = JSON.parse(fs.readFileSync(path.join(keysDir, `${circuit}_vkey.json`), "utf8"));
