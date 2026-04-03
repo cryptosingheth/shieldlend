@@ -570,9 +570,9 @@ Three bugs were found and fixed in commit `80f0fd5` before the final audit pass:
 
 | Contract | Address |
 |---|---|
-| ShieldedPool | `0xef7c8E84cb8e2C624Ff34e19E02b1b4c32A769Cd` |
-| LendingPool | `0x9e927D66b32D626248E8Ddf877C749c5c44Cdf68` |
-| NullifierRegistry | `0x626E86be2AB875F175F3461aAA9DE1F1Ba145E96` |
+| ShieldedPool | `0xfaeD6bf64a513aCEC9E8f1672d5e6584F869661a` |
+| LendingPool | `0xdBc459EC670deE0ae70cbF8b9Ea43a00b7A9184D` |
+| NullifierRegistry | `0x685E69Fa36521f527C00E05cf3e18eE4d18aD10C` |
 
 **Status**: Deployed. **Do not point users at these addresses until Tier 1 fixes are applied and circuits.ts is rewritten.** The C-1 vulnerability means any user funds deposited could be extracted by an attacker calling `borrow()` directly.
 

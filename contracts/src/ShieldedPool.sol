@@ -149,14 +149,17 @@ contract ShieldedPool {
     // -- Core: Deposit --------------------------------------------------------
     /*
      * Queue a commitment for the next epoch flush.
-     * Only fixed denominations accepted: 0.1, 0.5, or 1.0 ETH.
+     * Fixed denominations accepted: 0.001, 0.005, 0.01, 0.05, 0.1, 0.5 ETH.
      * 0.1% protocol fee withheld from each deposit.
      */
     function deposit(bytes32 commitment) external payable {
         if (
-            msg.value != 0.1 ether &&
-            msg.value != 0.5 ether &&
-            msg.value != 1.0 ether
+            msg.value != 0.001 ether &&
+            msg.value != 0.005 ether &&
+            msg.value != 0.01  ether &&
+            msg.value != 0.05  ether &&
+            msg.value != 0.1   ether &&
+            msg.value != 0.5   ether
         ) revert InvalidDenomination();
 
         uint256 fee = (msg.value * PROTOCOL_FEE_BPS) / 10000;

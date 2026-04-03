@@ -12,6 +12,7 @@ import { useNoteKey } from "@/lib/noteKeyContext";
 export function DepositForm() {
   const { address } = useAccount();
   const { noteKey } = useNoteKey();
+  const DENOMINATIONS = ["0.001", "0.005", "0.01", "0.05", "0.1", "0.5"];
   const [amountEth, setAmountEth] = useState("");
   const [status, setStatus] = useState<"idle" | "generating" | "submitting" | "done" | "error">(
     "idle"
@@ -34,8 +35,8 @@ export function DepositForm() {
   }, [isSuccess, address, hash, noteKey]);
 
   async function handleDeposit() {
-    if (!amountEth || isNaN(Number(amountEth)) || Number(amountEth) <= 0) {
-      setErrorMsg("Enter a valid ETH amount");
+    if (!amountEth) {
+      setErrorMsg("Select a denomination");
       return;
     }
 
@@ -70,22 +71,28 @@ export function DepositForm() {
     <div className="space-y-5">
       <div>
         <label className="block text-sm text-zinc-400 mb-2">Amount (ETH)</label>
-        <input
-          type="number"
-          step="0.001"
-          min="0"
-          value={amountEth}
-          onChange={(e) => setAmountEth(e.target.value)}
-          placeholder="0.1"
-          disabled={isLoading}
-          className="w-full bg-zinc-900 border border-zinc-700 rounded-lg px-4 py-3 text-sm font-mono
-                     focus:outline-none focus:border-indigo-500 disabled:opacity-50 transition-colors"
-        />
+        <div className="grid grid-cols-3 gap-2">
+          {DENOMINATIONS.map((d) => (
+            <button
+              key={d}
+              type="button"
+              disabled={isLoading}
+              onClick={() => setAmountEth(d)}
+              className={`py-2 rounded-lg text-sm font-mono border transition-colors disabled:opacity-50
+                ${amountEth === d
+                  ? "bg-indigo-600 border-indigo-500 text-white"
+                  : "bg-zinc-900 border-zinc-700 text-zinc-300 hover:border-indigo-500"
+                }`}
+            >
+              {d}
+            </button>
+          ))}
+        </div>
       </div>
 
       <button
         onClick={handleDeposit}
-        disabled={isLoading || !amountEth}
+        disabled={isLoading || !amountEth || !DENOMINATIONS.includes(amountEth)}
         className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed
                    text-white font-medium py-3 rounded-lg transition-colors text-sm"
       >
