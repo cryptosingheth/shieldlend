@@ -226,6 +226,9 @@ export function noteLabel(note: StoredNote): string {
   if (note.label) return note.label;
   const eth = (BigInt(note.amount) * 10000n / BigInt(1e18));
   const ethDisplay = (Number(eth) / 10000).toFixed(4);
-  const ts = new Date(note.depositedAt).toLocaleDateString();
-  return `${ethDisplay} ETH · ${ts}`;
+  const d = new Date(note.depositedAt);
+  const date = d.toLocaleDateString();
+  const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const short = note.commitment.slice(-4);
+  return `${ethDisplay} ETH · ${date} ${time} · #${short}`;
 }
