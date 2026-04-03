@@ -16,7 +16,8 @@
     "viem": "^2.17.0",
     "@tanstack/react-query": "^5.51.0",
     "circomlibjs": "^0.1.7",
-    "snarkjs": "^0.7.4"
+    "snarkjs": "^0.7.4",
+    "@scopelift/stealth-address-sdk": "^0.1.0"
   },
   "devDependencies": {
     "@types/node": "^20",

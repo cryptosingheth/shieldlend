@@ -7,9 +7,11 @@ import { createNote, serializeNote, type Note } from "@/lib/circuits";
 import { fieldToBytes32 } from "@/lib/contracts";
 import { saveNote } from "@/lib/noteStorage";
 import { useAccount } from "wagmi";
+import { useNoteKey } from "@/lib/noteKeyContext";
 
 export function DepositForm() {
   const { address } = useAccount();
+  const { noteKey } = useNoteKey();
   const [amountEth, setAmountEth] = useState("");
   const [status, setStatus] = useState<"idle" | "generating" | "submitting" | "done" | "error">(
     "idle"
@@ -25,11 +27,11 @@ export function DepositForm() {
   // Save note to vault ONLY after tx is confirmed on-chain
   useEffect(() => {
     if (isSuccess && pendingNote.current && address) {
-      saveNote(address, pendingNote.current, hash);
+      saveNote(address, pendingNote.current, noteKey, hash);
       pendingNote.current = null;
       setStatus("done");
     }
-  }, [isSuccess, address, hash]);
+  }, [isSuccess, address, hash, noteKey]);
 
   async function handleDeposit() {
     if (!amountEth || isNaN(Number(amountEth)) || Number(amountEth) <= 0) {
