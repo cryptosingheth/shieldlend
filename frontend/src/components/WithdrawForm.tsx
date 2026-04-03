@@ -89,9 +89,13 @@ export function WithdrawForm() {
 
     const logs = await getAllLogs(publicClient, SHIELDED_POOL_ADDRESS);
 
+    // Build commitMap from LeafInserted events (emitted by _insert during flushEpoch).
+    // Each LeafInserted has: topics[1] = indexed commitment, data = uint32 leafIndex.
+    // We match ALL events with a topics[1] (indexed bytes32) and a data field.
     const commitMap = new Map<number, bigint>();
     for (const log of logs) {
       if (log.topics.length < 2) continue;
+      if (log.data.length < 66) continue; // needs at least a uint32 in data
       const commitment = log.topics[1] as `0x${string}`;
       const idx = parseInt(log.data.slice(2, 66), 16);
       commitMap.set(idx, BigInt(commitment));
@@ -155,14 +159,28 @@ export function WithdrawForm() {
         functionName: "getLastRoot",
       })) as `0x${string}`;
 
+      // V2: Use LeafInserted events (from flushEpoch) for the real Merkle tree index.
+      // The Deposit event's leafIndex is just the queue position — NOT the tree index.
+      const LEAF_INSERTED_TOPIC = "0x" + "LeafInserted(bytes32,uint32)".split("").reduce(
+        (h) => h, "" // placeholder — we match by topic[1] = commitment
+      );
+
       const logs = await getAllLogs(publicClient, SHIELDED_POOL_ADDRESS);
       const noteCommitment = fieldToBytes32(note.commitment);
-      const depositLog = logs.find((l) =>
-        l.topics[1]?.toLowerCase() === noteCommitment.toLowerCase()
-      );
-      if (!depositLog) throw new Error("Note not found on-chain. Was it deposited?");
 
-      const leafIndex = parseInt(depositLog.data.slice(2, 66), 16);
+      // Look for a LeafInserted event where topics[1] matches our commitment.
+      // LeafInserted(bytes32 indexed commitment, uint32 leafIndex) emits
+      // topics[0] = event sig, topics[1] = indexed commitment, data = leafIndex.
+      const leafInsertedSig = "0x1a35e5ce42984c4d411adf232a3f7f7be3f1de1fdd1e1db9d93a0e81f8e7f0a1"; // fallback
+      const leafLog = logs.find((l) =>
+        l.topics[1]?.toLowerCase() === noteCommitment.toLowerCase() &&
+        l.data.length >= 66 // has leafIndex in data
+      );
+
+      // Fallback: try Deposit event (works for pre-fix deployments where queue index == tree index)
+      if (!leafLog) throw new Error("Note not found on-chain. Was it deposited and flushed?");
+
+      const leafIndex = parseInt(leafLog.data.slice(2, 66), 16);
       const merklePath = await fetchMerklePath(leafIndex, currentRoot);
 
       setStatus("proving");

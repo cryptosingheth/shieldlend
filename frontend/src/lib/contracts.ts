@@ -48,6 +48,7 @@ export const SHIELDED_POOL_ABI = parseAbi([
   "function withdraw(bytes32 root, bytes32 nullifierHash, address recipient, uint256 amount, uint256 domainId, uint256 aggregationId, bytes32[] merklePath, uint256 leafCount, uint256 leafIndex)",
   // Events
   "event Deposit(bytes32 indexed commitment, uint32 leafIndex, uint256 timestamp, uint256 amount)",
+  "event LeafInserted(bytes32 indexed commitment, uint32 leafIndex)",
   "event Withdrawal(address indexed recipient, bytes32 nullifierHash, uint256 amount)",
 ]);
 

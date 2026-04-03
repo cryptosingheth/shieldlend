@@ -72,6 +72,9 @@ contract ShieldedPool {
     // Protocol funds (fees + tips)
     uint256 public protocolFunds;
 
+    // Cumulative dummy count (for _dummiesForEpoch — avoids underflow)
+    uint256 public totalDummiesInserted;
+
     // ZEROS: Poseidon hashes of empty subtrees at each level
     bytes32[LEVELS] public ZEROS;
 
@@ -88,6 +91,7 @@ contract ShieldedPool {
         uint256 amount
     );
     event EpochFlushed(uint256 indexed epochNumber, uint256 realCount, uint256 dummyCount);
+    event LeafInserted(bytes32 indexed commitment, uint32 leafIndex);
     event NullifierLocked(bytes32 indexed nullifierHash);
     event LoanDisbursed(address indexed recipient, uint256 amount);
 
@@ -160,6 +164,8 @@ contract ShieldedPool {
 
         pendingCommitments.push(commitment);
 
+        // Note: leafIndex in event is the QUEUE position, not the final tree index.
+        // Actual tree index is emitted by LeafInserted during flushEpoch().
         emit Deposit(commitment, uint32(pendingCommitments.length - 1), block.timestamp, msg.value);
     }
 
@@ -198,11 +204,14 @@ contract ShieldedPool {
         }
 
         // Insert dummy commitments (indistinguishable from real ones on-chain)
+        uint256 actualDummies = 0;
         for (uint256 d = 0; d < dummyCount; d++) {
             if (nextIndex >= 2 ** LEVELS) break;
             bytes32 dummy = keccak256(abi.encodePacked(block.prevrandao, epochNumber, d));
             _insert(dummy);
+            actualDummies++;
         }
+        totalDummiesInserted += actualDummies;
 
         delete pendingCommitments;
 
@@ -239,18 +248,9 @@ contract ShieldedPool {
         uint256 leafCount,
         uint256 leafIndex
     ) external {
-        // Auto-settle path: locked note withdraws repay the loan atomically
-        if (lockedAsCollateral[nullifierHash]) {
-            uint256 totalOwed = ILendingPool(lendingPool).getOwed(nullifierHash);
-            if (amount < totalOwed) revert InsufficientCollateralForSettlement();
-            ILendingPool(lendingPool).settleCollateral{value: totalOwed}(nullifierHash);
-            (bool ok,) = recipient.call{value: amount - totalOwed}("");
-            require(ok, "Transfer failed");
-            nullifierRegistry.markSpent(nullifierHash);
-            emit Withdrawal(recipient, nullifierHash, amount - totalOwed);
-            return;
-        }
-
+        // ── PROOF VERIFICATION (runs for ALL withdrawals, including auto-settle) ──
+        // Without this gate, anyone who observes a NullifierLocked event could call
+        // withdraw() with the locked nullifier and drain the pool.
         if (!isKnownRoot(root)) revert UnknownRoot();
         if (nullifierRegistry.isSpent(nullifierHash)) revert NullifierAlreadySpent();
 
@@ -265,6 +265,22 @@ contract ShieldedPool {
 
         nullifierRegistry.markSpent(nullifierHash);
 
+        // ── AUTO-SETTLE PATH: locked note → repay loan atomically ────────────
+        if (lockedAsCollateral[nullifierHash]) {
+            uint256 totalOwed = ILendingPool(lendingPool).getOwed(nullifierHash);
+            if (amount < totalOwed) revert InsufficientCollateralForSettlement();
+            lockedAsCollateral[nullifierHash] = false; // release lock
+            ILendingPool(lendingPool).settleCollateral{value: totalOwed}(nullifierHash);
+            uint256 remainder = amount - totalOwed;
+            if (remainder > 0) {
+                (bool ok,) = recipient.call{value: remainder}("");
+                require(ok, "Transfer failed");
+            }
+            emit Withdrawal(recipient, nullifierHash, remainder);
+            return;
+        }
+
+        // ── NORMAL WITHDRAWAL ────────────────────────────────────────────────
         (bool success, ) = recipient.call{value: amount}("");
         require(success, "Transfer failed");
 
@@ -319,7 +335,10 @@ contract ShieldedPool {
 
     // -- Internal: Dummy count ------------------------------------------------
     function _dummiesForEpoch() internal view returns (uint256) {
-        uint256 realCount = nextIndex > 0 ? nextIndex - epochNumber * DUMMIES_PER_EPOCH : 0;
+        // totalDummiesInserted tracks actual dummies (not a constant multiple).
+        // Without this, nextIndex - epochNumber*DUMMIES_PER_EPOCH underflows
+        // once adaptive logic reduces dummy count below DUMMIES_PER_EPOCH.
+        uint256 realCount = nextIndex > totalDummiesInserted ? nextIndex - uint256(totalDummiesInserted) : 0;
         if (realCount < 200) return 10;
         if (realCount < 1000) return 5;
         return 2;
@@ -348,8 +367,10 @@ contract ShieldedPool {
         currentRootIndex = (currentRootIndex + 1) % ROOT_HISTORY_SIZE;
         roots[currentRootIndex] = currentLevelHash;
         currentRoot = currentLevelHash;
+        uint32 insertedAt = nextIndex;
         nextIndex++;
-        return nextIndex - 1;
+        emit LeafInserted(leaf, insertedAt);
+        return insertedAt;
     }
 
     /// @dev Poseidon(left, right) -- matches withdraw_ring.circom MerkleTreeChecker.
