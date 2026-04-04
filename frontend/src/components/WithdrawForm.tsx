@@ -473,7 +473,10 @@ export function WithdrawForm() {
         </p>
       </div>
 
-      {/* Pending epoch banner — countdown only, no manual action needed */}
+      {/* Pending epoch banner — only shown while there are blocks remaining.
+          When the epoch is already overdue (canFlushNow), the note can be
+          withdrawn immediately via auto-flush. No banner needed — the Withdraw
+          button is enabled and auto-flush is transparent to the user. */}
       {noteFlushStatus === "pending" && (() => {
         const flushAtBlock =
           effectiveLastEpochBlock !== undefined && epochBlocks !== undefined
@@ -486,27 +489,25 @@ export function WithdrawForm() {
         const secsLeft = blocksLeft !== undefined && blocksLeft > 0 ? blocksLeft * 2 : 0;
         const canFlushNow = blocksLeft !== undefined && blocksLeft === 0;
 
+        // Only show the amber countdown banner when there are blocks to wait.
+        // canFlushNow = true means the epoch is overdue — withdraw is possible
+        // immediately, no confusing "Deposit queued — Ready" state shown.
+        if (canFlushNow) return null;
+
         return (
           <div className="border border-amber-900/60 rounded-lg p-4 bg-amber-900/10">
             <div className="flex items-start gap-3">
               <span className="text-amber-400 text-lg leading-none">⏳</span>
               <div className="space-y-1">
                 <p className="text-sm text-amber-400 font-medium">Deposit queued — not yet in Merkle tree</p>
-                {canFlushNow ? (
-                  <p className="text-xs text-zinc-400">
-                    Ready. Click <span className="text-white font-medium">Withdraw</span> — the deposit
-                    will be inserted automatically before your proof is generated.
-                  </p>
-                ) : (
-                  <p className="text-xs text-zinc-400">
-                    Available in{" "}
-                    <span className="text-white font-medium">
-                      ~{blocksLeft ?? 50} blocks
-                    </span>
-                    {secsLeft > 0 && <span className="text-zinc-500"> (~{secsLeft}s)</span>}
-                    . Deposits are batched for privacy before entering the tree.
-                  </p>
-                )}
+                <p className="text-xs text-zinc-400">
+                  Available in{" "}
+                  <span className="text-white font-medium">
+                    ~{blocksLeft ?? 50} blocks
+                  </span>
+                  {secsLeft > 0 && <span className="text-zinc-500"> (~{secsLeft}s)</span>}
+                  . Deposits are batched for privacy before entering the tree.
+                </p>
               </div>
             </div>
           </div>
