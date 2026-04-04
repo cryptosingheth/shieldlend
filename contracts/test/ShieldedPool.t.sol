@@ -10,7 +10,7 @@ import {ZkVerifyAggregation} from "../src/ZkVerifyAggregation.sol";
  * ShieldedPool V2 Tests
  *
  * V2 changes covered:
- *   - Fixed denomination validation (0.1 / 0.5 / 1.0 ETH only)
+ *   - Fixed denomination validation (0.001 / 0.005 / 0.01 / 0.05 / 0.1 / 0.5 ETH)
  *   - Epoch batching: commitments queue in pendingCommitments[], inserted via flushEpoch()
  *   - flushEpoch() reverts before EPOCH_BLOCKS; shuffles + inserts dummies after
  *   - Protocol fee: 0.1% per deposit -> protocolFunds
@@ -107,9 +107,9 @@ contract ShieldedPoolTest is Test {
         assertEq(pool.pendingCommitments(0), COMMITMENT_2);
     }
 
-    function testDepositValidDenomination_1eth() public {
+    function testDepositValidDenomination_01eth() public {
         vm.prank(alice);
-        pool.deposit{value: 1.0 ether}(COMMITMENT_1);
+        pool.deposit{value: 0.01 ether}(COMMITMENT_1);
         assertEq(pool.pendingCommitments(0), COMMITMENT_1);
     }
 
@@ -117,7 +117,7 @@ contract ShieldedPoolTest is Test {
 
     function testDepositQueuesCommitment() public {
         vm.prank(alice);
-        pool.deposit{value: 1.0 ether}(COMMITMENT_1);
+        pool.deposit{value: 0.5 ether}(COMMITMENT_1);
 
         // Commitment must be in pending queue
         assertEq(pool.pendingCommitments(0), COMMITMENT_1);
@@ -127,7 +127,7 @@ contract ShieldedPoolTest is Test {
 
     function testFlushEpochTooEarly() public {
         vm.prank(alice);
-        pool.deposit{value: 1.0 ether}(COMMITMENT_1);
+        pool.deposit{value: 0.5 ether}(COMMITMENT_1);
 
         vm.roll(block.number + 49);
 
@@ -137,7 +137,7 @@ contract ShieldedPoolTest is Test {
 
     function testFlushEpochInsertsReal() public {
         vm.prank(alice);
-        pool.deposit{value: 1.0 ether}(COMMITMENT_1);
+        pool.deposit{value: 0.5 ether}(COMMITMENT_1);
 
         vm.prank(bob);
         pool.deposit{value: 0.5 ether}(COMMITMENT_2);
@@ -151,7 +151,7 @@ contract ShieldedPoolTest is Test {
 
     function testFlushEpochInsertsDummies() public {
         vm.prank(alice);
-        pool.deposit{value: 1.0 ether}(COMMITMENT_1);
+        pool.deposit{value: 0.5 ether}(COMMITMENT_1);
 
         vm.roll(block.number + 50);
 
@@ -167,7 +167,7 @@ contract ShieldedPoolTest is Test {
         bytes32 rootBefore = pool.getLastRoot();
 
         vm.prank(alice);
-        pool.deposit{value: 1.0 ether}(COMMITMENT_1);
+        pool.deposit{value: 0.5 ether}(COMMITMENT_1);
 
         vm.roll(block.number + 50);
         pool.flushEpoch();
@@ -177,7 +177,7 @@ contract ShieldedPoolTest is Test {
 
     function testFlushEpochEmitsEvent() public {
         vm.prank(alice);
-        pool.deposit{value: 1.0 ether}(COMMITMENT_1);
+        pool.deposit{value: 0.5 ether}(COMMITMENT_1);
 
         vm.roll(block.number + 50);
 
@@ -188,7 +188,7 @@ contract ShieldedPoolTest is Test {
 
     function testFlushEpochClearsPending() public {
         vm.prank(alice);
-        pool.deposit{value: 1.0 ether}(COMMITMENT_1);
+        pool.deposit{value: 0.5 ether}(COMMITMENT_1);
         vm.prank(bob);
         pool.deposit{value: 0.5 ether}(COMMITMENT_2);
 
@@ -200,9 +200,11 @@ contract ShieldedPoolTest is Test {
     }
 
     function testFlushEpochTipsToCaller() public {
-        // Deposit 1 ETH: fee = 0.001 ETH = exactly one tip
+        // Two 0.5 ETH deposits: combined fee 0.1% × 1 ETH = 0.001 ETH → one full tip
         vm.prank(alice);
-        pool.deposit{value: 1.0 ether}(COMMITMENT_1);
+        pool.deposit{value: 0.5 ether}(COMMITMENT_1);
+        vm.prank(bob);
+        pool.deposit{value: 0.5 ether}(COMMITMENT_2);
 
         vm.roll(block.number + 50);
 
@@ -217,9 +219,9 @@ contract ShieldedPoolTest is Test {
     function testProtocolFeeAccumulates() public {
         uint256 fundsBefore = pool.protocolFunds();
         vm.prank(alice);
-        pool.deposit{value: 1.0 ether}(COMMITMENT_1);
-        // 0.1% of 1 ETH = 0.001 ETH
-        assertEq(pool.protocolFunds(), fundsBefore + 0.001 ether);
+        pool.deposit{value: 0.5 ether}(COMMITMENT_1);
+        // 0.1% of 0.5 ETH = 0.0005 ETH
+        assertEq(pool.protocolFunds(), fundsBefore + 0.0005 ether);
     }
 
     // -- Nullifier locking ----------------------------------------------------
@@ -341,61 +343,61 @@ contract ShieldedPoolTest is Test {
     // -- Normal withdraw ------------------------------------------------------
 
     function testNormalWithdraw() public {
-        _depositAndFlush(COMMITMENT_1, 1.0 ether);
+        _depositAndFlush(COMMITMENT_1, 0.5 ether);
 
         bytes32 root = pool.getLastRoot();
-        bytes32 leaf = _buildLeaf(root, NULLIFIER_HASH_1, bob, 1.0 ether);
+        bytes32 leaf = _buildLeaf(root, NULLIFIER_HASH_1, bob, 0.5 ether);
         bytes32 aggRoot = keccak256(abi.encodePacked(leaf));
         zkVerify.submitAggregation(DOMAIN_ID, 10, aggRoot);
 
         uint256 bobBefore = bob.balance;
         pool.withdraw(
-            root, NULLIFIER_HASH_1, payable(bob), 1.0 ether,
+            root, NULLIFIER_HASH_1, payable(bob), 0.5 ether,
             DOMAIN_ID, 10, new bytes32[](0), 1, 0
         );
 
-        assertEq(bob.balance, bobBefore + 1.0 ether);
+        assertEq(bob.balance, bobBefore + 0.5 ether);
         assertTrue(nullifierReg.isSpent(NULLIFIER_HASH_1));
     }
 
     function testNormalWithdraw_unknownRootReverts() public {
-        _depositAndFlush(COMMITMENT_1, 1.0 ether);
+        _depositAndFlush(COMMITMENT_1, 0.5 ether);
 
         bytes32 fakeRoot = bytes32(uint256(0xdead));
         vm.expectRevert(ShieldedPool.UnknownRoot.selector);
         pool.withdraw(
-            fakeRoot, NULLIFIER_HASH_1, payable(bob), 1.0 ether,
+            fakeRoot, NULLIFIER_HASH_1, payable(bob), 0.5 ether,
             DOMAIN_ID, 1, new bytes32[](0), 1, 0
         );
     }
 
     function testNormalWithdraw_spentNullifierReverts() public {
-        _depositAndFlush(COMMITMENT_1, 1.0 ether);
+        _depositAndFlush(COMMITMENT_1, 0.5 ether);
 
         bytes32 root = pool.getLastRoot();
-        bytes32 leaf = _buildLeaf(root, NULLIFIER_HASH_1, bob, 1.0 ether);
+        bytes32 leaf = _buildLeaf(root, NULLIFIER_HASH_1, bob, 0.5 ether);
         bytes32 aggRoot = keccak256(abi.encodePacked(leaf));
         zkVerify.submitAggregation(DOMAIN_ID, 10, aggRoot);
 
         pool.withdraw(
-            root, NULLIFIER_HASH_1, payable(bob), 1.0 ether,
+            root, NULLIFIER_HASH_1, payable(bob), 0.5 ether,
             DOMAIN_ID, 10, new bytes32[](0), 1, 0
         );
 
         vm.expectRevert(ShieldedPool.NullifierAlreadySpent.selector);
         pool.withdraw(
-            root, NULLIFIER_HASH_1, payable(bob), 1.0 ether,
+            root, NULLIFIER_HASH_1, payable(bob), 0.5 ether,
             DOMAIN_ID, 10, new bytes32[](0), 1, 0
         );
     }
 
     function testNormalWithdraw_invalidProofReverts() public {
-        _depositAndFlush(COMMITMENT_1, 1.0 ether);
+        _depositAndFlush(COMMITMENT_1, 0.5 ether);
 
         bytes32 root = pool.getLastRoot();
         vm.expectRevert(ShieldedPool.InvalidProof.selector);
         pool.withdraw(
-            root, NULLIFIER_HASH_1, payable(bob), 1.0 ether,
+            root, NULLIFIER_HASH_1, payable(bob), 0.5 ether,
             DOMAIN_ID, 999, new bytes32[](0), 1, 0
         );
     }
@@ -403,7 +405,7 @@ contract ShieldedPoolTest is Test {
     // -- Root history ---------------------------------------------------------
 
     function testRootHistory_isKnownAfterFlush() public {
-        _depositAndFlush(COMMITMENT_1, 1.0 ether);
+        _depositAndFlush(COMMITMENT_1, 0.5 ether);
         bytes32 root = pool.getLastRoot();
         assertTrue(pool.isKnownRoot(root));
     }

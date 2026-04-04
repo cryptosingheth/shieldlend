@@ -60,7 +60,7 @@ contract GasTest is Test {
     function test_gas_deposit() public {
         vm.prank(alice);
         uint256 before = gasleft();
-        pool.deposit{value: 1 ether}(COMMITMENT);
+        pool.deposit{value: 0.5 ether}(COMMITMENT);
         uint256 used = before - gasleft();
         console.log("deposit() gas (queue only):", used);
     }
@@ -69,7 +69,7 @@ contract GasTest is Test {
 
     function test_gas_flushEpoch_singleDeposit() public {
         vm.prank(alice);
-        pool.deposit{value: 1 ether}(COMMITMENT);
+        pool.deposit{value: 0.5 ether}(COMMITMENT);
 
         vm.roll(block.number + 50);
 
@@ -82,7 +82,7 @@ contract GasTest is Test {
     function test_gas_flushEpoch_tenDeposits() public {
         for (uint256 i = 0; i < 10; i++) {
             vm.prank(alice);
-            pool.deposit{value: 1 ether}(bytes32(uint256(i + 1)));
+            pool.deposit{value: 0.5 ether}(bytes32(uint256(i + 1)));
         }
 
         vm.roll(block.number + 50);
@@ -97,7 +97,7 @@ contract GasTest is Test {
 
     function test_gas_withdraw() public {
         vm.prank(alice);
-        pool.deposit{value: 1 ether}(COMMITMENT);
+        pool.deposit{value: 0.5 ether}(COMMITMENT);
         vm.roll(block.number + 50);
         pool.flushEpoch();
 
@@ -107,7 +107,7 @@ contract GasTest is Test {
         inputs[0] = uint256(root);
         inputs[1] = uint256(NULLIFIER_HASH);
         inputs[2] = uint256(uint160(alice));
-        inputs[3] = 1 ether;
+        inputs[3] = 0.5 ether;
         bytes32 leaf = pool.statementHash(inputs);
         bytes32 aggRoot = keccak256(abi.encodePacked(leaf));
         zkVerify.submitAggregation(0, 1, aggRoot);
@@ -115,7 +115,7 @@ contract GasTest is Test {
         bytes32[] memory emptyPath = new bytes32[](0);
 
         uint256 before = gasleft();
-        pool.withdraw(root, NULLIFIER_HASH, payable(alice), 1 ether, 0, 1, emptyPath, 1, 0);
+        pool.withdraw(root, NULLIFIER_HASH, payable(alice), 0.5 ether, 0, 1, emptyPath, 1, 0);
         uint256 used = before - gasleft();
         console.log("withdraw() gas:", used);
     }

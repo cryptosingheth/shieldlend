@@ -89,9 +89,9 @@ contract SecurityAuditTest is Test {
         MockLP mockLP = new MockLP(0.4 ether);
         pool.setLendingPool(address(mockLP));
 
-        // Alice deposits and epoch flushes
+        // Alice deposits and epoch flushes (max allowed denomination is 0.5 ETH)
         vm.prank(alice);
-        pool.deposit{value: 1.0 ether}(COMMITMENT);
+        pool.deposit{value: 0.5 ether}(COMMITMENT);
         vm.roll(block.number + 50);
         pool.flushEpoch();
 
@@ -111,7 +111,7 @@ contract SecurityAuditTest is Test {
             root,                     // valid root
             NULLIFIER_HASH,           // locked nullifier — attacker knows from event
             payable(attacker),        // attacker as recipient
-            1.0 ether,               // full note value
+            0.5 ether,               // full note value
             DOMAIN_ID,
             999,                      // bogus aggregation ID — no proof
             new bytes32[](0),
@@ -127,7 +127,7 @@ contract SecurityAuditTest is Test {
 
         // Alice deposits and epoch flushes
         vm.prank(alice);
-        pool.deposit{value: 1.0 ether}(COMMITMENT);
+        pool.deposit{value: 0.5 ether}(COMMITMENT);
         vm.roll(block.number + 50);
         pool.flushEpoch();
 
@@ -141,7 +141,7 @@ contract SecurityAuditTest is Test {
         inputs[0] = uint256(root);
         inputs[1] = uint256(NULLIFIER_HASH);
         inputs[2] = uint256(uint160(alice));
-        inputs[3] = 1.0 ether;
+        inputs[3] = 0.5 ether;
         bytes32 leaf = pool.statementHash(inputs);
         bytes32 aggRoot = keccak256(abi.encodePacked(leaf));
         zkVerify.submitAggregation(DOMAIN_ID, 1, aggRoot);
@@ -149,12 +149,12 @@ contract SecurityAuditTest is Test {
         // Legitimate withdrawal: proof checks pass, then auto-settle runs
         uint256 aliceBefore = alice.balance;
         pool.withdraw(
-            root, NULLIFIER_HASH, payable(alice), 1.0 ether,
+            root, NULLIFIER_HASH, payable(alice), 0.5 ether,
             DOMAIN_ID, 1, new bytes32[](0), 1, 0
         );
 
-        // Alice receives 1.0 - 0.4 = 0.6 ETH remainder
-        assertEq(alice.balance, aliceBefore + 0.6 ether, "Alice should get remainder");
+        // Alice receives 0.5 - 0.4 = 0.1 ETH remainder
+        assertEq(alice.balance, aliceBefore + 0.1 ether, "Alice should get remainder");
         assertTrue(mockLP.settled(), "Loan should be settled");
         assertTrue(nullifierReg.isSpent(NULLIFIER_HASH), "Nullifier should be spent");
         assertFalse(pool.lockedAsCollateral(NULLIFIER_HASH), "Lock should be released");
@@ -174,7 +174,7 @@ contract SecurityAuditTest is Test {
         bytes32 c3 = bytes32(uint256(3));
 
         vm.prank(alice);
-        pool.deposit{value: 1.0 ether}(c1);
+        pool.deposit{value: 0.05 ether}(c1);
         vm.prank(alice);
         pool.deposit{value: 0.5 ether}(c2);
         vm.prank(alice);
@@ -250,7 +250,7 @@ contract SecurityAuditTest is Test {
     /// @notice Verify totalDummiesInserted is accurate after a simple epoch.
     function testBug3_totalDummiesInserted_tracksCorrectly() public {
         vm.prank(alice);
-        pool.deposit{value: 1.0 ether}(COMMITMENT);
+        pool.deposit{value: 0.5 ether}(COMMITMENT);
 
         vm.roll(block.number + 50);
         pool.flushEpoch();
@@ -281,11 +281,11 @@ contract SecurityAuditTest is Test {
 
     /// @notice Auto-settle where totalOwed equals amount (zero remainder)
     function testAutoSettle_exactRepayment_zeroRemainder() public {
-        MockLP mockLP = new MockLP(1.0 ether); // owed == note value
+        MockLP mockLP = new MockLP(0.5 ether); // owed == note value (max denomination)
         pool.setLendingPool(address(mockLP));
 
         vm.prank(alice);
-        pool.deposit{value: 1.0 ether}(COMMITMENT);
+        pool.deposit{value: 0.5 ether}(COMMITMENT);
         vm.roll(block.number + 50);
         pool.flushEpoch();
 
@@ -297,14 +297,14 @@ contract SecurityAuditTest is Test {
         inputs[0] = uint256(root);
         inputs[1] = uint256(NULLIFIER_HASH);
         inputs[2] = uint256(uint160(alice));
-        inputs[3] = 1.0 ether;
+        inputs[3] = 0.5 ether;
         bytes32 leaf = pool.statementHash(inputs);
         bytes32 aggRoot = keccak256(abi.encodePacked(leaf));
         zkVerify.submitAggregation(DOMAIN_ID, 1, aggRoot);
 
         uint256 aliceBefore = alice.balance;
         pool.withdraw(
-            root, NULLIFIER_HASH, payable(alice), 1.0 ether,
+            root, NULLIFIER_HASH, payable(alice), 0.5 ether,
             DOMAIN_ID, 1, new bytes32[](0), 1, 0
         );
 
@@ -341,7 +341,7 @@ contract SecurityAuditTest is Test {
         // Pool has 50 ETH from setUp. Try to withdraw 100 ETH with a "valid" proof.
         // This tests that the contract reverts on ETH transfer failure.
         vm.prank(alice);
-        pool.deposit{value: 1.0 ether}(COMMITMENT);
+        pool.deposit{value: 0.5 ether}(COMMITMENT);
         vm.roll(block.number + 50);
         pool.flushEpoch();
 
