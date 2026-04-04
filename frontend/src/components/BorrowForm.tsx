@@ -4,7 +4,7 @@ import { useState, useEffect } from "react";
 import { parseEther, formatEther, type Log } from "viem";
 import { useAccount, useWriteContract, usePublicClient } from "wagmi";
 import { deserializeNote, generateCollateralProof, type MerklePath } from "@/lib/circuits";
-import { useHasActiveLoan, useLoanDetails, fieldToBytes32, LENDING_POOL_ADDRESS, LENDING_POOL_ABI, SHIELDED_POOL_ADDRESS, SHIELDED_POOL_ABI } from "@/lib/contracts";
+import { useHasActiveLoan, fieldToBytes32, LENDING_POOL_ADDRESS, LENDING_POOL_ABI, SHIELDED_POOL_ADDRESS, SHIELDED_POOL_ABI } from "@/lib/contracts";
 import { loadNotes, storedNoteToNote, noteLabel, type StoredNote } from "@/lib/noteStorage";
 import { useNoteKey } from "@/lib/noteKeyContext";
 
@@ -74,9 +74,79 @@ export function BorrowForm() {
   const [borrowTxHash, setBorrowTxHash] = useState<string | null>(null);
 
   // ── Repay state ───────────────────────────────────────────────────────────
-  const [repayLoanId, setRepayLoanId] = useState<string>("");
   const [repayStatus, setRepayStatus] = useState<"idle" | "submitting" | "done" | "error">("idle");
   const [repayError, setRepayError] = useState("");
+
+  // Active loans discovered from the user's vault notes.
+  // Each entry: loanId + details fetched from getLoanDetails().
+  interface UserLoan {
+    loanId: bigint;
+    noteLabel: string;              // human-readable note identifier
+    borrowed: bigint;
+    currentInterest: bigint;
+    totalOwed: bigint;
+    repaid: boolean;
+  }
+  const [userLoans, setUserLoans] = useState<UserLoan[]>([]);
+  const [loadingLoans, setLoadingLoans] = useState(false);
+  const [selectedLoanId, setSelectedLoanId] = useState<string>("");
+
+  // ── Load active loans from vault notes ────────────────────────────────────
+  // For each saved note, check hasActiveLoan → activeLoanByNote → getLoanDetails.
+  // Done with publicClient.readContract in parallel (can't call hooks in a loop).
+  useEffect(() => {
+    if (!publicClient || savedNotes.length === 0) { setUserLoans([]); return; }
+    let cancelled = false;
+    setLoadingLoans(true);
+
+    async function fetchLoans() {
+      const results: UserLoan[] = [];
+      await Promise.all(
+        savedNotes.map(async (note) => {
+          const nhex = note.nullifierHash as `0x${string}`;
+          const hasActive = await publicClient!.readContract({
+            address: LENDING_POOL_ADDRESS,
+            abi: LENDING_POOL_ABI,
+            functionName: "hasActiveLoan",
+            args: [nhex],
+          }) as boolean;
+          if (!hasActive) return;
+
+          const loanId = await publicClient!.readContract({
+            address: LENDING_POOL_ADDRESS,
+            abi: LENDING_POOL_ABI,
+            functionName: "activeLoanByNote",
+            args: [nhex],
+          }) as bigint;
+
+          const details = await publicClient!.readContract({
+            address: LENDING_POOL_ADDRESS,
+            abi: LENDING_POOL_ABI,
+            functionName: "getLoanDetails",
+            args: [loanId],
+          }) as [string, bigint, bigint, bigint, boolean];
+
+          results.push({
+            loanId,
+            noteLabel: noteLabel(note),
+            borrowed: details[1],
+            currentInterest: details[2],
+            totalOwed: details[3],
+            repaid: details[4],
+          });
+        })
+      );
+      if (!cancelled) {
+        // Sort by loanId ascending so newest loan is last
+        results.sort((a, b) => (a.loanId < b.loanId ? -1 : 1));
+        setUserLoans(results);
+        setLoadingLoans(false);
+      }
+    }
+
+    fetchLoans().catch(() => { if (!cancelled) setLoadingLoans(false); });
+    return () => { cancelled = true; };
+  }, [savedNotes, publicClient]);
 
   // ── Contract read hooks ───────────────────────────────────────────────────
   const nullifierHashHex =
@@ -87,10 +157,7 @@ export function BorrowForm() {
 
   const { data: hasLoan } = useHasActiveLoan(nullifierHashHex as `0x${string}` | undefined);
 
-  const repayLoanIdBig = repayLoanId && !isNaN(Number(repayLoanId))
-    ? BigInt(repayLoanId)
-    : undefined;
-  const { data: loanDetails } = useLoanDetails(repayLoanIdBig);
+  const selectedLoan = userLoans.find((l) => l.loanId.toString() === selectedLoanId);
 
   const { writeContractAsync } = useWriteContract();
 
@@ -256,17 +323,17 @@ export function BorrowForm() {
 
   // ── Repay handler ─────────────────────────────────────────────────────────
   async function handleRepay() {
-    if (!loanDetails) return setRepayError("Load loan details first");
+    if (!selectedLoan) return setRepayError("Select a loan first");
+    if (selectedLoan.repaid) return setRepayError("This loan has already been repaid");
     try {
       setRepayError("");
       setRepayStatus("submitting");
-      const d = loanDetails as unknown as { totalOwed: bigint };
       await writeContractAsync({
         address: LENDING_POOL_ADDRESS,
         abi: LENDING_POOL_ABI,
         functionName: "repay",
-        args: [repayLoanIdBig!],
-        value: d.totalOwed,
+        args: [selectedLoan.loanId],
+        value: selectedLoan.totalOwed,
       });
       setRepayStatus("done");
     } catch (err) {
@@ -406,55 +473,53 @@ export function BorrowForm() {
       <div className="space-y-4">
         <h3 className="text-sm font-semibold text-zinc-300">Repay a loan</h3>
 
-        <div>
-          <label className="block text-sm text-zinc-400 mb-2">Loan ID</label>
-          <input
-            type="number"
-            min="0"
-            value={repayLoanId}
-            onChange={(e) => setRepayLoanId(e.target.value)}
-            placeholder="0"
-            disabled={repayStatus === "submitting"}
-            className="w-full bg-zinc-900 border border-zinc-700 rounded-lg px-4 py-3 text-sm font-mono
-                       focus:outline-none focus:border-indigo-500 disabled:opacity-50 transition-colors"
-          />
-        </div>
+        {loadingLoans ? (
+          <p className="text-xs text-zinc-500">Loading your active loans...</p>
+        ) : userLoans.length === 0 ? (
+          <p className="text-xs text-zinc-500">No active loans found for your vault notes.</p>
+        ) : (
+          <div>
+            <label className="block text-sm text-zinc-400 mb-2">Select loan</label>
+            <select
+              value={selectedLoanId}
+              onChange={(e) => { setSelectedLoanId(e.target.value); setRepayStatus("idle"); setRepayError(""); }}
+              disabled={repayStatus === "submitting"}
+              className="w-full bg-zinc-900 border border-zinc-700 rounded-lg px-4 py-3 text-sm
+                         focus:outline-none focus:border-indigo-500 disabled:opacity-50 transition-colors"
+            >
+              <option value="">— Select a loan —</option>
+              {userLoans.map((loan) => (
+                <option key={loan.loanId.toString()} value={loan.loanId.toString()}>
+                  Loan #{loan.loanId.toString()} · {loan.noteLabel} · {parseFloat(formatEther(loan.borrowed)).toFixed(4)} ETH
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
 
-        {loanDetails && (
+        {selectedLoan && (
           <div className="border border-zinc-800 rounded-lg p-4 bg-zinc-900/40 text-xs space-y-2">
-            {(() => {
-              const d = loanDetails as unknown as {
-                borrowed: bigint;
-                currentInterest: bigint;
-                totalOwed: bigint;
-                repaid: boolean;
-              };
-              return (
-                <>
-                  <div className="flex justify-between">
-                    <span className="text-zinc-500">Principal</span>
-                    <span className="font-mono text-zinc-200">{formatEther(d.borrowed)} ETH</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-zinc-500">Accrued interest</span>
-                    <span className="font-mono text-zinc-200">{formatEther(d.currentInterest)} ETH</span>
-                  </div>
-                  <div className="flex justify-between border-t border-zinc-800 pt-2">
-                    <span className="text-zinc-400 font-medium">Total owed</span>
-                    <span className="font-mono text-white font-semibold">{formatEther(d.totalOwed)} ETH</span>
-                  </div>
-                  {d.repaid && (
-                    <p className="text-green-400 text-xs pt-1">This loan has already been repaid.</p>
-                  )}
-                </>
-              );
-            })()}
+            <div className="flex justify-between">
+              <span className="text-zinc-500">Principal</span>
+              <span className="font-mono text-zinc-200">{formatEther(selectedLoan.borrowed)} ETH</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-zinc-500">Accrued interest</span>
+              <span className="font-mono text-zinc-200">{formatEther(selectedLoan.currentInterest)} ETH</span>
+            </div>
+            <div className="flex justify-between border-t border-zinc-800 pt-2">
+              <span className="text-zinc-400 font-medium">Total owed</span>
+              <span className="font-mono text-white font-semibold">{formatEther(selectedLoan.totalOwed)} ETH</span>
+            </div>
+            {selectedLoan.repaid && (
+              <p className="text-green-400 text-xs pt-1">This loan has already been repaid.</p>
+            )}
           </div>
         )}
 
         <button
           onClick={handleRepay}
-          disabled={repayStatus === "submitting" || !loanDetails || !!(loanDetails as unknown as { repaid: boolean }).repaid}
+          disabled={repayStatus === "submitting" || !selectedLoan || selectedLoan.repaid}
           className="w-full bg-zinc-700 hover:bg-zinc-600 disabled:opacity-50 disabled:cursor-not-allowed
                      text-white font-medium py-3 rounded-lg transition-colors text-sm"
         >

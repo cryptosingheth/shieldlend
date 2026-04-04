@@ -198,7 +198,9 @@ export function History() {
             <span className={`text-xs px-2 py-0.5 rounded-full border font-medium ${EVENT_COLORS[event.type]}`}>
               {EVENT_LABELS[event.type]}
             </span>
-            <span className="text-xs text-zinc-500 font-mono">{event.shortId}...</span>
+            <span className="text-xs text-zinc-500 font-mono">
+              {event.type === "borrow" ? event.shortId : `${event.shortId}...`}
+            </span>
           </div>
           <div className="flex items-center gap-4 text-xs text-right">
             {event.amount !== undefined && (
