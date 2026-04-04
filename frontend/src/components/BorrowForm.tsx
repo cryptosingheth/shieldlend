@@ -1,16 +1,23 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { parseEther, formatEther } from "viem";
-import { useAccount, useWriteContract, useWaitForTransactionReceipt } from "wagmi";
-import { deserializeNote, generateCollateralProof } from "@/lib/circuits";
-import { useHasActiveLoan, useLoanDetails, fieldToBytes32, LENDING_POOL_ADDRESS, LENDING_POOL_ABI } from "@/lib/contracts";
+import { parseEther, formatEther, type Log } from "viem";
+import { useAccount, useWriteContract, usePublicClient } from "wagmi";
+import { deserializeNote, generateCollateralProof, type MerklePath } from "@/lib/circuits";
+import { useHasActiveLoan, useLoanDetails, fieldToBytes32, LENDING_POOL_ADDRESS, LENDING_POOL_ABI, SHIELDED_POOL_ADDRESS, SHIELDED_POOL_ABI } from "@/lib/contracts";
 import { loadNotes, storedNoteToNote, noteLabel, type StoredNote } from "@/lib/noteStorage";
 import { useNoteKey } from "@/lib/noteKeyContext";
 
 // V2: MIN_HEALTH_FACTOR_BPS = 11000 (110%) in LendingPool.sol
 const MIN_HEALTH_FACTOR_BPS = 11000n;
 const BPS_DENOMINATOR = 10000n;
+
+// Merkle tree constants — must match ShieldedPool and collateral_ring.circom
+const LEVELS = 24;
+const DEPLOY_BLOCK = 39731476n;
+const CHUNK_SIZE = 9000n;
+// keccak256("LeafInserted(bytes32,uint32)") — filter for post-flush tree insertions only
+const LEAF_INSERTED_TOPIC = "0xa4e4458df45cfeb7eebc696f262212e6721fac69466bfc59f43b6040425afce6";
 
 function healthColor(hf: number): string {
   if (hf >= 2.0) return "text-green-400";
@@ -24,9 +31,25 @@ function healthLabel(hf: number): string {
   return "At risk";
 }
 
+async function getAllLogs(
+  publicClient: NonNullable<ReturnType<typeof usePublicClient>>,
+  address: `0x${string}`
+): Promise<Log[]> {
+  const rawLatest = await publicClient.getBlockNumber();
+  const latest = rawLatest > 1n ? rawLatest - 1n : rawLatest;
+  const allLogs: Log[] = [];
+  for (let from = DEPLOY_BLOCK; from <= latest; from += CHUNK_SIZE) {
+    const to = from + CHUNK_SIZE - 1n < latest ? from + CHUNK_SIZE - 1n : latest;
+    const chunk = await publicClient.getLogs({ address, fromBlock: from, toBlock: to });
+    allLogs.push(...chunk);
+  }
+  return allLogs;
+}
+
 export function BorrowForm() {
   const { address } = useAccount();
   const { noteKey } = useNoteKey();
+  const publicClient = usePublicClient();
 
   // ── Note selection ────────────────────────────────────────────────────────
   const [savedNotes, setSavedNotes] = useState<StoredNote[]>([]);
@@ -45,7 +68,7 @@ export function BorrowForm() {
   // ── Borrow state ──────────────────────────────────────────────────────────
   const [borrowEth, setBorrowEth] = useState("");
   const [borrowStatus, setBorrowStatus] = useState<
-    "idle" | "proving" | "zkverify" | "submitting" | "done" | "error"
+    "idle" | "fetching-path" | "proving" | "zkverify" | "submitting" | "done" | "error"
   >("idle");
   const [borrowError, setBorrowError] = useState("");
   const [borrowTxHash, setBorrowTxHash] = useState<string | null>(null);
@@ -81,7 +104,7 @@ export function BorrowForm() {
     ? (() => { try { return parseEther(borrowEth); } catch { return 0n; } })()
     : 0n;
 
-  // HF = (collateral / borrowed) × 10000 / MIN_HEALTH_FACTOR_BPS
+  // HF = (collateral / borrowed) expressed relative to MIN_HEALTH_FACTOR_BPS floor
   const healthFactor =
     borrowWei > 0n && collateral > 0n
       ? Number((collateral * BPS_DENOMINATOR) / (MIN_HEALTH_FACTOR_BPS * borrowWei / BPS_DENOMINATOR)) / 10000
@@ -91,12 +114,68 @@ export function BorrowForm() {
     ? formatEther((collateral * BPS_DENOMINATOR) / MIN_HEALTH_FACTOR_BPS)
     : null;
 
+  // ── Merkle path fetcher (same implementation as WithdrawForm) ─────────────
+  async function fetchMerklePath(leafIndex: number, root: `0x${string}`): Promise<MerklePath> {
+    if (!publicClient) throw new Error("No public client");
+
+    const logs = await getAllLogs(publicClient, SHIELDED_POOL_ADDRESS);
+
+    const commitMap = new Map<number, bigint>();
+    for (const log of logs) {
+      if (log.topics[0]?.toLowerCase() !== LEAF_INSERTED_TOPIC) continue;
+      if (log.topics.length < 2) continue;
+      const commitment = log.topics[1] as `0x${string}`;
+      const idx = parseInt(log.data.slice(2, 66), 16);
+      commitMap.set(idx, BigInt(commitment));
+    }
+
+    const { buildPoseidon } = await import("circomlibjs");
+    const poseidon = await buildPoseidon();
+    const F = poseidon.F;
+
+    // Precompute zero hashes up to LEVELS=24
+    const zeros: bigint[] = [0n];
+    for (let i = 0; i < LEVELS; i++) {
+      zeros.push(F.toObject(poseidon([zeros[i], zeros[i]])) as bigint);
+    }
+
+    const pathElements: bigint[] = [];
+    const pathIndices: number[] = [];
+
+    let currentLevel = new Map<number, bigint>(commitMap);
+    let idx = leafIndex;
+
+    for (let level = 0; level < LEVELS; level++) {
+      const isRight = idx % 2;
+      const siblingIdx = isRight ? idx - 1 : idx + 1;
+
+      pathElements.push(currentLevel.get(siblingIdx) ?? zeros[level]);
+      pathIndices.push(isRight);
+
+      const nextLevel = new Map<number, bigint>();
+      for (const [nodeIdx, val] of currentLevel) {
+        const parentIdx = Math.floor(nodeIdx / 2);
+        if (nextLevel.has(parentIdx)) continue;
+        const sibIdx = nodeIdx % 2 === 0 ? nodeIdx + 1 : nodeIdx - 1;
+        const sibVal = currentLevel.get(sibIdx) ?? zeros[level];
+        const left = nodeIdx % 2 === 0 ? val : sibVal;
+        const right = nodeIdx % 2 === 0 ? sibVal : val;
+        nextLevel.set(parentIdx, F.toObject(poseidon([left, right])) as bigint);
+      }
+      currentLevel = nextLevel;
+      idx = Math.floor(idx / 2);
+    }
+
+    return { pathElements, pathIndices, root: BigInt(root) };
+  }
+
   // ── Borrow handler ────────────────────────────────────────────────────────
   async function handleBorrow() {
     const note = noteForCalc;
     if (!note) return setBorrowError("Select a note or paste JSON");
     if (!borrowEth || isNaN(Number(borrowEth))) return setBorrowError("Enter borrow amount");
     if (!address) return setBorrowError("Connect wallet first");
+    if (!publicClient) return setBorrowError("No public client");
 
     try {
       setBorrowError("");
@@ -108,12 +187,39 @@ export function BorrowForm() {
         throw new Error(`Insufficient collateral. Need ${minCollateral} ETH, have ${formatEther(note.amount)} ETH`);
       }
 
+      setBorrowStatus("fetching-path");
+
+      // Borrow requires Merkle inclusion proof — note must be in the tree first.
+      const logs = await getAllLogs(publicClient, SHIELDED_POOL_ADDRESS);
+      const noteCommitment = fieldToBytes32(note.commitment);
+
+      const leafLog = logs.find((l) =>
+        l.topics[0]?.toLowerCase() === LEAF_INSERTED_TOPIC &&
+        l.topics[1]?.toLowerCase() === noteCommitment.toLowerCase()
+      );
+
+      if (!leafLog) {
+        throw new Error(
+          "Note not yet in Merkle tree. Wait for the epoch flush (~50 blocks after deposit) before borrowing."
+        );
+      }
+
+      const leafIndex = parseInt(leafLog.data.slice(2, 66), 16);
+
+      const freshRoot = (await publicClient.readContract({
+        address: SHIELDED_POOL_ADDRESS,
+        abi: SHIELDED_POOL_ABI,
+        functionName: "getLastRoot",
+      })) as `0x${string}`;
+
+      const merklePath = await fetchMerklePath(leafIndex, freshRoot);
+
       setBorrowStatus("proving");
-      // V2: circuit name is "collateral_ring" — server maps to collateral_ring_vkey.json
       const { proof, publicSignals } = await generateCollateralProof(
-        note.amount,
+        note,
+        merklePath,
         borrowAmount,
-        MIN_HEALTH_FACTOR_BPS  // pass as minRatioBps
+        MIN_HEALTH_FACTOR_BPS
       );
 
       setBorrowStatus("zkverify");
@@ -123,12 +229,11 @@ export function BorrowForm() {
         body: JSON.stringify({ circuit: "collateral_ring", proof, publicSignals }),
       });
       if (!zkRes.ok) throw new Error(`zkVerify failed: ${await zkRes.text()}`);
-      // zkVerify result confirmed — contract call below does not pass proof args (V2)
       await zkRes.json();
 
       setBorrowStatus("submitting");
-      // V2 borrow signature: (noteNullifierHash, borrowed, collateralAmount, recipient)
-      // No Groth16 proof args — collateral verified off-chain by zkVerify.
+      // V2 borrow: no Groth16 proof args — collateral verified off-chain by zkVerify.
+      // Contract only needs (noteNullifierHash, borrowed, collateralAmount, recipient).
       const txHash = await writeContractAsync({
         address: LENDING_POOL_ADDRESS,
         abi: LENDING_POOL_ABI,
@@ -136,7 +241,7 @@ export function BorrowForm() {
         args: [
           fieldToBytes32(note.nullifierHash),
           borrowAmount,
-          note.amount,           // collateralAmount — public signal from the circuit
+          note.amount,                          // collateralAmount = note denomination
           address as `0x${string}`,
         ],
       });
@@ -170,10 +275,11 @@ export function BorrowForm() {
     }
   }
 
-  const isBorrowing = ["proving", "zkverify", "submitting"].includes(borrowStatus);
+  const isBorrowing = ["fetching-path", "proving", "zkverify", "submitting"].includes(borrowStatus);
 
   const borrowLabel: Record<typeof borrowStatus, string> = {
     idle: "Borrow",
+    "fetching-path": "Fetching Merkle path...",
     proving: "Generating collateral ring proof (~25s)...",
     zkverify: "Submitting to zkVerify...",
     submitting: "Confirming borrow...",
@@ -186,8 +292,8 @@ export function BorrowForm() {
       {/* ── Borrow section ────────────────────────────────────────────────── */}
       <div className="space-y-5">
         <div className="border border-zinc-800 rounded-lg p-4 bg-zinc-900/40 text-xs text-zinc-400 space-y-1">
-          <p>Prove collateral &gt; 110% of borrow amount (MIN_HEALTH_FACTOR_BPS = 11000) using a ZK ring proof.</p>
-          <p>Collateral amount and which note you own are never revealed on-chain.</p>
+          <p>Prove collateral &gt; 110% of borrow amount using a ZK ring proof — your note value and identity stay private.</p>
+          <p>Note must be in the Merkle tree (epoch flushed) before borrowing.</p>
         </div>
 
         {/* Note selection */}
@@ -196,7 +302,12 @@ export function BorrowForm() {
           {savedNotes.length > 0 ? (
             <select
               value={selectedNullifierHash}
-              onChange={(e) => { setSelectedNullifierHash(e.target.value); setNoteJson(""); }}
+              onChange={(e) => {
+                setSelectedNullifierHash(e.target.value);
+                setNoteJson("");
+                setBorrowStatus("idle");
+                setBorrowError("");
+              }}
               disabled={isBorrowing}
               className="w-full bg-zinc-900 border border-zinc-700 rounded-lg px-4 py-3 text-sm
                          focus:outline-none focus:border-indigo-500 disabled:opacity-50 transition-colors"

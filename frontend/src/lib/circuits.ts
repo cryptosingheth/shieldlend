@@ -185,6 +185,13 @@ export async function generateWithdrawProof(
 /**
  * Generate a V2 collateral proof via collateral_ring.circom.
  * Requires collateral_ring.wasm + collateral_ring.zkey in /public/circuits/.
+ *
+ * Private: secret, nullifier, denomination, ring_index, pathElements[24], pathIndices[24]
+ * Public:  ring[16], nullifierHash, root, borrowed, minRatioBps
+ *
+ * Commitment formula matches withdraw_ring: Poseidon(secret, nullifier) — no denomination.
+ * denomination is a private witness used only for the LTV inequality check.
+ * This ensures the same on-chain leaf works for both withdraw and borrow proofs.
  */
 export async function generateCollateralProof(
   note: Note,
@@ -192,6 +199,13 @@ export async function generateCollateralProof(
   borrowed: bigint,
   minRatioBps: bigint
 ): Promise<CollateralProof> {
+  if (merklePath.pathElements.length !== 24) {
+    throw new Error(
+      `pathElements must have 24 elements (got ${merklePath.pathElements.length}). ` +
+      `Ensure LEVELS=24 in collateral_ring.circom.`
+    );
+  }
+
   const snarkjs = await import("snarkjs");
   const { ring, ringIndex } = buildRing(note.commitment);
 
@@ -199,17 +213,17 @@ export async function generateCollateralProof(
     // Private inputs
     secret:       note.secret.toString(),
     nullifier:    note.nullifier.toString(),
-    denomination: note.amount.toString(),
+    denomination: note.amount.toString(),   // private — LTV check only, not in commitment hash
     ring_index:   ringIndex.toString(),
     pathElements: merklePath.pathElements.map((e) => e.toString()),
     pathIndices:  merklePath.pathIndices.map((i) => i.toString()),
 
     // Public inputs
-    ring:         ring.map((r) => r.toString()),
-    root:         merklePath.root.toString(),
+    ring:          ring.map((r) => r.toString()),
     nullifierHash: note.nullifierHash.toString(),
-    borrowed:     borrowed.toString(),
-    minRatioBps:  minRatioBps.toString(),
+    root:          merklePath.root.toString(),
+    borrowed:      borrowed.toString(),
+    minRatioBps:   minRatioBps.toString(),
   };
 
   const { proof, publicSignals } = await snarkjs.groth16.fullProve(

@@ -10,14 +10,14 @@ import { SHIELDED_POOL_ADDRESS, LENDING_POOL_ADDRESS } from "@/lib/contracts";
 const TOPIC_DEPOSIT     = "0x5371f021da83c329fcf7058e2039d7c7384459a19a13baed1a0d9efbfb9d0ee6";
 // cast sig-event "Withdrawal(address,bytes32,uint256)"
 const TOPIC_WITHDRAWAL  = "0x4206db6775563d1043abfcf27cd0ecd19fcc464be574a1487fc95b24957a671a";
-// cast sig-event "Borrowed(uint256,bytes32,uint256,address)"
-const TOPIC_BORROWED    = "0xfee8aa84475025b266c50fc8a54f76b49eddc5d7b92c0061e9251acdbf2a11e7";
+// cast sig-event "Borrowed(uint256)"  — V2: only loanId indexed, no data (privacy)
+const TOPIC_BORROWED    = "0x69c0ed5a77051ba5f0c42418bb6db6d3f73884dea69811c50bf320298df6ca5c";
 // cast sig-event "Repaid(uint256,uint256)"
 const TOPIC_REPAID      = "0x81472a96709c8315c82af40d41ef624a642ad53864b097e53af675593bb4e035";
 
 type RawLog = Log & { transactionHash: `0x${string}` | null };
 
-const DEPLOY_BLOCK = 39499000n;
+const DEPLOY_BLOCK = 39731476n;
 const CHUNK_SIZE = 9000n;
 
 async function getAllLogs(
@@ -26,7 +26,9 @@ async function getAllLogs(
   signal?: AbortSignal
 ): Promise<RawLog[]> {
   if (!publicClient) return [];
-  const latest = await publicClient.getBlockNumber();
+  // Subtract 1 from head to avoid "block range extends beyond current head" RPC errors
+  const rawLatest = await publicClient.getBlockNumber();
+  const latest = rawLatest > 1n ? rawLatest - 1n : rawLatest;
   const all: RawLog[] = [];
   for (let from = DEPLOY_BLOCK; from <= latest; from += CHUNK_SIZE) {
     if (signal?.aborted) return [];
@@ -120,15 +122,14 @@ export function History() {
           const t0 = log.topics[0] as string;
 
           if (t0 === TOPIC_BORROWED) {
-            // Borrowed(uint256 indexed loanId, bytes32 indexed collateralNullifierHash, uint256 amount, address recipient)
-            // data: [amount(uint256), recipient(address padded)] — 2 slots
-            const amount = readUint(log.data, 0);
+            // V2: Borrowed(uint256 indexed loanId) — only loanId, no amount in logs (privacy)
+            // loanId is topics[1], no log.data
             collected.push({
               type: "borrow",
               txHash: log.transactionHash ?? "",
               blockNumber: log.blockNumber ?? 0n,
-              amount,
-              shortId: (log.topics[1] as string ?? "").slice(0, 10),
+              amount: undefined, // not emitted — privacy
+              shortId: "loan#" + BigInt(log.topics[1] as string ?? "0x0").toString(),
             });
           } else if (t0 === TOPIC_REPAID) {
             // Repaid(uint256 indexed loanId, uint256 totalRepaid)

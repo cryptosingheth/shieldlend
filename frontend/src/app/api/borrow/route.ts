@@ -3,32 +3,38 @@ import path from "path";
 import fs from "fs";
 import {
   createWalletClient,
-  createPublicClient,
   http,
   parseAbi,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { baseSepolia } from "viem/chains";
 
-// Server-side borrow flow:
-//  1. Accept { proof, publicSignals, noteNullifierHash, borrowed, recipient, zkVerifyAttestationId }
-//  2. Submit collateral Groth16 proof to zkVerify Volta → verified on their chain
-//  3. Extract pA/pB/pC calldata (Solidity-formatted curve points)
-//  4. Call LendingPool.borrow() with proof + params
-//  5. Return { txHash, aggregationId }
+// Server-side borrow flow (V2):
+//  1. Accept { proof, publicSignals, noteNullifierHash, borrowed, collateralAmount, recipient }
+//  2. Submit collateral_ring Groth16 proof to zkVerify Volta → verified off-chain
+//  3. Call LendingPool.borrow(noteNullifierHash, borrowed, collateralAmount, recipient)
+//     — No on-chain Groth16 verifier in V2. ZK proof is verified by zkVerify before this call.
+//  4. Return { txHash, aggregationId }
+//
+// V2 vs V1 changes:
+//   - Removed pA/pB/pC extraction (no on-chain verifier)
+//   - Changed vkey: collateral_vkey.json → collateral_ring_vkey.json
+//   - borrow() ABI: 4 args only (noteNullifierHash, borrowed, collateralAmount, recipient)
+//   - No aggregation root posting (LendingPool does not call _verifyAttestation)
 
 const DOMAIN_ID = 0;
 
+// V2 LendingPool.borrow — no proof args
 const LENDING_POOL_ABI = parseAbi([
-  "function borrow(uint256[2] pA, uint256[2][2] pB, uint256[2] pC, bytes32 noteNullifierHash, uint256 borrowed, address recipient, uint256 zkVerifyAttestationId) payable",
+  "function borrow(bytes32 noteNullifierHash, uint256 borrowed, uint256 collateralAmount, address recipient) external",
 ]);
 
 export async function POST(req: NextRequest) {
   try {
-    const { proof, publicSignals, noteNullifierHash, borrowed, recipient, zkVerifyAttestationId } =
+    const { proof, publicSignals, noteNullifierHash, borrowed, collateralAmount, recipient } =
       await req.json();
 
-    if (!proof || !publicSignals || !noteNullifierHash || !borrowed || !recipient) {
+    if (!proof || !publicSignals || !noteNullifierHash || !borrowed || !collateralAmount || !recipient) {
       return NextResponse.json({ error: "Missing required fields" }, { status: 400 });
     }
 
@@ -52,8 +58,9 @@ export async function POST(req: NextRequest) {
     const { zkVerifySession, ZkVerifyEvents, Library, CurveType } = await import("zkverifyjs");
 
     const keysDir = path.join(process.cwd(), "..", "circuits", "keys");
+    // V2: collateral circuit is collateral_ring
     const vkey = JSON.parse(
-      fs.readFileSync(path.join(keysDir, "collateral_vkey.json"), "utf8")
+      fs.readFileSync(path.join(keysDir, "collateral_ring_vkey.json"), "utf8")
     );
 
     const session = await zkVerifySession.start().Volta().withAccount(SEED_PHRASE);
@@ -64,34 +71,15 @@ export async function POST(req: NextRequest) {
         .groth16({ library: Library.snarkjs, curve: CurveType.bn128 })
         .execute({ proofData: { vk: vkey, proof, publicSignals }, domainId: DOMAIN_ID });
 
-      let aggregationId: number = zkVerifyAttestationId ?? Math.floor(Date.now() / 1000);
+      let aggregationId: number = 0;
 
       events.on(ZkVerifyEvents.IncludedInBlock, (eventData: { aggregationId: number }) => {
         if (eventData.aggregationId) aggregationId = eventData.aggregationId;
       });
 
-      await transactionResult;
+      const result = await transactionResult;
 
-      // Extract Groth16 calldata (pA, pB, pC) for on-chain verification
-      // snarkjs types don't expose exportSolidityCallData — cast to any
-      const snarkjs = await import("snarkjs");
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const calldataRaw = await (snarkjs.groth16 as any).exportSolidityCallData(proof, publicSignals);
-      // exportSolidityCallData returns: [pA_hex, pB_hex, pC_hex, pubInputs_hex]
-      const calldata = JSON.parse("[" + calldataRaw + "]") as [
-        [string, string],
-        [[string, string], [string, string]],
-        [string, string],
-        string[]
-      ];
-
-      const pA = calldata[0].map((x) => BigInt(x)) as [bigint, bigint];
-      const pB = calldata[1].map((pair) => pair.map((x) => BigInt(x))) as [
-        [bigint, bigint],
-        [bigint, bigint]
-      ];
-      const pC = calldata[2].map((x) => BigInt(x)) as [bigint, bigint];
-
+      // zkVerify confirmed — now call LendingPool.borrow() directly (no on-chain verifier)
       const account = privateKeyToAccount(DEPLOYER_KEY as `0x${string}`);
       const walletClient = createWalletClient({
         account,
@@ -105,17 +93,14 @@ export async function POST(req: NextRequest) {
         abi: LENDING_POOL_ABI,
         functionName: "borrow",
         args: [
-          pA,
-          pB,
-          pC,
           noteNullifierHash as `0x${string}`,
           BigInt(borrowed),
+          BigInt(collateralAmount),
           recipient as `0x${string}`,
-          BigInt(aggregationId),
         ],
       });
 
-      return NextResponse.json({ txHash, aggregationId });
+      return NextResponse.json({ txHash, aggregationId, zkTxHash: result.txHash });
     } finally {
       await session.close();
     }

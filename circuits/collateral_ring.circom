@@ -66,10 +66,12 @@ template MerkleTreeChecker(levels) {
  *   anonymity to the subset of notes at that denomination. Keeping it private
  *   hides the collateral size while still proving it satisfies the LTV ratio.
  *
- * Why the commitment formula differs from WithdrawRing:
- *   Withdrawal notes use Poseidon(secret, nullifier) -- no amount. Collateral
- *   notes must commit to denomination explicitly so the LTV constraint can
- *   reference it as a private signal proven via the commitment.
+ * Commitment formula matches WithdrawRing:
+ *   Both circuits use Poseidon(secret, nullifier) — no denomination in the hash.
+ *   denomination is a private witness used only for the LTV inequality (Step 6).
+ *   It is NOT committed on-chain. This ensures the same deposited leaf works for
+ *   both withdraw and borrow proofs. (Production: a denomination-binding deposit
+ *   circuit would add a separate commitment type to bind the amount on-chain.)
  *
  * This circuit proves FIVE things:
  *
@@ -118,17 +120,18 @@ template CollateralRing(levels, ringSize) {
     rangeCheck.out === 1;
 
     // -------------------------------------------------------------------------
-    // Step 2: Compute C_real = Poseidon(secret, nullifier, denomination)
+    // Step 2: Compute C_real = Poseidon(secret, nullifier)
     //
-    // Three-input Poseidon. denomination is included so the commitment binds
-    // the note's ETH value. The prover cannot lie about denomination because
-    // any tampered value would produce a different C_real that won't match
-    // any entry in the ring.
+    // Matches withdraw_ring.circom exactly — no denomination in the hash.
+    // The on-chain leaf stored at deposit time is Poseidon(secret, nullifier),
+    // so the Merkle inclusion check (Step 5) passes for the same deposited note.
+    // denomination is kept as a private witness for the LTV check in Step 6;
+    // the prover cannot lie about it because any wrong value would violate the
+    // inequality constraint denomination * minRatioBps >= borrowed * 10000.
     // -------------------------------------------------------------------------
-    component commitHasher = Poseidon(3);
+    component commitHasher = Poseidon(2);
     commitHasher.inputs[0] <== secret;
     commitHasher.inputs[1] <== nullifier;
-    commitHasher.inputs[2] <== denomination;
     signal c_real;
     c_real <== commitHasher.out;
 
