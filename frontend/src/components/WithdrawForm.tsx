@@ -276,13 +276,14 @@ export function WithdrawForm() {
         const flushReceipt = await publicClient.waitForTransactionReceipt({ hash: flushTxHash });
         logUpToBlock = flushReceipt.blockNumber;
 
-        // Mark this note as flushed in the map NOW — before the log re-fetch.
-        // After flush, lastEpochBlock updates to the flush block, which would
-        // reset the pending banner countdown to ~50 blocks. Clearing "pending"
-        // here prevents that banner from reappearing during the slow getAllLogs call.
+        // flushEpoch() flushes ALL queued deposits, not just the selected one.
+        // Mark every pending note as "ready" so their banners don't reset
+        // to a 50-block countdown after lastEpochBlock updates on-chain.
         setFlushStatusMap((prev) => {
           const next = new Map(prev);
-          next.set(selectedNullifierHash, "ready");
+          for (const [key, val] of prev) {
+            if (val === "pending") next.set(key, "ready");
+          }
           return next;
         });
 
