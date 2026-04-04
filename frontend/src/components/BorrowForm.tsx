@@ -325,15 +325,29 @@ export function BorrowForm() {
   async function handleRepay() {
     if (!selectedLoan) return setRepayError("Select a loan first");
     if (selectedLoan.repaid) return setRepayError("This loan has already been repaid");
+    if (!publicClient) return setRepayError("No public client");
     try {
       setRepayError("");
       setRepayStatus("submitting");
+
+      // Re-read totalOwed fresh at repay time — the value in state is stale.
+      // Interest accrues per-block, so a stale msg.value hits InsufficientRepayment.
+      // Add a 0.1% buffer on top; the contract refunds any overpayment automatically.
+      const freshDetails = await publicClient.readContract({
+        address: LENDING_POOL_ADDRESS,
+        abi: LENDING_POOL_ABI,
+        functionName: "getLoanDetails",
+        args: [selectedLoan.loanId],
+      }) as [string, bigint, bigint, bigint, boolean];
+      const freshTotalOwed = freshDetails[3];
+      const sendAmount = freshTotalOwed + freshTotalOwed / 1000n; // +0.1% buffer
+
       await writeContractAsync({
         address: LENDING_POOL_ADDRESS,
         abi: LENDING_POOL_ABI,
         functionName: "repay",
         args: [selectedLoan.loanId],
-        value: selectedLoan.totalOwed,
+        value: sendAmount,
       });
       setRepayStatus("done");
     } catch (err) {
