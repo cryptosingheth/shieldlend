@@ -81,6 +81,15 @@ export function WithdrawForm() {
   // Built once when savedNotes loads (not per-selection), so switching notes is instant.
   const [flushStatusMap, setFlushStatusMap] = useState<Map<string, "pending" | "ready">>(new Map());
   const [checkingFlushStatus, setCheckingFlushStatus] = useState(false);
+  // After flushEpoch() confirms, immediately override the stale lastEpochBlock from
+  // useEpochStatus (which polls every 12s). Without this, the countdown shows "Ready"
+  // for up to 12 seconds after a flush because the hook still returns the old value.
+  const [localFlushBlock, setLocalFlushBlock] = useState<bigint | undefined>();
+  // effectiveLastEpochBlock: use the larger of the hook value and our local override.
+  const effectiveLastEpochBlock =
+    localFlushBlock !== undefined && (lastEpochBlock === undefined || localFlushBlock > lastEpochBlock)
+      ? localFlushBlock
+      : lastEpochBlock;
 
   const { withdraw, isPending, isConfirming, isSuccess } = useWithdraw();
   const { writeContractAsync } = useWriteContract();
@@ -276,6 +285,11 @@ export function WithdrawForm() {
         const flushReceipt = await publicClient.waitForTransactionReceipt({ hash: flushTxHash });
         logUpToBlock = flushReceipt.blockNumber;
 
+        // Immediately update effectiveLastEpochBlock so the countdown in the
+        // pending banner reflects the real post-flush value without waiting for
+        // the 12-second useEpochStatus poll to fire.
+        setLocalFlushBlock(flushReceipt.blockNumber);
+
         // flushEpoch() flushes ALL queued deposits, not just the selected one.
         // Mark every pending note as "ready" so their banners don't reset
         // to a 50-block countdown after lastEpochBlock updates on-chain.
@@ -462,8 +476,8 @@ export function WithdrawForm() {
       {/* Pending epoch banner — countdown only, no manual action needed */}
       {noteFlushStatus === "pending" && (() => {
         const flushAtBlock =
-          lastEpochBlock !== undefined && epochBlocks !== undefined
-            ? lastEpochBlock + epochBlocks
+          effectiveLastEpochBlock !== undefined && epochBlocks !== undefined
+            ? effectiveLastEpochBlock + epochBlocks
             : undefined;
         const blocksLeft =
           flushAtBlock !== undefined && currentBlock !== undefined
@@ -506,7 +520,7 @@ export function WithdrawForm() {
       <button
         onClick={handleWithdraw}
         disabled={isLoading || (!noteJson && !selectedNullifierHash) || noteFlushStatus === "checking" || (noteFlushStatus === "pending" && (() => {
-          const flushAt = lastEpochBlock !== undefined && epochBlocks !== undefined ? lastEpochBlock + epochBlocks : undefined;
+          const flushAt = effectiveLastEpochBlock !== undefined && epochBlocks !== undefined ? effectiveLastEpochBlock + epochBlocks : undefined;
           return flushAt !== undefined && currentBlock !== undefined && Number(currentBlock) < Number(flushAt);
         })())}
         className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed
