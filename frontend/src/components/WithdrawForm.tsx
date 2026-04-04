@@ -27,13 +27,20 @@ const LEAF_INSERTED_TOPIC = "0xa4e4458df45cfeb7eebc696f262212e6721fac69466bfc59f
 async function getAllLogs(
   publicClient: NonNullable<ReturnType<typeof usePublicClient>>,
   address: `0x${string}`,
-  upToBlock?: bigint  // if provided, ensures logs include this block (avoids race after flush)
+  upToBlock?: bigint  // if provided, use exactly this block (it's already confirmed)
 ): Promise<Log[]> {
-  // Subtract a 2-block safety margin: eth_blockNumber may return a value
-  // slightly ahead of what the node has indexed for eth_getLogs, causing
-  // "block range extends beyond current head block" on the last chunk.
-  const rawLatest = upToBlock ?? await publicClient.getBlockNumber();
-  const latest = rawLatest > 2n ? rawLatest - 2n : rawLatest;
+  // When no explicit block is given, subtract 1 block as a safety margin:
+  // eth_blockNumber can return a value slightly ahead of what the node has
+  // indexed for eth_getLogs ("block range extends beyond current head block").
+  // Do NOT subtract when upToBlock is explicit — that block is already confirmed
+  // (e.g. flushReceipt.blockNumber) and we need events up to exactly that block.
+  let latest: bigint;
+  if (upToBlock !== undefined) {
+    latest = upToBlock;
+  } else {
+    const rawLatest = await publicClient.getBlockNumber();
+    latest = rawLatest > 1n ? rawLatest - 1n : rawLatest;
+  }
   const allLogs: Log[] = [];
   for (let from = DEPLOY_BLOCK; from <= latest; from += CHUNK_SIZE) {
     const to = from + CHUNK_SIZE - 1n < latest ? from + CHUNK_SIZE - 1n : latest;
@@ -143,10 +150,10 @@ export function WithdrawForm() {
         : 0n
       : null;
 
-  async function fetchMerklePath(leafIndex: number, root: `0x${string}`): Promise<MerklePath> {
+  async function fetchMerklePath(leafIndex: number, root: `0x${string}`, upToBlock?: bigint): Promise<MerklePath> {
     if (!publicClient) throw new Error("No public client");
 
-    const logs = await getAllLogs(publicClient, SHIELDED_POOL_ADDRESS);
+    const logs = await getAllLogs(publicClient, SHIELDED_POOL_ADDRESS, upToBlock);
 
     // Build commitMap ONLY from LeafInserted events (topics[0] = LEAF_INSERTED_TOPIC).
     // Deposit events also have topics[1] = indexed commitment but their data encodes
@@ -213,12 +220,6 @@ export function WithdrawForm() {
       const note = selectedStored ? storedNoteToNote(selectedStored) : deserializeNote(noteJson);
       if (!publicClient) throw new Error("No public client");
 
-      const currentRoot = (await publicClient.readContract({
-        address: SHIELDED_POOL_ADDRESS,
-        abi: SHIELDED_POOL_ABI,
-        functionName: "getLastRoot",
-      })) as `0x${string}`;
-
       const logs = await getAllLogs(publicClient, SHIELDED_POOL_ADDRESS);
       const noteCommitment = fieldToBytes32(note.commitment);
 
@@ -236,6 +237,9 @@ export function WithdrawForm() {
       );
 
       let resolvedLeafLog = leafLog;
+      // logUpToBlock is used to ensure fetchMerklePath queries the same block
+      // range that produced resolvedLeafLog — important after an auto-flush.
+      let logUpToBlock: bigint | undefined = undefined;
 
       if (!resolvedLeafLog) {
         // Deposit is queued. Check whether the epoch is ready to flush.
@@ -270,6 +274,7 @@ export function WithdrawForm() {
         // getAllLogs must query UP TO that block — otherwise it may miss the
         // LeafInserted event if the node hasn't indexed the new block yet.
         const flushReceipt = await publicClient.waitForTransactionReceipt({ hash: flushTxHash });
+        logUpToBlock = flushReceipt.blockNumber;
 
         // Mark this note as flushed in the map NOW — before the log re-fetch.
         // After flush, lastEpochBlock updates to the flush block, which would
@@ -282,7 +287,7 @@ export function WithdrawForm() {
         });
 
         setStatus("fetching-path");
-        const freshLogs = await getAllLogs(publicClient, SHIELDED_POOL_ADDRESS, flushReceipt.blockNumber);
+        const freshLogs = await getAllLogs(publicClient, SHIELDED_POOL_ADDRESS, logUpToBlock);
         resolvedLeafLog = freshLogs.find((l) =>
           l.topics[0]?.toLowerCase() === LEAF_INSERTED_TOPIC &&
           l.topics[1]?.toLowerCase() === noteCommitment.toLowerCase()
@@ -293,14 +298,17 @@ export function WithdrawForm() {
 
       const leafIndex = parseInt(resolvedLeafLog.data.slice(2, 66), 16);
 
-      // Fetch fresh root after potential flush
+      // Always read root AFTER any potential flush — this is the root the proof
+      // will be generated against. The same root is passed to withdraw() and
+      // sent to the zkverify route so all three agree on the same value.
       const freshRoot = (await publicClient.readContract({
         address: SHIELDED_POOL_ADDRESS,
         abi: SHIELDED_POOL_ABI,
         functionName: "getLastRoot",
       })) as `0x${string}`;
 
-      const merklePath = await fetchMerklePath(leafIndex, freshRoot);
+      // fetchMerklePath needs the same log range used to find resolvedLeafLog.
+      const merklePath = await fetchMerklePath(leafIndex, freshRoot, logUpToBlock);
 
       setStatus("proving");
       // V2: circuit name is "withdraw_ring" — server maps to withdraw_ring_vkey.json
@@ -325,7 +333,7 @@ export function WithdrawForm() {
       const nullifierHashHex = fieldToBytes32(note.nullifierHash);
 
       await withdraw(
-        currentRoot,
+        freshRoot,
         nullifierHashHex,
         recipient as Address,
         note.amount,
