@@ -1,8 +1,8 @@
 # ShieldLend V2A — Security Audit & Implementation Report
 
 **Branch**: `v2a-architecture`
-**Date**: 2026-04-03
-**Auditor**: Internal (Claude Code, session 9e2ba90d)
+**Date**: 2026-04-04 (updated)
+**Auditor**: Internal (Claude Code, sessions 9e2ba90d + continuation)
 **Scope**: All Solidity contracts, Circom circuits, and TypeScript frontend library code
 
 ---
@@ -138,13 +138,26 @@ ShieldLend V1 used a Tornado Cash-style fixed-denomination shielded pool:
 `main` → `v2-architecture` (docs/spec only) and `v2a-architecture` (full implementation).
 All implementation commits land on `v2a-architecture`. No merge to `main` until audit findings are resolved.
 
-### Commit Sequence (this session)
+### Commit Sequence (session 1 — 2026-04-03)
 
 ```
 11c4acb  feat: V2 contracts, circuits, and tests — ShieldLend V2A architecture
 56417af  feat: implement V2 Phase 2 + Phase 3 — ring circuits, encrypted storage, V2 frontend
 80f0fd5  fix: patch 3 critical/high bugs found during V2A security audit
 7f7033f  feat: complete V2 implementation — README, NoteKeyProvider wiring, DepositForm encryption
+```
+
+### Commit Sequence (session 2 — 2026-04-04)
+
+```
+1507411  fix: remove recipient/relayer/fee signals from withdraw proof input
+4dcbc93  fix: batch-check all note flush statuses on load, fix counter reappearance
+15ead14  fix: match statement hash inputs between zkverify route and contract
+d1282a5  fix: three WithdrawForm correctness bugs (root freshness, getLogs margin, upToBlock threading)
+b172c53  fix: complete V2 frontend alignment — borrow route, History, DepositForm, circuits
+b15a9c4  fix: mark ALL pending notes ready after flushEpoch, not just selected note
+12f81b8  fix: use effectiveLastEpochBlock to prevent stale countdown after flush
+85cf915  fix: hide pending banner when epoch is already ready (canFlushNow)
 ```
 
 ### Testing Approach
@@ -162,15 +175,15 @@ All implementation commits land on `v2a-architecture`. No merge to `main` until 
 |---|---|---|---|---|
 | C-1 | CRITICAL | `borrow()` has no access control | `LendingPool.sol:113` | Open |
 | C-2 | CRITICAL | `liquidate()` never unlocks collateral | `LendingPool.sol:209` | Open |
-| C-3 | CRITICAL | Commitment scheme mismatch across all three layers | Multiple files | Open |
-| C-4 | CRITICAL | `circuits.ts` uses V1 circuit paths and V1 input structure | `circuits.ts:1-120` | Open |
+| C-3 | CRITICAL | Commitment scheme mismatch across all three layers | Multiple files | **Partial Fix** |
+| C-4 | CRITICAL | `circuits.ts` uses V1 circuit paths and V1 input structure | `circuits.ts:1-120` | **Fixed** |
 | H-1 | HIGH | Withdraw amount not validated against denomination | `ShieldedPool.sol:withdraw()` | Open |
 | H-2 | HIGH | `disburseLoan()` has no maximum amount cap | `LendingPool.sol:disburseLoan()` | Open |
 | H-3 | HIGH | Ring-index-dependent nullifier enables double-spend | `withdraw_ring.circom:nullifierHash` | Open |
-| H-4 | HIGH | `generateWithdrawProof` uses V1 input structure | `circuits.ts:generateWithdrawProof` | Open |
-| H-5 | HIGH | `generateCollateralProof` uses V1 input structure | `circuits.ts:generateCollateralProof` | Open |
-| H-6 | HIGH | `computeCommitment` input order wrong | `circuits.ts:computeCommitment` | Open |
-| H-7 | HIGH | Missing env vars block all zkVerify submissions | `api/zkverify/route.ts` | Open |
+| H-4 | HIGH | `generateWithdrawProof` uses V1 input structure | `circuits.ts:generateWithdrawProof` | **Fixed** |
+| H-5 | HIGH | `generateCollateralProof` uses V1 input structure | `circuits.ts:generateCollateralProof` | **Fixed** |
+| H-6 | HIGH | `computeCommitment` input order wrong | `circuits.ts:computeCommitment` | **Fixed** |
+| H-7 | HIGH | Missing env vars block all zkVerify submissions | `api/zkverify/route.ts` | **Fixed** |
 | M-1 | MEDIUM | Repaid ETH trapped in LendingPool | `LendingPool.sol:repay()` | Open |
 | M-2 | MEDIUM | Interest accrual uses block.timestamp — manipulable | `LendingPool.sol:_accrueInterest()` | Open |
 | M-3 | MEDIUM | No slippage/deadline on borrow amount | `LendingPool.sol:borrow()` | Open |
@@ -500,7 +513,9 @@ Consider using OpenZeppelin `Ownable2Step` for the admin transfer pattern and ad
 
 ## 10. Bugs Fixed During Development
 
-Three bugs were found and fixed in commit `80f0fd5` before the final audit pass:
+### Session 1 Bugs (commit `80f0fd5`)
+
+Three bugs were found and fixed before the final audit pass:
 
 ### Bug 1 — Auto-Settle Proof Bypass (CRITICAL — FIXED)
 
@@ -522,24 +537,163 @@ Three bugs were found and fixed in commit `80f0fd5` before the final audit pass:
 
 ---
 
+### Session 2 Bugs (2026-04-04) — End-to-End Integration Fixes
+
+All bugs below were found during live end-to-end testing on Base Sepolia. All are fixed.
+
+### Bug 4 — withdraw proof input had `recipient`, `relayer`, `fee` signals (HIGH — FIXED)
+
+**Commit**: `1507411`
+**Location**: `frontend/src/lib/circuits.ts:generateWithdrawProof`
+**Description**: `circuits.ts` was passing `recipient`, `relayer`, and `fee` fields to snarkjs, but `withdraw_ring.circom` has no such signals. snarkjs threw "Too many values for input signal recipient", blocking every withdrawal.
+**Fix**: Removed those three fields from the proof input object.
+
+---
+
+### Bug 5 — All notes blocked when one note was "checking" flush status (HIGH — FIXED)
+
+**Commit**: `4dcbc93`
+**Location**: `frontend/src/components/WithdrawForm.tsx`
+**Description**: A single `noteFlushStatus` state was shared across all notes. Selecting any note triggered a per-selection log scan (10–30s), setting status to "checking" and disabling the Withdraw button for that entire duration — even for already-flushed notes.
+**Fix**: Replaced with a `flushStatusMap: Map<nullifierHash, "pending"|"ready">` built once on page load. Note switching is O(1) map lookup — no per-selection RPC calls.
+
+---
+
+### Bug 6 — Pending banner reappeared after flush (MEDIUM — FIXED)
+
+**Commit**: `4dcbc93`
+**Location**: `frontend/src/components/WithdrawForm.tsx`
+**Description**: After `flushEpoch()` confirmed, the banner cleared. But `lastEpochBlock` then updated on-chain, resetting the countdown from 0 back to ~50 blocks, causing the "pending" banner to reappear during the slow `getAllLogs` re-fetch (10–30s).
+**Fix**: Set `flushStatusMap` entry to `"ready"` immediately on flush receipt (before the log re-fetch), so the banner never reappears regardless of `lastEpochBlock` polling.
+
+---
+
+### Bug 7 — statementHash inputs mismatch caused InvalidProof revert (CRITICAL — FIXED)
+
+**Commit**: `15ead14`
+**Location**: `frontend/src/app/api/zkverify/route.ts`
+**Description**: The route was computing `statementHash` from all 18 circuit public signals. The contract's `_verifyAttestation` uses only 4 inputs: `[root, nullifierHash, uint160(recipient), amount]`. Different leaf → different aggRoot submitted → `verifyProofAggregation` returned false → `InvalidProof` revert → gas estimate 140M → exceeds Base Sepolia block limit of 25M.
+**Fix**: Extracted `rootVal = BigInt(sigs[17])` and `nullifierHashVal = BigInt(sigs[16])` from public signals; built the 4-input array; called `statementHash` via `readContract` to get the leaf exactly as the contract computes it.
+
+---
+
+### Bug 8 — freshRoot read before flush, proof generated against post-flush root (HIGH — FIXED)
+
+**Commit**: `d1282a5`
+**Location**: `frontend/src/components/WithdrawForm.tsx:handleWithdraw`
+**Description**: `getLastRoot()` was called before the potential `flushEpoch()` auto-flush. The proof was then generated against the post-flush root (`freshRoot`), but the pre-flush root was passed to `withdraw()`. The two roots disagreed → `_verifyAttestation` computed a different leaf → `InvalidProof`.
+**Fix**: Removed the pre-flush root read entirely. Single `freshRoot = getLastRoot()` call made after any potential flush, used consistently for both proof generation and the `withdraw()` call.
+
+---
+
+### Bug 9 — getLogs queried blocks ahead of indexed head (MEDIUM — FIXED)
+
+**Commit**: `d1282a5`
+**Location**: `frontend/src/lib/contracts.ts:getAllLogs`
+**Description**: `eth_blockNumber` can return a value 1–2 blocks ahead of what the RPC node has indexed for `eth_getLogs`. Requesting logs up to the exact head block returned "block range extends beyond current head block" errors.
+**Fix**: Subtract `1n` from ambient block number for general scans. Do NOT subtract from explicit `upToBlock` values (flush receipt block numbers) — those are already confirmed and the full range is needed.
+
+---
+
+### Bug 10 — fetchMerklePath missing upToBlock after auto-flush (MEDIUM — FIXED)
+
+**Commit**: `d1282a5`
+**Location**: `frontend/src/components/WithdrawForm.tsx:fetchMerklePath`
+**Description**: After auto-flush, `fetchMerklePath` was called without an `upToBlock` parameter, defaulting to `rawLatest - 1n`. If the node's indexed head hadn't caught up to the flush block yet, the new `LeafInserted` event was missed and the path was computed against an incomplete tree.
+**Fix**: Added `upToBlock?: bigint` parameter to `fetchMerklePath`; pass `flushReceipt.blockNumber` from the auto-flush path so the scan covers exactly up to the confirmed flush block.
+
+---
+
+### Bug 11 — collateral_ring.circom commitment formula mismatch (CRITICAL — FIXED)
+
+**Commit**: `b172c53`
+**Location**: `circuits/collateral_ring.circom:Step 2`
+**Description**: `collateral_ring.circom` computed the commitment as `Poseidon(secret, nullifier, denomination)` (3 inputs), but on-chain deposits use `Poseidon(secret, nullifier)` (2 inputs, matching `withdraw_ring.circom`). A prover's note commitment would never match the Merkle leaf stored during deposit → Merkle inclusion always failed → every borrow proof was rejected.
+**Fix**: Changed `Poseidon(3)` to `Poseidon(2)`, removed `denomination` from the commitment hash. `denomination` remains a private witness for the LTV inequality check only (Step 6). Recompiled circuit, regenerated zkey + vkey, copied artifacts to `frontend/public/circuits/`.
+
+---
+
+### Bug 12 — BorrowForm called generateCollateralProof with wrong args (HIGH — FIXED)
+
+**Commit**: `b172c53`
+**Location**: `frontend/src/components/BorrowForm.tsx`
+**Description**: `BorrowForm` was calling `generateCollateralProof(note.amount, borrowAmount, MIN_HEALTH_FACTOR_BPS)` — 3 positional args matching the old V1 signature. The V2 function requires `(note, merklePath, borrowed, minRatioBps)`. Additionally, no Merkle path was being fetched before proof generation, which the circuit requires for the global inclusion proof.
+**Fix**: Complete rewrite — added `getAllLogs` + `fetchMerklePath` (identical to `WithdrawForm`), LeafInserted check before proving, correct `generateCollateralProof(note, merklePath, borrowAmount, MIN_HEALTH_FACTOR_BPS)` call.
+
+---
+
+### Bug 13 — /api/borrow/route.ts was V1 (pA/pB/pC extraction, wrong vkey) (HIGH — FIXED)
+
+**Commit**: `b172c53`
+**Location**: `frontend/src/app/api/borrow/route.ts`
+**Description**: The route extracted `pA`, `pB`, `pC` Groth16 calldata for an on-chain Solidity verifier that no longer exists in V2. It also used `collateral_vkey.json` (V1 name) instead of `collateral_ring_vkey.json`. V2 `LendingPool.borrow()` takes 4 args with no proof.
+**Fix**: Removed all pA/pB/pC extraction, changed vkey to `collateral_ring_vkey.json`, rewrote ABI to `borrow(bytes32 noteNullifierHash, uint256 borrowed, uint256 collateralAmount, address recipient)`, removed aggregation root posting (LendingPool does not call `_verifyAttestation`).
+
+---
+
+### Bug 14 — History.tsx wrong deploy block, wrong Borrowed topic, no getLogs margin (MEDIUM — FIXED)
+
+**Commit**: `b172c53`
+**Location**: `frontend/src/components/History.tsx`
+**Description**: Three separate issues: (1) `DEPLOY_BLOCK = 39499000n` predated actual V2 deployment at block 39731476, causing unnecessary log scans over ~232K empty blocks. (2) `TOPIC_BORROWED` was `keccak256("Borrowed(uint256,bytes32,uint256,address)")` — the V1 4-arg signature; V2 emits only `Borrowed(uint256 indexed loanId)`. Zero borrow events were ever matched. (3) No `-1n` safety margin on `getBlockNumber()`, causing intermittent "block range extends beyond head" errors.
+**Fix**: Corrected deploy block, recomputed topic as `keccak256("Borrowed(uint256)")`, added `-1n` margin, updated borrow event parsing to extract only `loanId` from `topics[1]` (no amount — privacy).
+
+---
+
+### Bug 15 — DEPLOYER_PRIVATE_KEY and ZKVERIFY_AGGREGATION_ADDRESS missing from .env.local (CRITICAL — FIXED)
+
+**Location**: `frontend/.env.local`
+**Description**: Both env vars were absent. In `api/zkverify/route.ts`, the `submitAggregation` block is gated on `DEPLOYER_KEY && ZK_AGG_ADDRESS && POOL_ADDRESS`. With either var missing, the block was silently skipped — no aggRoot was ever stored on-chain. `verifyProofAggregation` then checked against `bytes32(0)` → always false → `InvalidProof` revert → gas estimate 140M → exceeds Base Sepolia block limit (25M) → viem error.
+**Fix**: Added `DEPLOYER_PRIVATE_KEY` (from `contracts/.env`) and `ZKVERIFY_AGGREGATION_ADDRESS=0x8b722840538d9101bfd8c1c228fb704fbe47f460` (from deployment broadcast) to `.env.local`.
+
+---
+
+### Bug 16 — flushStatusMap only updated selected note after flushEpoch (MEDIUM — FIXED)
+
+**Commit**: `b15a9c4`
+**Location**: `frontend/src/components/WithdrawForm.tsx`
+**Description**: After auto-flush, `setFlushStatusMap` only set the selected note's nullifierHash to "ready". `flushEpoch()` inserts ALL queued deposits simultaneously. Other pending notes stayed "pending" in the map and incorrectly showed a ~50-block countdown (because `lastEpochBlock` just updated to the flush block).
+**Fix**: After flush receipt, iterate the entire map and set all "pending" entries to "ready".
+
+---
+
+### Bug 17 — Stale lastEpochBlock caused "Ready" for fresh deposits (MEDIUM — FIXED)
+
+**Commit**: `12f81b8`
+**Location**: `frontend/src/components/WithdrawForm.tsx`
+**Description**: `useEpochStatus` polls `lastEpochBlock` every 12 seconds. After `flushEpoch()` confirms, the hook returned the pre-flush value for up to 12 seconds. During that window, `lastEpochBlock + 50` was still in the past → `blocksLeft = 0` → every pending note showed "Ready" instead of the countdown.
+**Fix**: Stored `flushReceipt.blockNumber` in `localFlushBlock` state immediately on flush. `effectiveLastEpochBlock = max(hookValue, localFlushBlock)` is used in all countdown computations, eliminating the polling delay.
+
+---
+
+### Bug 18 — Amber "Deposit queued" banner showed for notes that could withdraw immediately (LOW — FIXED)
+
+**Commit**: `85cf915`
+**Location**: `frontend/src/components/WithdrawForm.tsx`
+**Description**: When `canFlushNow = true` (epoch overdue — any deposit is immediately withdrawable), the banner still rendered with header "Deposit queued — not yet in Merkle tree" and body "Ready. Click Withdraw." This was confusing — the orange warning banner implied a problem when none existed. The Withdraw button was already enabled.
+**Fix**: Return `null` from the banner render when `canFlushNow = true`. The Withdraw button alone (enabled, no banner) communicates that the note is ready.
+
+---
+
 ## 11. Fix Roadmap (Priority Order)
 
 ### Tier 1 — Must Fix Before Any User Deposits
 
-1. **C-3 + C-4 + H-4 + H-5 + H-6**: Unify commitment scheme and rewrite `circuits.ts`
-   - Decide canonical Poseidon formula (recommend `Poseidon(secret, nullifier, denomination)`)
-   - Update `withdraw_ring.circom` commitment line
-   - Update `circuits.ts:computeCommitment`, `generateWithdrawProof`, `generateCollateralProof`
-   - Re-run trusted setup (zkey invalidated by circuit change)
+1. **C-3 + C-4 + H-4 + H-5 + H-6**: Unify commitment scheme and rewrite `circuits.ts` — **PARTIALLY COMPLETE**
+   - ~~`collateral_ring.circom` commitment fixed to `Poseidon(secret, nullifier)` — matches on-chain leaf~~ ✓
+   - ~~`circuits.ts` rewritten for V2: correct wasm/zkey paths, ring inputs, Merkle path~~ ✓
+   - ~~`generateWithdrawProof` and `generateCollateralProof` input structures corrected~~ ✓
+   - ~~`computeCommitment` input order fixed~~ ✓
+   - Remaining: `denomination` is NOT in the collateral commitment hash (production design note — denomination binding would need a separate commitment type or contract change)
 
-2. **C-1**: Gate `borrow()` on verified collateral
+2. **C-1**: Gate `borrow()` on verified collateral — **OPEN**
    - Add `mapping(bytes32 => uint256) public verifiedCollaterals` to LendingPool
    - Set `verifiedCollaterals[nullifier] = denomination` only from `collateralDeposit()` (which verifies zkVerify proof)
    - In `borrow()`: `require(verifiedCollaterals[collateralNullifier] > 0, "no verified collateral")`
 
-3. **H-7**: Document and verify missing env vars
-   - Add `DEPLOYER_PRIVATE_KEY` and `ZKVERIFY_AGGREGATION_ADDRESS` to `.env.local.example`
-   - Confirm values from zkVerify Volta documentation
+3. **H-7**: Document and verify missing env vars — **FIXED**
+   - ~~Added `DEPLOYER_PRIVATE_KEY` and `ZKVERIFY_AGGREGATION_ADDRESS` to `.env.local`~~ ✓
+   - Still open: add both to `.env.local.example` so future deployments don't miss them
 
 ### Tier 2 — Fix Before Mainnet
 
@@ -573,14 +727,23 @@ Three bugs were found and fixed in commit `80f0fd5` before the final audit pass:
 | ShieldedPool | `0xfaeD6bf64a513aCEC9E8f1672d5e6584F869661a` |
 | LendingPool | `0xdBc459EC670deE0ae70cbF8b9Ea43a00b7A9184D` |
 | NullifierRegistry | `0x685E69Fa36521f527C00E05cf3e18eE4d18aD10C` |
+| ZkVerifyAggregation | `0x8b722840538d9101bfd8c1c228fb704fbe47f460` |
 
-**Status**: Deployed. **Do not point users at these addresses until Tier 1 fixes are applied and circuits.ts is rewritten.** The C-1 vulnerability means any user funds deposited could be extracted by an attacker calling `borrow()` directly.
+**Deployer**: `0x6d4b038b3345acb06b8fdca1beac24c731a44fb2`
+
+**End-to-end status (as of 2026-04-04)**:
+- Deposit → confirmed ✓
+- Withdraw (with auto-flush + zkVerify + on-chain proof aggregation) → confirmed ✓
+- Borrow → zkVerify circuit recompiled, frontend wired — not yet live-tested
+- Repay → not yet live-tested
+
+**Status**: **C-1 is still open** — do not advertise these addresses publicly. The borrow function has no access control gate on collateral validity. Suitable for internal demo / hackathon showcase only.
 
 ### zkVerify
 
-**VK hash in `.env`**: `0x3c7529ffc44c852ad3b1b566a976ea29f379eec2a2edadb7ade311a432962e49`
-**Note**: This VK hash was computed from the trusted setup output. It becomes invalid if any circuit constraint changes (i.e., after fixing C-3). A new trusted setup must be run and the new hash re-deployed.
+**VK hash (withdraw_ring, in `contracts/.env`)**: `0x3c7529ffc44c852ad3b1b566a976ea29f379eec2a2edadb7ade311a432962e49`
+**Note**: `collateral_ring.circom` was recompiled in session 2 (commitment formula fix). The collateral_ring zkey and vkey are now regenerated. The withdraw_ring circuit was not changed — its VK hash remains valid.
 
 ---
 
-*Report generated from audit session 9e2ba90d on branch v2a-architecture. All findings are open unless marked FIXED.*
+*Report last updated 2026-04-04. Sessions: 9e2ba90d (initial audit) + continuation (integration fixes). 18 bugs total found and fixed across both sessions.*
