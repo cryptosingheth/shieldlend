@@ -473,10 +473,12 @@ export function WithdrawForm() {
         </p>
       </div>
 
-      {/* Pending epoch banner — only shown while there are blocks remaining.
-          When the epoch is already overdue (canFlushNow), the note can be
-          withdrawn immediately via auto-flush. No banner needed — the Withdraw
-          button is enabled and auto-flush is transparent to the user. */}
+      {/* Pending epoch banner.
+          Two states:
+          1. blocksLeft > 0 — epoch not ready yet, amber countdown, button disabled.
+          2. blocksLeft = 0 — epoch overdue, note can be flushed immediately.
+             Show a distinct indigo "ready" banner so the user knows the note is
+             still pending (not yet in the tree) but they can click Withdraw now. */}
       {noteFlushStatus === "pending" && (() => {
         const flushAtBlock =
           effectiveLastEpochBlock !== undefined && epochBlocks !== undefined
@@ -489,10 +491,25 @@ export function WithdrawForm() {
         const secsLeft = blocksLeft !== undefined && blocksLeft > 0 ? blocksLeft * 2 : 0;
         const canFlushNow = blocksLeft !== undefined && blocksLeft === 0;
 
-        // Only show the amber countdown banner when there are blocks to wait.
-        // canFlushNow = true means the epoch is overdue — withdraw is possible
-        // immediately, no confusing "Deposit queued — Ready" state shown.
-        if (canFlushNow) return null;
+        if (canFlushNow) {
+          // Epoch is overdue — withdraw is immediately possible via auto-flush.
+          // Show indigo info banner (not amber warning) so the user knows they
+          // can proceed, but still sees that the note isn't in the tree yet.
+          return (
+            <div className="border border-indigo-800/60 rounded-lg p-4 bg-indigo-950/30">
+              <div className="flex items-start gap-3">
+                <span className="text-indigo-400 text-base leading-none">↓</span>
+                <div className="space-y-1">
+                  <p className="text-sm text-indigo-300 font-medium">Deposit queued — ready to insert</p>
+                  <p className="text-xs text-zinc-400">
+                    Click <span className="text-white font-medium">Withdraw</span> — the epoch will flush
+                    automatically, inserting your deposit into the Merkle tree before your proof is generated.
+                  </p>
+                </div>
+              </div>
+            </div>
+          );
+        }
 
         return (
           <div className="border border-amber-900/60 rounded-lg p-4 bg-amber-900/10">
