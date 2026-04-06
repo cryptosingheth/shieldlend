@@ -675,6 +675,37 @@ All bugs below were found during live end-to-end testing on Base Sepolia. All ar
 
 ---
 
+### Session 3 Bugs (2026-04-06) — Repay Flow Fixes
+
+---
+
+### Bug 19 — Stale `totalOwed` in repay causes `InsufficientRepayment` revert (HIGH — FIXED)
+
+**Commit**: `9892dbe`
+**Location**: `frontend/src/components/BorrowForm.tsx:handleRepay`
+**Description**: `selectedLoan.totalOwed` was read once in a `useEffect` at loan-discovery time and stored in component state. Interest accrues every block (~2s on Base Sepolia). By the time the user clicks Repay, on-chain `totalOwed` had grown by a few wei → `msg.value < currentTotalOwed` → `InsufficientRepayment` revert → viem gas estimation fails → surfaces as "exceeds max transaction gas limit".
+**Fix**: Re-read `getLoanDetails(loanId)` fresh via `publicClient.readContract` immediately inside `handleRepay` before the `writeContractAsync` call. Add a 0.1% buffer (`freshTotalOwed + freshTotalOwed / 1000n`) to cover the ~2 blocks between the read and mine. `LendingPool.repay()` already refunds any overpayment to `msg.sender`.
+
+---
+
+### Bug 20 — Repay section used manual text input for loan ID with stale undefined references (HIGH — FIXED)
+
+**Commit**: `87b0d80`
+**Location**: `frontend/src/components/BorrowForm.tsx`
+**Description**: The repay section required the user to manually type a loan ID they had no way of knowing. The implementation referenced `repayLoanId`, `repayLoanIdBig`, and `loanDetails` — variables that were orphaned during the V2 migration when `useLoanDetails` was removed but the UI was not updated. `handleRepay` would reference `loanDetails` (undefined) and immediately bail.
+**Fix**: Added auto-discovery `useEffect` that iterates vault notes via `hasActiveLoan → activeLoanByNote → getLoanDetails` in parallel (`Promise.all` over `publicClient.readContract`). Result populates `userLoans[]` state. Replaced text input with a `<select>` dropdown. Removed stale `useLoanDetails` import.
+
+---
+
+### Bug 21 — History.tsx appended `...` to `loan#N` entries (LOW — FIXED)
+
+**Commit**: `87b0d80`
+**Location**: `frontend/src/components/History.tsx:201`
+**Description**: JSX used `{event.shortId}...` unconditionally for all event types. Deposit/withdrawal shortIds are truncated hex hashes (`0x1a2b...`), so `...` is correct. Borrow shortIds are `loan#0`, `loan#1` etc — complete numbers where `...` is semantically wrong.
+**Fix**: Conditional render: `event.type === "borrow" ? event.shortId : \`${event.shortId}...\``
+
+---
+
 ## 11. Fix Roadmap (Priority Order)
 
 ### Tier 1 — Must Fix Before Any User Deposits
@@ -731,11 +762,11 @@ All bugs below were found during live end-to-end testing on Base Sepolia. All ar
 
 **Deployer**: `0x6d4b038b3345acb06b8fdca1beac24c731a44fb2`
 
-**End-to-end status (as of 2026-04-04)**:
+**End-to-end status (as of 2026-04-06)**:
 - Deposit → confirmed ✓
 - Withdraw (with auto-flush + zkVerify + on-chain proof aggregation) → confirmed ✓
 - Borrow → zkVerify circuit recompiled, frontend wired — not yet live-tested
-- Repay → not yet live-tested
+- Repay → dropdown auto-discovers loans; stale totalOwed bug fixed — not yet live-tested end-to-end
 
 **Status**: **C-1 is still open** — do not advertise these addresses publicly. The borrow function has no access control gate on collateral validity. Suitable for internal demo / hackathon showcase only.
 
@@ -746,4 +777,4 @@ All bugs below were found during live end-to-end testing on Base Sepolia. All ar
 
 ---
 
-*Report last updated 2026-04-04. Sessions: 9e2ba90d (initial audit) + continuation (integration fixes). 18 bugs total found and fixed across both sessions.*
+*Report last updated 2026-04-06. Sessions: 9e2ba90d (initial audit) + session 2 (integration fixes) + session 3 (repay flow). 21 bugs total found and fixed across all sessions.*
