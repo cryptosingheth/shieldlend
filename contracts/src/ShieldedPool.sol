@@ -298,8 +298,19 @@ contract ShieldedPool {
         emit NullifierLocked(nullifierHash);
     }
 
+    /// @notice Unlock a collateral nullifier after loan repayment or liquidation.
+    ///         Only callable by LendingPool.
+    function unlockNullifier(bytes32 nullifierHash) external onlyLendingPool {
+        lockedAsCollateral[nullifierHash] = false;
+    }
+
     /// @notice Disburse ETH for a loan. Only callable by LendingPool.
+    ///         Cap enforced: amount must not exceed available liquidity (excluding protocol funds).
     function disburseLoan(address payable recipient, uint256 amount) external onlyLendingPool {
+        require(
+            amount <= address(this).balance - protocolFunds,
+            "Insufficient pool liquidity"
+        );
         (bool ok,) = recipient.call{value: amount}("");
         require(ok, "Disbursement failed");
         emit LoanDisbursed(recipient, amount);

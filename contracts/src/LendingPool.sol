@@ -21,6 +21,7 @@ import {NullifierRegistry} from "./NullifierRegistry.sol";
 interface IShieldedPool {
     function lockNullifier(bytes32 n) external;
     function disburseLoan(address payable recipient, uint256 amount) external;
+    function unlockNullifier(bytes32 n) external;
 }
 
 contract LendingPool {
@@ -28,6 +29,7 @@ contract LendingPool {
 
     address public immutable admin;
     address public shieldedPool;
+    address public operator; // backend wallet that has verified zkVerify proof off-chain
     NullifierRegistry public immutable nullifierRegistry;
 
     // -- Interest rate model (Aave v3 two-slope utilization) ------------------
@@ -75,6 +77,7 @@ contract LendingPool {
     error InsufficientRepayment();
     error NotAdmin();
     error NotShieldedPool();
+    error NotOperator();
 
     // -- Modifiers ------------------------------------------------------------
     modifier onlyAdmin() {
@@ -87,14 +90,25 @@ contract LendingPool {
         _;
     }
 
+    modifier onlyOperator() {
+        if (msg.sender != operator) revert NotOperator();
+        _;
+    }
+
     constructor(address _nullifierRegistry) {
         admin = msg.sender;
+        operator = msg.sender; // deployer is initial operator; update via setOperator()
         nullifierRegistry = NullifierRegistry(_nullifierRegistry);
     }
 
     // -- Admin ----------------------------------------------------------------
     function setShieldedPool(address _sp) external onlyAdmin {
         shieldedPool = _sp;
+    }
+
+    /// @notice Update the operator address (backend wallet that submits borrows after zkVerify).
+    function setOperator(address _op) external onlyAdmin {
+        operator = _op;
     }
 
     // -- Core: Borrow ---------------------------------------------------------
@@ -115,7 +129,7 @@ contract LendingPool {
         uint256 borrowed,
         uint256 collateralAmount,
         address payable recipient
-    ) external {
+    ) external onlyOperator {
         if (hasActiveLoan[noteNullifierHash]) revert NoteAlreadyUsedAsCollateral();
 
         // Health factor check at borrow time: collateral * 10000 >= borrowed * MIN_HEALTH_FACTOR_BPS
@@ -172,6 +186,10 @@ contract LendingPool {
             require(ok, "Refund failed");
         }
 
+        // Forward repaid ETH to ShieldedPool (sole ETH vault)
+        (bool fwd,) = payable(shieldedPool).call{value: totalOwed}("");
+        require(fwd, "Forward to pool failed");
+
         emit Repaid(loanId, totalOwed);
     }
 
@@ -212,16 +230,24 @@ contract LendingPool {
         uint256 totalOwed = getOwed(l.collateralNullifierHash);
         require(msg.value >= totalOwed, "Insufficient liquidation payment");
 
+        bytes32 collateralHash = l.collateralNullifierHash;
         uint256 principal = l.borrowed;
         l.repaid = true;
-        hasActiveLoan[l.collateralNullifierHash] = false;
+        hasActiveLoan[collateralHash] = false;
         totalBorrowed -= principal;
+
+        // Unlock collateral note so it can be withdrawn again
+        IShieldedPool(shieldedPool).unlockNullifier(collateralHash);
 
         // Refund overpayment
         if (msg.value > totalOwed) {
             (bool ok,) = msg.sender.call{value: msg.value - totalOwed}("");
             require(ok, "Refund failed");
         }
+
+        // Forward repaid ETH to ShieldedPool (sole ETH vault)
+        (bool fwd,) = payable(shieldedPool).call{value: totalOwed}("");
+        require(fwd, "Forward to pool failed");
 
         emit Liquidated(loanId, msg.sender, totalOwed, l.collateralAmount);
     }

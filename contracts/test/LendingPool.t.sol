@@ -32,6 +32,10 @@ contract MockShieldedPool {
         locked[n] = true;
     }
 
+    function unlockNullifier(bytes32 n) external {
+        locked[n] = false;
+    }
+
     function disburseLoan(address payable recipient, uint256 amount) external {
         lastDisbursedRecipient = recipient;
         lastDisbursedAmount = amount;
@@ -72,6 +76,8 @@ contract LendingPoolTest is Test {
         vm.deal(carol, 100 ether);
 
         lendingPool.setShieldedPool(address(mockSP));
+        // alice is the operator (simulates the backend wallet that runs zkVerify)
+        lendingPool.setOperator(alice);
     }
 
     // -- Borrow: happy path ---------------------------------------------------
@@ -356,6 +362,22 @@ contract LendingPoolTest is Test {
         assertEq(lendingPool.totalBorrowed(), 0);
     }
 
+    function testLiquidate_unlocksCollateral() public {
+        // C-2 fix: liquidate must call unlockNullifier on ShieldedPool
+        uint256 edgeBorrow = 0.9 ether;
+        uint256 edgeCollateral = 1 ether;
+        vm.prank(alice);
+        lendingPool.borrow(NOTE_HASH_1, edgeBorrow, edgeCollateral, payable(bob));
+        assertTrue(mockSP.locked(NOTE_HASH_1), "Note should be locked after borrow");
+
+        vm.warp(block.timestamp + 365 days * 2);
+        uint256 owed = lendingPool.getOwed(NOTE_HASH_1);
+        vm.prank(carol);
+        lendingPool.liquidate{value: owed}(0);
+
+        assertFalse(mockSP.locked(NOTE_HASH_1), "Note must be unlocked after liquidation");
+    }
+
     function testLiquidate_reverts_whenHealthy() public {
         vm.prank(alice);
         lendingPool.borrow(NOTE_HASH_1, BORROWED, COLLATERAL, payable(bob));
@@ -363,6 +385,20 @@ contract LendingPoolTest is Test {
         vm.prank(carol);
         vm.expectRevert(bytes("Not liquidatable"));
         lendingPool.liquidate{value: BORROWED}(0);
+    }
+
+    // -- Operator access control (C-1 fix) ------------------------------------
+
+    function testBorrow_reverts_nonOperator() public {
+        vm.prank(carol); // carol is not operator
+        vm.expectRevert(LendingPool.NotOperator.selector);
+        lendingPool.borrow(NOTE_HASH_1, BORROWED, COLLATERAL, payable(bob));
+    }
+
+    function testSetOperator_onlyAdmin() public {
+        vm.prank(alice);
+        vm.expectRevert(LendingPool.NotAdmin.selector);
+        lendingPool.setOperator(carol);
     }
 
     // -- Admin ----------------------------------------------------------------

@@ -30,3 +30,4 @@ broadcast/
 .vscode/
 .idea/
 *.swp
+frontend/package-lock.json
