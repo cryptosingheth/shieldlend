@@ -804,20 +804,20 @@ All bugs below were found during live end-to-end testing on Base Sepolia. All ar
 
 | Contract | Address |
 |---|---|
-| ShieldedPool | `0xfaeD6bf64a513aCEC9E8f1672d5e6584F869661a` |
-| LendingPool | `0xdBc459EC670deE0ae70cbF8b9Ea43a00b7A9184D` |
-| NullifierRegistry | `0x685E69Fa36521f527C00E05cf3e18eE4d18aD10C` |
+| ShieldedPool | `0xdd477c9Abe05a66741D28bae57B4b1eD484232E7` |
+| LendingPool | `0x456Ad285F2E12Adc2dAe8e14Bb0b0229c906f959` |
+| NullifierRegistry | `0xd696a77dB8C8289f97CE0d558A612809E71049C7` |
 | ZkVerifyAggregation | `0x8b722840538d9101bfd8c1c228fb704fbe47f460` |
 
 **Deployer**: `0x6d4b038b3345acb06b8fdca1beac24c731a44fb2`
 
-**End-to-end status (as of 2026-04-06)**:
+**End-to-end status (as of 2026-04-07)**:
 - Deposit → confirmed ✓
 - Withdraw (with auto-flush + zkVerify + on-chain proof aggregation) → confirmed ✓
 - Borrow → zkVerify circuit recompiled, frontend wired — not yet live-tested
 - Repay → dropdown auto-discovers loans; stale totalOwed bug fixed — not yet live-tested end-to-end
 
-**Status**: All Tier 1 security fixes applied (C-1, C-2, H-2, M-1). A **redeployment is required** before live testing — the contracts currently at these addresses are the pre-fix versions. Redeploy from `v2a-architecture` branch before end-to-end borrow/repay testing.
+**Status**: All Tier 1 security fixes applied (C-1, C-2, H-2, M-1). Redeployed 2026-04-07 from `v2a-architecture` branch. These addresses are the fixed versions — safe for live borrow/repay testing.
 
 ### zkVerify
 
