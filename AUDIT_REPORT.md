@@ -177,9 +177,9 @@ b15a9c4  fix: mark ALL pending notes ready after flushEpoch, not just selected n
 | C-2 | CRITICAL | `liquidate()` never unlocks collateral | `LendingPool.sol:209` | **Fixed** |
 | C-3 | CRITICAL | Commitment scheme mismatch across all three layers | Multiple files | **Partial Fix** |
 | C-4 | CRITICAL | `circuits.ts` uses V1 circuit paths and V1 input structure | `circuits.ts:1-120` | **Fixed** |
-| H-1 | HIGH | Withdraw amount not validated against denomination | `ShieldedPool.sol:withdraw()` | Open (requires circuit change) |
+| H-1 | HIGH | Withdraw amount not validated against denomination | `ShieldedPool.sol:withdraw()` | **Fixed** |
 | H-2 | HIGH | `disburseLoan()` has no maximum amount cap | `LendingPool.sol:disburseLoan()` | **Fixed** |
-| H-3 | HIGH | Ring-index-dependent nullifier enables double-spend | `withdraw_ring.circom:nullifierHash` | Open |
+| H-3 | HIGH | Ring-index-dependent nullifier enables double-spend | `withdraw_ring.circom:nullifierHash` | **Fixed** |
 | H-4 | HIGH | `generateWithdrawProof` uses V1 input structure | `circuits.ts:generateWithdrawProof` | **Fixed** |
 | H-5 | HIGH | `generateCollateralProof` uses V1 input structure | `circuits.ts:generateCollateralProof` | **Fixed** |
 | H-6 | HIGH | `computeCommitment` input order wrong | `circuits.ts:computeCommitment` | **Fixed** |
@@ -776,13 +776,11 @@ All bugs below were found during live end-to-end testing on Base Sepolia. All ar
 6. ~~**M-1**: Route repaid ETH back to ShieldedPool~~ ✓ (session 4 — forwarding in repay + liquidate)
 7. ~~**L-5**: package-lock.json in .gitignore~~ ✓
 
-### Tier 2 — Open (Require Circuit Change or Architectural Decision)
+### Tier 2 — Completed (Circuit Changes)
 
-1. **H-1**: Withdraw amount not validated against denomination
-   - Requires `denomination` as a public output in `withdraw_ring.circom` + circuit recompile
-2. **H-3**: Ring-index-dependent nullifier enables theoretical double-spend
-   - Fix: `nullifierHash = Poseidon(nullifier)` independent of ring_index — requires circuit recompile
-3. **L-3**: `GreaterEqThan(96)` LTV check truncates at 96 bits — use 128
+1. ~~**H-1**: Withdraw amount not validated against denomination~~ ✓ (denomination as public output in withdraw_ring.circom, commitment = Poseidon(secret, nullifier, denomination))
+2. ~~**H-3**: Ring-index-dependent nullifier enables theoretical double-spend~~ ✓ (nullifierHash = Poseidon(nullifier), ring_index removed from both circuits)
+3. **L-3**: `GreaterEqThan(96)` LTV check truncates at 96 bits — use 128 (low risk, deferred)
 
 ### Tier 3 — Hardening (Pre-Mainnet)
 
