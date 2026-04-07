@@ -80,6 +80,9 @@ export function WithdrawForm() {
   // Per-note flush status, keyed by nullifierHash.
   // Built once when savedNotes loads (not per-selection), so switching notes is instant.
   const [flushStatusMap, setFlushStatusMap] = useState<Map<string, "pending" | "ready">>(new Map());
+  // Per-note deposit block, keyed by nullifierHash. Used to enforce a personal
+  // 50-block minimum privacy window from deposit time, independent of the global epoch timer.
+  const [depositBlockMap, setDepositBlockMap] = useState<Map<string, bigint>>(new Map());
   const [checkingFlushStatus, setCheckingFlushStatus] = useState(false);
   // After flushEpoch() confirms, immediately override the stale lastEpochBlock from
   // useEpochStatus (which polls every 12s). Without this, the countdown shows "Ready"
@@ -102,12 +105,12 @@ export function WithdrawForm() {
   }, [address, noteKey]);
 
   // ── Batch flush-status check (runs once per notes-load, not per selection) ──
-  // Fetches all LeafInserted logs once, then marks every saved note as
-  // "pending" or "ready". Switching notes in the dropdown is an O(1) map
-  // lookup — no extra RPC calls, no per-note "checking" delay.
+  // Fetches all logs once, then marks every saved note as "pending" or "ready"
+  // and records each note's deposit block for the personal privacy countdown.
   useEffect(() => {
     if (!publicClient || savedNotes.length === 0) {
       setFlushStatusMap(new Map());
+      setDepositBlockMap(new Map());
       return;
     }
     let cancelled = false;
@@ -117,17 +120,28 @@ export function WithdrawForm() {
       .then((snapshotBlock) => getAllLogs(publicClient, SHIELDED_POOL_ADDRESS, snapshotBlock))
       .then((logs) => {
         if (cancelled) return;
-        const newMap = new Map<string, "pending" | "ready">();
+        const newFlushMap = new Map<string, "pending" | "ready">();
+        const newDepositMap = new Map<string, bigint>();
         for (const note of savedNotes) {
           const commitment = ("0x" + note.commitment.padStart(64, "0")) as `0x${string}`;
+          // Find the Deposit event to record what block this note was deposited in.
+          // This is used to enforce a personal 50-block wait from deposit time,
+          // even when the global epoch timer is already overdue.
+          const depositLog = logs.find(
+            (l) => l.topics[1]?.toLowerCase() === commitment.toLowerCase()
+          );
+          if (depositLog?.blockNumber != null) {
+            newDepositMap.set(note.nullifierHash, depositLog.blockNumber);
+          }
           const flushed = logs.some(
             (l) =>
               l.topics[0]?.toLowerCase() === LEAF_INSERTED_TOPIC &&
               l.topics[1]?.toLowerCase() === commitment.toLowerCase()
           );
-          newMap.set(note.nullifierHash, flushed ? "ready" : "pending");
+          newFlushMap.set(note.nullifierHash, flushed ? "ready" : "pending");
         }
-        setFlushStatusMap(newMap);
+        setFlushStatusMap(newFlushMap);
+        setDepositBlockMap(newDepositMap);
         setCheckingFlushStatus(false);
       })
       .catch(() => { if (!cancelled) setCheckingFlushStatus(false); });
@@ -480,10 +494,22 @@ export function WithdrawForm() {
              Show a distinct indigo "ready" banner so the user knows the note is
              still pending (not yet in the tree) but they can click Withdraw now. */}
       {noteFlushStatus === "pending" && (() => {
-        const flushAtBlock =
+        const globalFlushAt =
           effectiveLastEpochBlock !== undefined && epochBlocks !== undefined
             ? effectiveLastEpochBlock + epochBlocks
             : undefined;
+        // Personal privacy window: note must wait EPOCH_BLOCKS from its own deposit block,
+        // even if the global epoch timer is already overdue. Prevents zero-block privacy windows.
+        const depositBlock = selectedNullifierHash ? depositBlockMap.get(selectedNullifierHash) : undefined;
+        const personalFlushAt =
+          depositBlock !== undefined && epochBlocks !== undefined
+            ? depositBlock + epochBlocks
+            : undefined;
+        // Use the later of the two: global epoch timer vs personal deposit window.
+        const flushAtBlock =
+          globalFlushAt !== undefined && personalFlushAt !== undefined
+            ? globalFlushAt > personalFlushAt ? globalFlushAt : personalFlushAt
+            : (globalFlushAt ?? personalFlushAt);
         const blocksLeft =
           flushAtBlock !== undefined && currentBlock !== undefined
             ? Math.max(0, Number(flushAtBlock) - Number(currentBlock))
@@ -538,7 +564,12 @@ export function WithdrawForm() {
       <button
         onClick={handleWithdraw}
         disabled={isLoading || (!noteJson && !selectedNullifierHash) || noteFlushStatus === "checking" || (noteFlushStatus === "pending" && (() => {
-          const flushAt = effectiveLastEpochBlock !== undefined && epochBlocks !== undefined ? effectiveLastEpochBlock + epochBlocks : undefined;
+          const globalFlushAt = effectiveLastEpochBlock !== undefined && epochBlocks !== undefined ? effectiveLastEpochBlock + epochBlocks : undefined;
+          const depositBlock = selectedNullifierHash ? depositBlockMap.get(selectedNullifierHash) : undefined;
+          const personalFlushAt = depositBlock !== undefined && epochBlocks !== undefined ? depositBlock + epochBlocks : undefined;
+          const flushAt = globalFlushAt !== undefined && personalFlushAt !== undefined
+            ? (globalFlushAt > personalFlushAt ? globalFlushAt : personalFlushAt)
+            : (globalFlushAt ?? personalFlushAt);
           return flushAt !== undefined && currentBlock !== undefined && Number(currentBlock) < Number(flushAt);
         })())}
         className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed
