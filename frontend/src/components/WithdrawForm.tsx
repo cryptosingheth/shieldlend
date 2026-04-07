@@ -60,7 +60,9 @@ type ZkVerifyResult = {
   txHash: string;
 };
 
-export function WithdrawForm() {
+type WithdrawStatus = "idle" | "flushing" | "fetching-path" | "proving" | "zkverify" | "submitting" | "done" | "error";
+
+export function WithdrawForm({ onStatusChange }: { onStatusChange?: (s: WithdrawStatus) => void }) {
   const { address } = useAccount();
   const publicClient = usePublicClient();
   const { noteKey } = useNoteKey();
@@ -72,9 +74,10 @@ export function WithdrawForm() {
   const [selectedNullifierHash, setSelectedNullifierHash] = useState<string>("");
   const [noteJson, setNoteJson] = useState("");
   const [recipient, setRecipient] = useState(address ?? "");
-  const [status, setStatus] = useState<
-    "idle" | "flushing" | "fetching-path" | "proving" | "zkverify" | "submitting" | "done" | "error"
-  >("idle");
+  const [status, setStatus] = useState<WithdrawStatus>("idle");
+
+  // Notify parent whenever status changes so it can show a cross-tab progress indicator.
+  useEffect(() => { onStatusChange?.(status); }, [status, onStatusChange]);
   const [errorMsg, setErrorMsg] = useState("");
   const [txHash, setTxHash] = useState<string | null>(null);
   // Per-note flush status, keyed by nullifierHash.
@@ -123,7 +126,8 @@ export function WithdrawForm() {
         const newFlushMap = new Map<string, "pending" | "ready">();
         const newDepositMap = new Map<string, bigint>();
         for (const note of savedNotes) {
-          const commitment = ("0x" + note.commitment.padStart(64, "0")) as `0x${string}`;
+          // note.commitment is already "0x000...abc" (66 chars) from fieldToBytes32 — use directly.
+          const commitment = note.commitment as `0x${string}`;
           // Find the Deposit event to record what block this note was deposited in.
           // This is used to enforce a personal 50-block wait from deposit time,
           // even when the global epoch timer is already overdue.

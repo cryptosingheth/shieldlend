@@ -27,6 +27,7 @@ export default function Home() {
   const { switchChain } = useSwitchChain();
   const [tab, setTab] = useState<Tab>("dashboard");
   const [mounted, setMounted] = useState(false);
+  const [withdrawStatus, setWithdrawStatus] = useState<string>("idle");
 
   // Avoid SSR/client hydration mismatch — chain state is client-only
   useEffect(() => { setMounted(true); }, []);
@@ -89,6 +90,35 @@ export default function Home() {
         </div>
       )}
 
+      {/* ── Withdrawal in-progress banner (shown on all tabs when active) ──── */}
+      {["flushing", "fetching-path", "proving", "zkverify", "submitting"].includes(withdrawStatus) && (
+        <div className="border-b border-indigo-800/60 bg-indigo-950/40 px-6 py-2.5 flex items-center justify-between text-sm">
+          <div className="flex items-center gap-2.5">
+            <span className="relative flex h-2 w-2">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75" />
+              <span className="relative inline-flex rounded-full h-2 w-2 bg-indigo-500" />
+            </span>
+            <span className="text-indigo-300 text-xs">
+              {{
+                "flushing":      "Flushing epoch to Merkle tree...",
+                "fetching-path": "Fetching Merkle inclusion path...",
+                "proving":       "Generating ZK proof — this takes ~20s...",
+                "zkverify":      "Submitting proof to zkVerify...",
+                "submitting":    "Sending withdrawal transaction...",
+              }[withdrawStatus] ?? "Withdrawal in progress..."}
+            </span>
+          </div>
+          {tab !== "withdraw" && (
+            <button
+              onClick={() => setTab("withdraw")}
+              className="text-xs text-indigo-400 hover:text-indigo-300 underline underline-offset-2 transition-colors"
+            >
+              View
+            </button>
+          )}
+        </div>
+      )}
+
       {/* ── Tabs + content ─────────────────────────────────────────────────── */}
       <div className="max-w-2xl mx-auto px-4 pb-16">
 
@@ -105,6 +135,10 @@ export default function Home() {
               }`}
             >
               {TAB_LABELS[t]}
+              {/* Pulsing dot on Withdraw tab when operation is in progress */}
+              {t === "withdraw" && ["flushing", "fetching-path", "proving", "zkverify", "submitting"].includes(withdrawStatus) && (
+                <span className="ml-1.5 inline-flex h-1.5 w-1.5 rounded-full bg-indigo-400 animate-pulse" />
+              )}
             </button>
           ))}
         </div>
@@ -121,16 +155,21 @@ export default function Home() {
               <DepositForm />
             </>
           )}
-          {tab === "withdraw" && (
-            <>
-              <div className="border border-zinc-800 rounded-lg p-4 text-sm text-zinc-400 bg-zinc-900/50 mb-6">
-                Withdraw using your private note. The withdrawal is unlinkable to your original
-                deposit — send to any address.
-              </div>
-              <WithdrawForm />
-            </>
-          )}
-          {tab === "borrow" && <BorrowForm />}
+
+          {/* WithdrawForm and BorrowForm stay mounted while a proof/zkVerify operation is
+              in flight — CSS-hidden tabs keep async state alive across navigation. */}
+          <div className={tab === "withdraw" ? "" : "hidden"}>
+            <div className="border border-zinc-800 rounded-lg p-4 text-sm text-zinc-400 bg-zinc-900/50 mb-6">
+              Withdraw using your private note. The withdrawal is unlinkable to your original
+              deposit — send to any address.
+            </div>
+            <WithdrawForm onStatusChange={setWithdrawStatus} />
+          </div>
+
+          <div className={tab === "borrow" ? "" : "hidden"}>
+            <BorrowForm />
+          </div>
+
           {tab === "history" && (
             <>
               <div className="border border-zinc-800 rounded-lg p-4 text-sm text-zinc-400 bg-zinc-900/50 mb-6">
