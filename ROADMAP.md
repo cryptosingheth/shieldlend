@@ -15,7 +15,6 @@ This document tracks what has been built and what remains. The V2A architecture 
 | End-to-end: Deposit → Withdraw | ✅ Confirmed live |
 | End-to-end: Borrow → Repay | 🔜 Pending live test |
 | Security: Access control on borrow (C-1) | ⚠️ Open critical finding |
-| Production chain: Horizen L3 deploy | ⏳ Future |
 
 ---
 
@@ -49,14 +48,7 @@ Options:
 ### 4. Fix C-2: Liquidation does not unlock collateral
 `liquidate()` marks `loan.repaid = true` and removes the active loan record, but never calls `ShieldedPool.unlockNullifier()`. The collateral note stays locked permanently after liquidation.
 
-### 5. Production chain: Horizen L3
-When Horizen L3 testnet is available:
-- Redeploy all contracts to Horizen L3
-- Update `.env.local` with new RPC + contract addresses
-- Verify zkVerify domain ID for Horizen L3
-- Update History.tsx deploy block number
-
-### 6. Security hardening (before mainnet)
+### 5. Security hardening (before mainnet)
 See `AUDIT_REPORT.md` for the full list of 21 documented findings. Critical open items: C-1 (borrow access control), C-2 (liquidation collateral unlock), H-1 through H-3. These are documented as acceptable for hackathon/testnet use only.
 
 ---

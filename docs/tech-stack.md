@@ -15,8 +15,6 @@ Why Base for V2A:
 - Base Sepolia testnet has reliable public RPC endpoints and a well-stocked faucet
 - BaseScan block explorer works out of the box for debugging
 
-Note on Horizen L3: The original V1 design targeted Horizen L3 (a privacy-first EVM L3 on Base). V2A deployed on Base Sepolia directly because Horizen L3 testnet infrastructure was not available at deployment time. Migration to Horizen L3 requires only an RPC URL change — no contract changes.
-
 What was evaluated and rejected:
 - Ethereum L1: proof verification gas (~500k) makes withdrawals cost $30+ per tx even with zkVerify
 - Polygon zkEVM/Scroll: not purpose-built for privacy DeFi; more complex bridge setup for zkVerify
@@ -26,13 +24,15 @@ What was evaluated and rejected:
 
 ## Proof Verification: zkVerify Volta
 
-What it is: A modular proof verification chain from Horizen Labs. Accepts Groth16 proofs via SDK and emits on-chain attestations.
+What it is: A modular, chain-agnostic proof verification layer. Accepts Groth16 proofs via SDK and emits on-chain attestations that any EVM contract can verify.
 
 Why zkVerify:
 
-Cost: On-chain Groth16 verification costs ~250-500k gas on Ethereum L1 (~$5-30 per proof at moderate gas). zkVerify amortizes verification cost — reducing per-user cost by ~91%. On Base L2 the direct gas cost is lower, but zkVerify still provides the aggregation infrastructure for scaling.
+Cost: On-chain Groth16 verification costs ~250-500k gas on Ethereum L1 (~$5-30 per proof at moderate gas). zkVerify moves verification off-chain — reducing per-user verification cost by ~91%. On Base L2 the direct gas cost is lower, but zkVerify adds proof aggregation infrastructure that scales to multi-proof batching without changing the on-chain interface.
 
-Modularity: zkVerify is chain-agnostic. The same proof submission pipeline works whether contracts are on Base, Horizen L3, or any other EVM chain.
+Decoupled verification: Proof verification is handled by a dedicated verifier network, not bundled into the application contract. This means circuit upgrades (new ptau, new vkey) don't require redeploying ShieldedPool — only the vkey registered with zkVerify changes.
+
+Modularity: The same proof submission pipeline works on any EVM chain. No chain-specific changes needed to the withdrawal logic.
 
 Single-leaf aggregation: V2A uses a single-leaf aggregation pattern — each proof is its own 1-leaf aggregation tree. This simplifies integration while remaining compatible with multi-proof batching in production.
 

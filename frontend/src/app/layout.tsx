@@ -4,7 +4,7 @@ import { Providers } from "./providers";
 
 export const metadata: Metadata = {
   title: "ShieldLend — Private DeFi Lending",
-  description: "ZK-powered private lending on Horizen L3 + zkVerify",
+  description: "ZK-powered private lending on Base Sepolia with zkVerify proof verification",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

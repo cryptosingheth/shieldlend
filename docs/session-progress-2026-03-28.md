@@ -1,7 +1,7 @@
 # ShieldLend — Build Session Progress Report
 **Date:** 2026-03-28
 **Author:** Claude Sonnet 4.6 (Anthropic) + Opinder Singh
-**Project:** ShieldLend — ZK-based private DeFi lending on Horizen L3 + zkVerify
+**Project:** ShieldLend — ZK-based private DeFi lending on Base Sepolia + zkVerify
 
 ---
 

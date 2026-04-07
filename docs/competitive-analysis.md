@@ -111,6 +111,6 @@ ShieldLend V2A = proven pattern (Tornado Cash / Sacred Finance)
 | Deposit batching | None (immediate insertion) | 50-block epoch with dummy entries |
 | Collateral | Must reveal collateral on-chain | Private collateral via ZK LTV check |
 | ETH custody | Protocol holds ETH in lending pool | Single vault (ShieldedPool), LendingPool is accounting-only |
-| Chain | Ethereum L1 | Base Sepolia (testnet), Horizen L3 (planned production) |
+| Chain | Ethereum L1 | Base Sepolia |
 
 The gap ShieldLend fills: no deployed project has combined the Tornado Cash privacy pattern with ring proofs, epoch batching, and DeFi lending mechanics where collateral amount stays private. Sacred Finance was the closest, but ran on expensive L1 with no ring privacy and no private collateral proofs.
