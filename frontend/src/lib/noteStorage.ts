@@ -52,7 +52,7 @@ export async function deriveNoteKey(
 ): Promise<CryptoKey> {
   const baseKey = await crypto.subtle.importKey(
     "raw",
-    keyMaterial,
+    keyMaterial.buffer as ArrayBuffer,
     { name: "HKDF" },
     false,
     ["deriveKey"]

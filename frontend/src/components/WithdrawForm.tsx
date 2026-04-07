@@ -306,7 +306,7 @@ export function WithdrawForm() {
         resolvedLeafLog = freshLogs.find((l) =>
           l.topics[0]?.toLowerCase() === LEAF_INSERTED_TOPIC &&
           l.topics[1]?.toLowerCase() === noteCommitment.toLowerCase()
-        ) ?? null;
+        );
 
         if (!resolvedLeafLog) throw new Error("Flush succeeded but LeafInserted event not found. Try withdrawing again.");
       }
