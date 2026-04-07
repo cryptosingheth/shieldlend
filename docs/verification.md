@@ -1,167 +1,218 @@
-# Proof verification — technical guide
+# ShieldLend V2A — Proof Verification Guide
 
-This document explains **how proofs are verified** in ShieldLend, which **artifacts and contracts** are involved, and how to **regenerate proofs** for Foundry tests after changing circuits or keys.
-
----
-
-## Two verification paths
-
-| Path | Where it runs | Used for |
-|------|----------------|----------|
-| **zkVerify aggregation** | `ShieldedPool` calls `IZkVerifyAggregation.verifyProofAggregation` | Production withdrawals: cheap gas; proof checked off-chain on zkVerify, then a Merkle inclusion proof is checked on-chain. |
-| **Groth16 Solidity verifier** | `DepositVerifier`, `WithdrawVerifier`, `CollateralVerifier` (`verifyProof`) | Optional on-chain Groth16 check; `LendingPool` uses `CollateralVerifier` for borrow proofs; full-path tests live in Foundry. |
-
-These are **independent**: the Solidity verifier embeds a **verification key** derived from your circuit’s `.zkey`. zkVerify uses its own pipeline and **statement hashes** bound to the same public inputs. If you change the trusted setup or circuit, you must refresh **both** the exported Solidity verifiers **and** any zkVerify-facing keys your app uses.
+This document explains how proofs are verified in ShieldLend V2A, what artifacts are involved, and how to regenerate keys after circuit changes.
 
 ---
 
-## Groth16 on-chain verification (how `verifyProof` works)
+## Two Verification Paths
 
-1. **Public inputs** — Field elements (≤ BN254 scalar field order `r`) passed as `uint256` arrays. Their **order** must match snarkjs / Circom (outputs first, then `public` inputs in declaration order).
+| Path | Where | Used For |
+|---|---|---|
+| zkVerify aggregation | ShieldedPool calls ZkVerifyAggregation.verifyProofAggregation | Production withdrawals and borrows. Proof checked off-chain on zkVerify Volta; aggRoot checked on-chain via single-leaf Merkle. |
+| Groth16 Solidity verifier | CollateralVerifier.verifyProof | On-chain Groth16 fallback; used in Foundry tests. |
 
-2. **Proof tuple** — Groth16 proof `(π_A ∈ G1, π_B ∈ G2, π_C ∈ G1)` encoded as:
-   - `pA[2]`, `pC[2]`: affine Fq coordinates for G1 points  
-   - `pB[2][2]`: G2 point (two Fq² limbs per coordinate)
-
-3. **Verifier contract** — SnarkJS-generated Solidity builds a linear combination of fixed **IC** points with the public inputs, then runs a **single pairing check** on BN128 via precompile `0x08` (`ecPairing`). Internally it uses `0x06` (G1 add), `0x07` (G1 mul) for the MSM step.
-
-4. **Result** — `verifyProof` returns `true` iff the pairing equation holds for the proof and public signals under the embedded vk. Tampering with any public signal or proof coordinate without a fresh valid proof makes the check fail.
+These are independent. The Solidity verifier embeds a verification key from the circuit's .zkey. zkVerify uses its own pipeline with statementHash-encoded public inputs. If you change the circuit, you must refresh both the Solidity verifier AND the zkVerify vkey registration.
 
 ---
 
-## Files involved in local proof generation and tests
+## zkVerify Verification — How It Works (V2A)
+
+### 1. Proof submission
+
+```typescript
+// /api/zkverify route (server-side, Next.js)
+const session = await ZkVerifySession.start().Volta().withAccount(DEPLOYER_SEED);
+const { domainId, aggregationId } = await session
+    .verify()
+    .groth16(collateral_ring_vkey_json)  // or withdraw_ring_vkey
+    .execute({ proof, publicSignals });
+```
+
+### 2. Aggregation root computation and posting
+
+```typescript
+// /api/withdraw or /api/borrow route
+const leaf = await publicClient.readContract({
+    address: SHIELDED_POOL_ADDRESS,
+    functionName: "statementHash",
+    args: [[root, nullifierHash, BigInt(recipient), amount]]
+});
+const aggRoot = keccak256(encodePacked(["bytes32"], [leaf]));
+await writeContract({ functionName: "submitAggregation",
+    args: [domainId, aggregationId, aggRoot] });
+```
+
+### 3. On-chain verification in ShieldedPool.withdraw()
+
+```solidity
+function _verifyAttestation(
+    uint256 domainId, uint256 aggregationId, bytes32 aggRoot,
+    bytes32[] memory merklePath, uint256 leafCount, uint256 leafIndex,
+    bytes32 leaf
+) internal view {
+    bool ok = zkVerifyAgg.verifyProofAggregation(
+        domainId, aggregationId, aggRoot, merklePath, leafCount, leafIndex, leaf
+    );
+    require(ok, "InvalidProof");
+}
+```
+
+### 4. What Merkle.verifyProofKeccak checks for single-leaf
+
+For `merklePath=[], leafCount=1, leafIndex=0`:
+```
+verifyProofKeccak(aggRoot, [], 1, 0, leaf)
+  -> assert keccak256(leaf) == aggRoot
+```
+A 1-leaf Merkle tree has root = keccak256(leaf). This is the V2A single-leaf aggregation pattern.
+
+### Critical: required env vars
+
+Without these, submitAggregation is silently skipped and aggRoot stays bytes32(0). verifyProofAggregation always returns false. Surface symptom: "exceeds max transaction gas limit: 140M" in the frontend.
+
+```
+DEPLOYER_PRIVATE_KEY=0x...  (in frontend/.env.local — gitignored)
+ZKVERIFY_AGGREGATION_ADDRESS=0x8b722840538d9101bfd8c1c228fb704fbe47f460
+```
+
+---
+
+## Groth16 On-Chain Verification — How verifyProof Works
+
+1. Public inputs — field elements (< BN254 scalar field order r) as uint256 arrays. Order must match snarkjs/Circom (outputs first, then public inputs in declaration order).
+
+2. Proof tuple — Groth16 proof (pA in G1, pB in G2, pC in G1) encoded as:
+   - pA[2], pC[2]: affine Fq coordinates for G1 points
+   - pB[2][2]: G2 point (two Fq² limbs per coordinate)
+
+3. Verifier contract — snarkjs-generated Solidity builds a linear combination of fixed IC points with public inputs, then runs a pairing check on BN128 via precompile 0x08 (ecPairing).
+
+4. Result — verifyProof returns true iff the pairing equation holds. Tampering with any public signal or proof point breaks the check.
+
+---
+
+## Files Involved in V2A
 
 | Path | Role |
-|------|------|
-| `scripts/gen_test_proofs.js` | Node script: runs `snarkjs.groth16.fullProve` for `deposit`, `collateral`, and `withdraw`; writes `circuits/build/test_proofs.json` and prints Solidity-style calldata. **Requires** compiled WASM + `*_final.zkey` + `*_vkey.json` under `circuits/build/`. |
-| `contracts/test/Groth16Verifiers.t.sol` | Foundry tests that deploy the three verifier contracts and call `verifyProof` with **real** curve points (valid proofs + tampered / dummy cases). Values are synced with the last `gen_test_proofs.js` run for the **same** zkeys as the Solidity verifiers. |
-| `contracts/src/verifiers/DepositVerifier.sol` | SnarkJS-exported Groth16 verifier for `deposit.circom`. |
-| `contracts/src/verifiers/WithdrawVerifier.sol` | SnarkJS-exported Groth16 verifier for `withdraw.circom`. |
-| `contracts/src/verifiers/CollateralVerifier.sol` | SnarkJS-exported Groth16 verifier for `collateral.circom`. |
-| `circuits/build/*.r1cs`, `*_js/*.wasm` | Circuit compile outputs from `circom`. |
-| `circuits/build/*_final.zkey` | Final proving key after Groth16 setup + contribution (or beacon). Must match the verifier you deploy. |
-| `circuits/build/*_vkey.json` | Verification key JSON (snarkjs `groth16 verify`, frontends). |
-| `circuits/build/test_proofs.json` | Generated proof bundle + calldata strings (optional reference; tests hardcode values for stability in CI without requiring Node). |
-| `circuits/build/pot13.ptau` | Powers-of-tau file used in this repo’s dev pipeline (Hermez `powersOfTau28_hez_final_13.ptau` or equivalent). |
+|---|---|
+| circuits/withdraw_ring.circom | V2A withdrawal circuit. K=16 ring, LEVELS=24. |
+| circuits/collateral_ring.circom | V2A collateral circuit. Ring + LTV check. |
+| circuits/build/withdraw_ring_js/withdraw_ring.wasm | Compiled WASM for browser proving |
+| circuits/build/collateral_ring_js/collateral_ring.wasm | Compiled WASM for browser proving |
+| circuits/keys/withdraw_ring_final.zkey | Proving key (large binary, gitignored) |
+| circuits/keys/collateral_ring_final.zkey | Proving key (large binary, gitignored) |
+| circuits/keys/withdraw_ring_vkey.json | Verification key JSON (small, committed) |
+| circuits/keys/collateral_ring_vkey.json | Verification key JSON (small, committed) |
+| frontend/public/circuits/withdraw_ring.wasm | WASM served to browser |
+| frontend/public/circuits/withdraw_ring.zkey | zkey served to browser |
+| frontend/public/circuits/collateral_ring.wasm | WASM served to browser |
+| frontend/public/circuits/collateral_ring.zkey | zkey served to browser |
+| contracts/src/verifiers/CollateralVerifier.sol | snarkjs-exported Groth16 verifier |
+| contracts/src/verifiers/WithdrawVerifier.sol | snarkjs-exported Groth16 verifier |
 
 ---
 
-## End-to-end: compile → keys → verifiers → proofs → Forge
-
-Run from the **repository root** unless noted.
+## End-to-End: Compile -> Keys -> Verifiers -> Test
 
 ### 1. Dependencies
 
-- **Node**: `npm install` at repo root (provides `snarkjs`, `circomlibjs`).
-- **Circom**: on `PATH` (e.g. `cargo install` from [iden3/circom](https://github.com/iden3/circom)).
+```bash
+npm install         # at repo root — provides snarkjs, circomlibjs
+# circom on PATH:   cargo install --git https://github.com/iden3/circom
+# forge:            https://book.getfoundry.sh/
+```
 
 ### 2. Compile circuits
 
 ```bash
 mkdir -p circuits/build
-circom circuits/deposit.circom    --r1cs --wasm --sym -o circuits/build -l node_modules
-circom circuits/withdraw.circom   --r1cs --wasm --sym -o circuits/build -l node_modules
-circom circuits/collateral.circom --r1cs --wasm --sym -o circuits/build -l node_modules
+circom circuits/withdraw_ring.circom   --r1cs --wasm --sym -o circuits/build -l node_modules
+circom circuits/collateral_ring.circom --r1cs --wasm --sym -o circuits/build -l node_modules
 ```
 
-Outputs land in `circuits/build/` (e.g. `deposit_js/deposit.wasm`, `deposit.r1cs`).
+Outputs: circuits/build/withdraw_ring_js/withdraw_ring.wasm, circuits/build/withdraw_ring.r1cs
 
-### 3. Powers of tau and Groth16 setup
-
-Use a ptau with **sufficient power** for your constraint count (here `2^13` is enough for these circuits):
+### 3. Powers of Tau and Groth16 setup
 
 ```bash
-# Example: download once
-curl -sL https://storage.googleapis.com/zkevm/ptau/powersOfTau28_hez_final_13.ptau \
-  -o circuits/build/pot13.ptau
+# Download ptau (iden3 GCS — Hermez S3 bucket is decommissioned)
+curl -sL https://storage.googleapis.com/zkevm/ptau/powersOfTau28_hez_final_17.ptau \
+     -o circuits/build/pot17.ptau
 
-npx snarkjs groth16 setup circuits/build/deposit.r1cs    circuits/build/pot13.ptau circuits/build/deposit_0000.zkey
-npx snarkjs groth16 setup circuits/build/withdraw.r1cs   circuits/build/pot13.ptau circuits/build/withdraw_0000.zkey
-npx snarkjs groth16 setup circuits/build/collateral.r1cs circuits/build/pot13.ptau circuits/build/collateral_0000.zkey
+npx snarkjs groth16 setup circuits/build/withdraw_ring.r1cs \
+    circuits/build/pot17.ptau circuits/build/withdraw_ring_0000.zkey
+npx snarkjs groth16 setup circuits/build/collateral_ring.r1cs \
+    circuits/build/pot17.ptau circuits/build/collateral_ring_0000.zkey
+
+# Finalize with beacon (dev) or contribution (production)
+npx snarkjs zkey beacon circuits/build/withdraw_ring_0000.zkey \
+    circuits/build/withdraw_ring_final.zkey <beaconHex> 10
+npx snarkjs zkey beacon circuits/build/collateral_ring_0000.zkey \
+    circuits/build/collateral_ring_final.zkey <beaconHex> 10
 ```
 
-Finalize each zkey (contributions or beacon — dev example):
+### 4. Export verification keys and Solidity verifiers
 
 ```bash
-npx snarkjs zkey beacon circuits/build/deposit_0000.zkey    circuits/build/deposit_final.zkey    <beaconHex> 10
-npx snarkjs zkey beacon circuits/build/withdraw_0000.zkey   circuits/build/withdraw_final.zkey   <beaconHex> 10
-npx snarkjs zkey beacon circuits/build/collateral_0000.zkey circuits/build/collateral_final.zkey <beaconHex> 10
+npx snarkjs zkey export verificationkey circuits/build/withdraw_ring_final.zkey \
+    circuits/keys/withdraw_ring_vkey.json
+npx snarkjs zkey export verificationkey circuits/build/collateral_ring_final.zkey \
+    circuits/keys/collateral_ring_vkey.json
+
+npx snarkjs zkey export solidityverifier circuits/build/withdraw_ring_final.zkey \
+    contracts/src/verifiers/WithdrawVerifier.sol
+npx snarkjs zkey export solidityverifier circuits/build/collateral_ring_final.zkey \
+    contracts/src/verifiers/CollateralVerifier.sol
 ```
 
-Export vkeys:
+snarkjs emits contract Groth16Verifier — rename each to WithdrawVerifier and CollateralVerifier.
+
+### 5. Copy WASM + zkey to frontend/public
 
 ```bash
-npx snarkjs zkey export verificationkey circuits/build/deposit_final.zkey    circuits/build/deposit_vkey.json
-npx snarkjs zkey export verificationkey circuits/build/withdraw_final.zkey   circuits/build/withdraw_vkey.json
-npx snarkjs zkey export verificationkey circuits/build/collateral_final.zkey circuits/build/collateral_vkey.json
+cp circuits/build/withdraw_ring_js/withdraw_ring.wasm frontend/public/circuits/
+cp circuits/build/withdraw_ring_final.zkey frontend/public/circuits/withdraw_ring.zkey
+cp circuits/build/collateral_ring_js/collateral_ring.wasm frontend/public/circuits/
+cp circuits/build/collateral_ring_final.zkey frontend/public/circuits/collateral_ring.zkey
 ```
 
-### 4. Export Solidity verifiers (must match zkeys)
+### 6. Compute VK hash for ShieldedPool.sol
 
 ```bash
-npx snarkjs zkey export solidityverifier circuits/build/deposit_final.zkey    contracts/src/verifiers/DepositVerifier.sol
-npx snarkjs zkey export solidityverifier circuits/build/withdraw_final.zkey   contracts/src/verifiers/WithdrawVerifier.sol
-npx snarkjs zkey export solidityverifier circuits/build/collateral_final.zkey contracts/src/verifiers/CollateralVerifier.sol
+node -e "
+const ethers = require('ethers');
+const vkey = require('./circuits/keys/withdraw_ring_vkey.json');
+const hash = ethers.keccak256(ethers.toUtf8Bytes(JSON.stringify(vkey)));
+console.log('WITHDRAW_RING_VK_HASH=' + hash);
+"
 ```
 
-SnarkJS emits `contract Groth16Verifier` — rename each contract to `DepositVerifier`, `WithdrawVerifier`, and `CollateralVerifier` respectively (same as existing repo convention).
+Update contracts/.env with the new VK hash and redeploy ShieldedPool.
 
-### 5. Generate test proofs and JSON
+### 7. Forge tests
 
 ```bash
-node scripts/gen_test_proofs.js
+cd contracts && forge test -vv
+# Expected: 60+ tests passing
 ```
-
-This:
-
-- Proves **deposit** with fixed test witnesses (`nullifier=123`, `secret=456`, `amount=1000`).
-- Proves **collateral** with `collateral=2000`, `borrowed=1000`, `ratio=15000`.
-- Builds a **20-level** Merkle root consistent with `ShieldedPool`’s Poseidon binary tree (zeros on the right path) and proves **withdraw** for the same note.
-
-Writes `circuits/build/test_proofs.json`. **If you change zkeys or witnesses**, copy the new `pA/pB/pC` and public signal arrays from the script output (or JSON) into `Groth16Verifiers.t.sol`.
-
-### 6. Verify with snarkjs (off-chain sanity check)
-
-After `groth16 prove` or `fullProve`, you have `public.json` and `proof.json`:
-
-```bash
-npx snarkjs groth16 verify circuits/build/deposit_vkey.json public.json proof.json
-```
-
-`gen_test_proofs.js` already checks each proof with `snarkjs.groth16.verify` before writing `test_proofs.json`; use the CLI when debugging a single circuit export.
-
-### 7. Verify with Foundry (on-chain verifier bytecode)
-
-```bash
-forge test --match-contract Groth16VerifiersTest -vv
-forge test
-```
-
-The tests exercise **valid** Groth16 proofs and **invalid** cases (wrong public inputs, garbage points) against the deployed verifier contracts.
 
 ---
 
-## zkVerify path (ShieldedPool withdrawals) — short reference
+## Checklist After Changing a .circom File
 
-1. User produces a Groth16 proof + public signals in the browser (same circuit math).
-2. Proof is submitted to zkVerify; after aggregation, the app obtains `domainId`, `aggregationId`, Merkle path, `leafCount`, `leafIndex`.
-3. `ShieldedPool` recomputes the **statement leaf** from public inputs (`PROVING_SYSTEM_ID`, `vkHash`, `VERSION_HASH`, endian-adjusted public input hash) and calls `verifyProofAggregation`.
-
-Details and leaf encoding align with [zkVerify’s Groth16 / Circom docs](https://docs.zkverify.io/overview/getting-started/smart-contract). The `vkHash` in `ShieldedPool` must match the key material zkVerify uses for your circuit.
-
----
-
-## Checklist after changing a `.circom` file
-
-1. Recompile the circuit (`circom …`).
-2. Re-run `groth16 setup` → finalize zkey → export `*_vkey.json` and Solidity verifier for **that** circuit.
-3. Run `node scripts/gen_test_proofs.js` and update `Groth16Verifiers.t.sol` if hardcoded constants drift.
-4. `forge test`.
-5. Redeploy verifiers / pool as needed; refresh zkVerify registration if you use attestation.
+1. Recompile the circuit (circom ...)
+2. Re-run groth16 setup -> finalize zkey -> export vkey.json and Solidity verifier
+3. Copy new WASM + zkey to frontend/public/circuits/
+4. Recompute VK hash and update contracts/.env
+5. Redeploy ShieldedPool.sol (VK hash is immutable in the constructor)
+6. Update zkVerify domain registration with new vkey
+7. forge test
 
 ---
 
-## Related docs
+## Deployed VK Hashes (Base Sepolia)
 
-- [circuits.md](./circuits.md) — circuit semantics and the older `circuits/keys/` oriented setup notes.
-- [architecture.md](./architecture.md) — system-level flow.
+| Circuit | VK hash |
+|---|---|
+| withdraw_ring | 0x3c7529ffc44c852ad3b1b566a976ea29f379eec2a2edadb7ade311a432962e49 |
+| collateral_ring | Recompiled in session 2 (commitment formula fix) — check circuits/keys/collateral_ring_vkey.json |

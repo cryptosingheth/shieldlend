@@ -1,11 +1,10 @@
-# ShieldLend — Technical Deep Dive
-**For ZK Cohort Presentation + Instructor Review**
+# ShieldLend V2A — Technical Deep Dive
 
 ---
 
 ## The Core Idea in One Sentence
 
-ShieldLend proves you own a deposit — without revealing which deposit is yours — using Zero-Knowledge Proofs, Poseidon hashing, and an incremental Merkle tree.
+ShieldLend V2A uses ring ZK proofs, epoch batch insertion, adaptive dummy commitments, and AES-256-GCM note encryption to let you deposit ETH and later withdraw it to a different address — with no on-chain link, no timing correlation, and no dependency on how many other users are in the protocol.
 
 ---
 
@@ -13,15 +12,22 @@ ShieldLend proves you own a deposit — without revealing which deposit is yours
 
 ```
 User's Browser
-  │
-  ├── generateNote()         → Poseidon(nullifier, secret, amount) = commitment
-  ├── generateWithdrawProof() → Groth16 proof (snarkjs WASM, runs locally)
-  │
-  └── API Route /api/zkverify
-        └── zkVerifySession   → submits proof to Volta testnet
-              └── attestation → returned to browser
-                    └── withdraw() on-chain → ShieldedPool.sol
-                          └── transfers ETH to recipient
+  |
+  +-- computeCommitment()           -> Poseidon(secret, nullifier) = commitment
+  +-- AES-256-GCM encrypt(note)     -> localStorage (wallet-derived key)
+  +-- generateWithdrawProof()       -> Groth16 ring proof (snarkjs WASM, ~25s)
+  +-- generateCollateralProof()     -> Groth16 ring proof (snarkjs WASM, ~25s)
+  |
+  +-- API Route /api/zkverify
+        -> zkVerifySession          -> submits proof to Volta testnet
+              -> { domainId, aggId } -> returned to browser
+                    |
+  +-- API Route /api/withdraw or /api/borrow
+        -> submitAggregation()      -> aggRoot = keccak256(statementHash(...))
+                                    -> ZkVerifyAggregation.submitAggregation()
+                    |
+              -> withdraw() on-chain -> ShieldedPool.sol
+                    -> verifyProofAggregation -> transfers ETH to recipient
 ```
 
 ---
@@ -30,228 +36,278 @@ User's Browser
 
 ### Why Circom?
 
-Circom is a domain-specific language for writing **arithmetic circuits** — mathematical constraints that define what a valid proof looks like. You write the rules ("the prover must know X such that Y"), and the Groth16 prover generates a proof that satisfies those rules.
+Circom is a DSL for writing arithmetic circuits — mathematical constraints defining what a valid proof looks like. You write the rules, and the Groth16 prover generates a 192-byte proof satisfying them.
 
-### Circuit 1: `deposit.circom` (~540 constraints)
+### Circuit 1: withdraw_ring.circom (~24k constraints)
 
-**What it proves:** "I know a nullifier, secret, and amount such that Poseidon(nullifier, secret, amount) = commitment"
+This is the core privacy circuit.
 
-**Why it matters:** The commitment goes on-chain. The nullifier and secret stay private. No one can reverse-engineer them from the commitment (Poseidon is a one-way function).
-
-```
-Private inputs:  nullifier, secret, amount
-Public output:   commitment = Poseidon(nullifier, secret, amount)
-```
-
-In practice, the deposit circuit is not used for on-chain verification — the commitment is just computed in JavaScript. But having it as a circuit proves the commitment was formed correctly.
-
-### Circuit 2: `withdraw.circom` (~6,020 constraints)
-
-**What it proves:**
-1. "I know a note (nullifier, secret, amount) whose commitment is in the Merkle tree" (membership proof)
-2. "The nullifierHash = Poseidon(nullifier) is unique to this note" (double-spend prevention)
+What it proves:
+1. I know (secret, nullifier) such that Poseidon(secret, nullifier) = C_real
+2. C_real is one of the K=16 commitments in the public ring (at position ring_index, which is PRIVATE)
+3. C_real is a leaf in the depth-24 global Merkle tree with root R (it was actually deposited)
+4. nullifierHash = Poseidon(nullifier, ring_index) is the correct spend tag
 
 ```
-Private inputs:  nullifier, secret, amount
-                 pathElements[20], pathIndices[20]  ← Merkle path
-Public inputs:   root (current Merkle root)
-                 nullifierHash = Poseidon(nullifier)
-                 recipient, amount
+Private:  secret, nullifier, ring_index, pathElements[24], pathIndices[24]
+Public:   ring[16], root, recipient, amount
+Output:   nullifierHash
 ```
 
-The 20-level Merkle tree supports 2^20 = 1,048,576 deposits. The path is 20 sibling hashes — enough to reconstruct the root.
+Key insight: the observer sees ring[16] (16 possible notes) and nullifierHash, but cannot determine which ring member the prover owns because ring_index is private. With 10 dummies/epoch and 30 epochs in the ring selection window, the minimum anonymity set is 300 at protocol launch.
 
-**Key insight:** The nullifier is private, but nullifierHash is public. The contract records nullifierHash as spent, preventing double withdrawal. An observer sees "this nullifierHash was spent" but cannot link it to any specific deposit.
+### Circuit 2: collateral_ring.circom (~24k constraints)
 
-### Circuit 3: `collateral.circom` (~42 constraints)
+Same ring structure as withdraw_ring, with an additional LTV inequality check.
 
-**What it proves:** "I have collateral ≥ 150% of borrowed amount, without revealing the collateral amount"
+What it proves:
+1-3. Same ring membership + Merkle inclusion proof as above
+4. denomination (PRIVATE) x 10000 >= borrowed x minRatioBps
+5. The note's denomination actually satisfies the LTV requirement
 
 ```
-Private input:   collateral
-Public inputs:   borrowed, ratio (e.g. 15000 for 150%)
-Constraint:      collateral * 10000 ≥ ratio * borrowed
+Private:  secret, nullifier, denomination, ring_index, pathElements[24], pathIndices[24]
+Public:   ring[16], root, nullifierHash, borrowed, minRatioBps
 ```
 
-Uses `GreaterEqThan(n)` from circomlib — a range proof gadget that compares two numbers using bit decomposition.
+Why denomination is private: if denomination were public, an observer could narrow which ring member the prover owns by correlating denomination values. Keeping it private hides collateral size.
+
+Why denomination is NOT in the commitment hash: Both circuits use Poseidon(secret, nullifier). This means the same deposited leaf works for both withdraw and borrow proofs.
+
+### What changed from V1 circuits
+
+| Aspect | V1 | V2A |
+|---|---|---|
+| Circuit | withdraw.circom (single-note) | withdraw_ring.circom (K=16 ring) |
+| Depth | 20 | 24 |
+| Commitment | Poseidon(nullifier, secret, amount) | Poseidon(secret, nullifier) |
+| nullifierHash | Poseidon(nullifier) | Poseidon(nullifier, ring_index) |
+| Anonymity set | Depends on real user count | 300+ at launch (dummies) |
+| Proving time | ~5-8s | ~25s |
 
 ---
 
-## Part 2: The Trusted Setup
+## Part 2: The Epoch Batching System
 
-### What is Powers of Tau?
+This is the temporal privacy layer — it prevents timing correlation attacks.
 
-Groth16 requires a **trusted setup ceremony** — a one-time computation that generates public parameters (called `ptau`). These parameters encode a secret toxic waste value τ (tau). If τ is ever revealed, fake proofs can be generated.
+### The Problem with Immediate Insertion
 
-The Hermez network ran a multi-party ceremony with thousands of participants. As long as at least one participant deleted their τ, the setup is safe. We use their `pot14_final.ptau` (power=14, supports up to 2^14 = 16,384 constraints per circuit).
+Without batching, if you deposit at block N and withdraw at block N+51, an observer sees:
+- Block N: commitment C_X inserted into Merkle tree
+- Block N+51: withdrawal consuming nullifierHash Y
 
-### Per-circuit setup
+Even with a valid ZK proof, if there was only one deposit between blocks N and N+51, the observer trivially knows which deposit corresponds to the withdrawal.
 
-After the ptau ceremony, each circuit gets its own proving/verification keys:
+### The V2A Solution
 
-```bash
-# Phase 2 (per-circuit)
-snarkjs groth16 setup withdraw.r1cs pot14_final.ptau withdraw_0000.zkey
-snarkjs zkey contribute withdraw_0000.zkey withdraw_final.zkey
-snarkjs zkey export verificationkey withdraw_final.zkey withdraw_vkey.json
+```
+deposit(C_real) -> pendingCommitments[] queue  (NOT yet in tree)
+
+Every 50 blocks, flushEpoch() is called:
+  1. Snapshot the pending queue
+  2. Generate adaptive dummy commitments:
+     - 0-3 real deposits this epoch  -> insert 10 dummies
+     - 4-9 real deposits             -> insert 5 dummies
+     - 10+ real deposits             -> insert 2 dummies
+  3. Shuffle (real + dummies) using block.prevrandao
+  4. _insert() each into depth-24 Merkle tree
+  5. Emit LeafInserted(commitment, leafIndex) for each
 ```
 
-The `withdraw_final.zkey` is the **proving key** (5MB, used by the prover).
-The `withdraw_vkey.json` is the **verification key** (3KB, embedded in the verifier contract).
+Result: an observer cannot tell which commitments are real vs dummy, and cannot tell which position in the batch a real deposit occupies.
+
+### Why block.prevrandao (not block.timestamp or blockhash)?
+
+On Ethereum post-merge, `block.prevrandao` is the RANDAO beacon value — essentially unmanipulable by block proposers for a single block's shuffle. A proposer would need to grind through 2^255 RANDAO values to influence the shuffle order — economically irrational.
+
+### The 50-block UX tradeoff
+
+50 blocks on Base Sepolia = ~100 seconds. This is the price of temporal privacy. The frontend shows:
+- Amber countdown banner: "~N blocks (~Ns) until epoch flush"
+- When epoch is ready: "Ready — click Withdraw to proceed"
+- On Withdraw click: auto-triggers flushEpoch() (first MetaMask tx), then immediately proceeds with the ZK proof
 
 ---
 
-## Part 3: The Smart Contracts
+## Part 3: Note Encryption
 
-### `ShieldedPool.sol` — The core privacy primitive
+V1 stored notes as plaintext JSON in localStorage. Anyone with access to the user's browser storage could steal all funds.
 
-Implements an **incremental Merkle tree** — a data structure that allows O(log N) insertion without rebuilding the entire tree.
+### V2A Key Derivation
 
 ```
-deposit(bytes32 commitment) external payable
-  → inserts commitment into Merkle tree
-  → emits Deposit(commitment, leafIndex, timestamp, amount)
-
-withdraw(proof, root, nullifierHash, recipient, amount, attestationId) external
-  → checks root is recent (last 30 roots stored)
-  → checks nullifierHash not spent
-  → verifies zkVerify attestation
-  → marks nullifier spent
-  → transfers ETH to recipient
+1. User clicks "Connect Wallet" and signs the fixed message:
+   "ShieldLend: Sign to derive vault key"
+2. Browser receives the 65-byte ECDSA signature
+3. Key = HKDF(
+     ikm  = signature bytes,
+     salt = keccak256("ShieldLend note key"),
+     info = "note encryption key"
+   )  ->  32-byte AES key (as CryptoKey object)
+4. Every note is encrypted:
+   ciphertext = AES-256-GCM(key, JSON.stringify(note))
+   stored as { iv, ciphertext } in localStorage
 ```
 
-**Critical design choice:** `hashLeftRight()` uses **Poseidon** (not keccak256). This is essential — the circuit uses Poseidon for tree hashing, and the contract must produce identical roots. If they diverge, every proof fails.
+### Properties
 
-```solidity
-function hashLeftRight(bytes32 left, bytes32 right) internal pure returns (bytes32) {
-    return bytes32(PoseidonT3.hash([uint256(left), uint256(right)]));
-}
-```
-
-### `NullifierRegistry.sol` — Double-spend prevention
-
-Stores a mapping of spent nullifier hashes. When a withdrawal is submitted, the nullifier hash is permanently marked spent. Attempting to withdraw twice produces a `NullifierAlreadySpent` revert.
-
-**Circular dependency solution:** ShieldedPool needs NullifierRegistry's address, and NullifierRegistry needs ShieldedPool's address. Solved with a one-time `setShieldedPool()` admin initializer called after deployment.
-
-### `LendingPool.sol` — ZK-collateral lending
-
-Accepts a Groth16 collateral proof (verifying the borrower has ≥150% collateral) and disburses ETH. Interest accrues over time. `repay()` accepts ETH and marks the loan closed.
-
-### Verifier Contracts (`*Verifier.sol`)
-
-Auto-generated by snarkjs from the verification key. Each verifier is ~250 lines of assembly-heavy Solidity that performs Groth16 pairing checks using the BN128 elliptic curve.
-
-```solidity
-function verifyProof(
-    uint[2] calldata _pA, uint[2][2] calldata _pB, uint[2] calldata _pC,
-    uint[N] calldata _pubSignals
-) public view returns (bool)
-```
-
-A valid Groth16 proof is ~200 bytes. Verification costs ~250,000 gas on-chain.
+- Deterministic: same wallet always derives the same key -> cross-device recovery works
+- Wallet-bound: only the wallet owner can sign and decrypt
+- Server-blind: key derivation happens entirely client-side; key never reaches any server
+- Forward-secure per-note: each note uses a random 96-bit IV
 
 ---
 
-## Part 4: zkVerify Integration
+## Part 4: The Smart Contracts
+
+### ShieldedPool.sol — The Core Privacy Primitive
+
+The single ETH vault for the entire protocol. Key design decisions:
+
+Vault-strategy separation: ShieldedPool holds all ETH. LendingPool has zero ETH custody. This limits the blast radius of any LendingPool vulnerability — it can only affect loan accounting, not directly drain ETH.
+
+Auto-settle: when withdraw() is called for a note that has an active loan, ShieldedPool automatically calls LendingPool.settleCollateral() before releasing ETH. The user's loan is settled atomically with the withdrawal — no separate repay step needed.
+
+Nullifier locking: when LendingPool.borrow() is called, it calls ShieldedPool.lockNullifier(noteNullifierHash). This prevents the user from withdrawing the collateral note until the loan is repaid, fixing the critical V1 solvency bug.
+
+Hash function consistency: ShieldedPool uses PoseidonT3 for the Merkle tree hashLeftRight() function. This is essential — if the on-chain hash diverged from the circuit's Poseidon implementation, every proof would fail with a root mismatch.
+
+### LendingPool.sol — Accounting Only
+
+No ETH custody. All financial operations are proxied through ShieldedPool.
+
+Interest rate: Aave v3 kinked two-slope utilization model.
+```
+U <= 80%: rate = R_base + (U/U_opt) x R_slope1
+U > 80%:  rate = R_base + R_slope1 + ((U-0.8)/0.2) x R_slope2
+Parameters: R_base=1%, R_slope1=4%, U_opt=80%, R_slope2=40%
+```
+
+Liquidation: health factor based, not time based. HF = (collateralAmount x LIQUIDATION_THRESHOLD) / totalOwed. Liquidatable when HF < 1. Bonus: 5% to liquidator.
+
+No price oracle needed: collateral and borrowed asset are both ETH — no external price feed required.
+
+---
+
+## Part 5: zkVerify Integration
 
 ### What zkVerify does
 
-zkVerify is a dedicated proof verification blockchain (Volta testnet). Instead of verifying proofs directly on Ethereum/Base (expensive — ~250k gas per proof), you:
+zkVerify is a dedicated proof verification blockchain. Instead of verifying proofs on Ethereum/Base (expensive), you submit the proof to zkVerify Volta (cheap) and receive an attestation that the on-chain contract accepts.
 
-1. Submit proof to zkVerify Volta → costs ~$0.001 on Volta
-2. zkVerify verifies and produces an **attestation** (an on-chain statement that "proof X was valid")
-3. The attestation aggregates into a Merkle tree of verified proofs
-4. On Base Sepolia, `ShieldedPool` checks the attestation ID
+### V2A Single-Leaf Aggregation Pattern
 
-For the demo, `_verifyAttestation()` in ShieldedPool is a stub (returns true). A production implementation would bridge the Volta attestation to Base using zkVerify's cross-chain messaging.
+V2A uses a simplified single-leaf aggregation rather than full multi-proof batching:
 
-### Why this matters for the hackathon
+```
+1. proof + publicSignals -> /api/zkverify (Next.js server route)
+2. zkVerifySession.verify().groth16(vkey).execute({ proof, publicSignals })
+   -> { domainId, aggregationId }
 
-zkVerify enables **proof aggregation** — thousands of proofs can be verified for the cost of one. This is the key to making ZK-based DeFi economically viable. Without aggregation, each withdrawal costs ~250k gas for proof verification alone (~$5 at moderate gas prices).
+3. /api/withdraw computes:
+   leaf = statementHash([root, nullifierHash, uint160(recipient), amount])
+   aggRoot = keccak256(abi.encode(leaf))
+   ZkVerifyAggregation.submitAggregation(domainId, aggregationId, aggRoot)
+
+4. Frontend calls:
+   ShieldedPool.withdraw(..., domainId, aggregationId, merklePath=[], leafCount=1, leafIndex=0)
+
+5. ShieldedPool._verifyAttestation():
+   ZkVerifyAggregation.verifyProofAggregation(domainId, aggId, aggRoot, [], 1, 0, leaf)
+   -> Merkle.verifyProofKeccak(aggRoot, [], 1, 0, leaf)
+   -> assert keccak256(leaf) == aggRoot   PASS
+```
+
+Why single-leaf: full Merkle aggregation requires a keeper that batches proofs off-chain. For V2A demo, each proof is its own 1-leaf aggregation tree. This is mathematically valid — a 1-leaf Merkle tree has root = keccak256(leaf).
+
+### The statementHash function
+
+statementHash is a view function on ShieldedPool.sol that encodes the public inputs into a format zkVerify expects:
+
+```solidity
+function statementHash(uint256[] inputs) public view returns (bytes32) {
+    // Encodes: PROVING_SYSTEM_ID, VERSION_HASH, vkHash,
+    //          then each public input with endianness correction
+    // The exact encoding must match zkVerify's leaf format spec
+}
+```
+
+This is critical — if the leaf encoding diverges between the route and what the contract expects, verifyProofAggregation always returns false, causing InvalidProof revert (surfaces as "gas estimate 140M" in the frontend).
 
 ---
 
-## Part 5: The Frontend — How Proofs are Generated in the Browser
+## Part 6: Frontend Architecture
 
-### Note creation (Deposit tab)
-
-```typescript
-// 1. Generate random private inputs
-const nullifier = generateRandomField(); // random 254-bit number
-const secret = generateRandomField();
-const amount = parseEther("0.005");
-
-// 2. Compute commitment using Poseidon WASM
-const poseidon = await buildPoseidon();
-const commitment = F.toObject(poseidon([nullifier, secret, amount]));
-
-// 3. Commitment goes on-chain; nullifier+secret stay in browser
-```
-
-### Merkle path reconstruction (Withdraw tab)
-
-The browser fetches all `Deposit` events from the ShieldedPool and reconstructs the Merkle tree:
+### Note Discovery Flow (Withdraw tab)
 
 ```typescript
-// Sparse tree algorithm — O(20) hashes instead of O(2^20)
-// Step 1: precompute zero hashes
-zeros[0] = 0n;
-zeros[i] = Poseidon(zeros[i-1], zeros[i-1]); // for i = 1..20
+// 1. Load notes from encrypted localStorage
+const notes = await loadNotes(address, noteKey);
 
-// Step 2: walk up the tree from leaf to root
-// At each level, sibling = known commitment OR zeros[level]
-// Compute only ~40 hashes instead of 2 million
+// 2. For each note, build flush status map in parallel
+const flushStatusMap = new Map();
+await Promise.all(notes.map(async (note) => {
+    const logs = await getAllLogs(publicClient, SHIELDED_POOL_ADDRESS);
+    const found = logs.find(l =>
+        l.topics[0] === LEAF_INSERTED_TOPIC &&
+        l.topics[1] === commitment
+    );
+    flushStatusMap.set(note.nullifierHash, found ? "ready" : "pending");
+}));
+
+// 3. Epoch countdown for pending notes
+const effectiveLastEpochBlock = max(hookValue, localFlushBlock);
+// localFlushBlock is set immediately on flush receipt
+// prevents stale 12s polling window from showing wrong state
 ```
 
-### Proof generation
+### Repay Loan Discovery
 
 ```typescript
-const { proof, publicSignals } = await snarkjs.groth16.fullProve(
-    { nullifier, secret, amount, pathElements, pathIndices },
-    "/circuits/withdraw.wasm",   // 2.3MB WebAssembly
-    "/circuits/withdraw_final.zkey" // 5MB proving key
-);
-// ~5-10 seconds in a Web Worker (off main thread)
+// Auto-discover active loans from vault notes
+await Promise.all(savedNotes.map(async (note) => {
+    const hasActive = await publicClient.readContract({
+        functionName: "hasActiveLoan", args: [note.nullifierHash]
+    });
+    if (!hasActive) return;
+
+    const loanId = await publicClient.readContract({
+        functionName: "activeLoanByNote", args: [note.nullifierHash]
+    });
+
+    const details = await publicClient.readContract({
+        functionName: "getLoanDetails", args: [loanId]
+    });
+
+    results.push({ loanId, noteLabel: noteLabel(note), ...details });
+}));
 ```
 
-The proof is ~200 bytes (3 elliptic curve points). Public signals (root, nullifierHash, recipient, amount) are ~4 field elements.
+### Why totalOwed is re-fetched at repay time
 
----
+Interest accrues per block (~2s on Base Sepolia). The `totalOwed` stored in component state was read when the loans loaded — potentially minutes ago. By repay time, `msg.value` (from stale state) < actual `totalOwed` → `InsufficientRepayment` revert → viem gas estimation fails → "exceeds max transaction gas limit."
 
-## Part 6: Privacy Model
-
-### What is hidden
-- Which deposit corresponds to which withdrawal
-- The depositor's address (if they use a different wallet for withdrawal)
-- The nullifier and secret (commitment is a one-way hash)
-
-### What is public
-- Total pool size (sum of all deposits)
-- Individual deposit amounts (unless you use fixed denominations like Tornado Cash)
-- Withdrawal amounts
-- The commitment (but not what it represents)
-
-### Limitations of this demo
-- Variable deposit amounts leak some information (amounts are public on-chain)
-- Production privacy protocols use **fixed denominations** (e.g., exactly 0.1 ETH) so no amount information is revealed
-- The ZK proof proves membership but not the specific leaf — this is the privacy guarantee
+Fix: re-read getLoanDetails immediately before writeContractAsync, add 0.1% buffer. Contract refunds overpayment.
 
 ---
 
 ## Explaining to the Instructor / Community
 
 ### The 30-second pitch
-> "ShieldLend uses Zero-Knowledge Proofs to let you deposit ETH and later withdraw it to a different address, with no on-chain link between them. The math guarantees that you can prove you made a deposit without revealing which one. We built this using Circom circuits, Groth16 proving, and zkVerify for proof aggregation."
+
+"ShieldLend V2A uses ring ZK proofs and epoch batch insertion to let you deposit ETH and later withdraw it to a different address — with no on-chain link between them. Even at protocol launch with zero other users, the anonymity set is 300+ because the protocol itself inserts dummy commitments. The lending layer lets you borrow against your shielded note without revealing which note is yours or how much collateral you have."
 
 ### Key technical talking points
-1. **Poseidon hash** — designed for ZK circuits, 8x fewer constraints than SHA256. Used for both commitments and Merkle tree hashing.
-2. **Incremental Merkle tree** — O(log N) insertion. 20 levels = 1M deposits supported.
-3. **Nullifier pattern** — `nullifierHash = Poseidon(nullifier)` is public but unlinkable to the commitment.
-4. **Groth16 proofs** — 200 bytes, ~5-10 seconds to generate, ~$0.10 to verify on L2.
-5. **Sparse tree optimization** — proof generation went from 60 seconds (full tree rebuild) to 5 seconds (sparse path computation).
 
-### What makes ShieldLend different from Tornado Cash
-- Lending: deposits can be used as collateral without revealing the collateral amount
-- zkVerify: proof aggregation reduces verification cost by 100x vs direct on-chain verification
-- Horizen L3 target: zero gas fees for users
+1. Poseidon hash — designed for ZK circuits, ~8x fewer constraints than SHA256. Used for commitments AND Merkle tree hash on-chain — they MUST be identical or every proof fails.
+
+2. Ring proofs vs tree proofs — ring proofs decouple withdrawal timing from deposit timing. The user proves membership in a local ring of K=16, not the entire global tree at a specific point in time.
+
+3. Epoch batching + prevrandao — batches hide which deposit belongs to which note in each flush. prevrandao is unmanipulable by block proposers.
+
+4. Dummy commitments — protocol-inserted synthetic leaves pad every epoch, giving 300+ anonymity set independent of real user volume.
+
+5. Vault-strategy separation — ShieldedPool holds all ETH. LendingPool is accounting-only. This prevents a borrow bug from draining the vault directly.
+
+6. Single-leaf aggregation — the zkVerify integration uses leaf = statementHash([root, nullifierHash, uint160(recipient), amount]), aggRoot = keccak256(leaf). A 1-leaf Merkle tree is trivially valid.

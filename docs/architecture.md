@@ -1,89 +1,90 @@
-# ShieldLend — System Architecture
+# ShieldLend V2A — System Architecture
+
+**Branch**: `v2a-architecture` | **Network**: Base Sepolia (chain ID 84532)
 
 ---
 
 ## Overview
 
-ShieldLend has four layers:
+ShieldLend V2A has five layers:
 
-1. **Browser** — user-facing UI, wallet connection, in-browser proof generation (no trusted server)
-2. **ZK Circuits** — Circom circuits compiled to WASM; run client-side to produce Groth16 proofs
-3. **Smart Contracts** — Solidity on Horizen L3; handle on-chain state (Merkle tree, nullifiers, funds)
-4. **zkVerify** — off-chain proof verification chain; proofs submitted here are 91% cheaper to verify than on Ethereum L1
+1. **Browser** — Next.js UI, wallet connection, in-browser ring proof generation (snarkjs WASM), note encryption (AES-256-GCM)
+2. **ZK Circuits** — Circom ring circuits compiled to WASM; run client-side to produce Groth16 proofs
+3. **Smart Contracts** — Solidity on Base Sepolia; single ETH vault (ShieldedPool) + accounting-only lending (LendingPool)
+4. **zkVerify** — Off-chain proof verification (Volta testnet); single-leaf aggregation root posted to ShieldedPool on-chain
+5. **Epoch Batching Layer** — 50-block queuing + Fisher-Yates shuffle + adaptive dummy insertion; breaks timing correlation
 
 ---
 
-## Full System Diagram
+## V1 vs V2A
+
+| Dimension | V1 | V2A |
+|---|---|---|
+| ETH custody | ShieldedPool + LendingPool | ShieldedPool only — single unified vault |
+| Circuit | withdraw.circom (depth-20, single note) | withdraw_ring.circom (K=16 ring, depth-24) |
+| Commitment | Poseidon(nullifier, secret, amount) | Poseidon(secret, nullifier) — 2 inputs, no amount |
+| Denominations | Open (any amount) | Fixed: 0.001/0.005/0.01/0.05/0.1/0.5 ETH |
+| Deposit insertion | Immediate | Queued 50 blocks, batch-flushed with dummies |
+| Anonymity set | Depends on user volume | 300+ at launch (10 dummies x 30 epochs) |
+| Note storage | Plaintext localStorage | AES-256-GCM, HKDF key from MetaMask signature |
+| Interest model | Flat rate | Aave v3 kinked two-slope utilization curve |
+| Liquidation | Time-based | Health factor (HF = collateral x LT / owed) |
+| Auto-settle | None | withdraw() atomically repays open loans |
+
+---
+
+## System Diagram
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  USER BROWSER                                                   │
-│  Next.js + wagmi + snarkjs (WASM)                               │
-│                                                                 │
-│  ┌──────────────────┐  ┌──────────────────┐  ┌───────────────┐  │
-│  │  Deposit UI      │  │  Withdraw UI     │  │  Collateral   │  │
-│  │  1. Enter amount │  │  1. Enter secret │  │  Proof UI     │  │
-│  │  2. Generate     │  │  2. Generate     │  │               │  │
-│  │     secret       │  │     Merkle proof │  │  1. Prove     │  │
-│  │  3. Compute      │  │  3. Generate     │  │     ratio >   │  │
-│  │     commitment   │  │     nullifier    │  │     threshold │  │
-│  │  4. Submit tx    │  │  4. Submit proof │  │               │  │
-│  └──────────────────┘  └──────────────────┘  └───────────────┘  │
-└──────────────────────────────┬──────────────────────────────────┘
-                               │ wallet tx + proof
-┌──────────────────────────────▼──────────────────────────────────┐
-│  ZK CIRCUITS (Circom — compiled to WASM, run in browser)        │
-│                                                                 │
-│  deposit.circom                                                 │
-│  ─────────────                                                  │
-│  private inputs:  amount, secret, nullifier                     │
-│  public outputs:  commitment = Pedersen(amount || secret)       │
-│                   nullifierHash = Poseidon(nullifier)           │
-│                                                                 │
-│  withdraw.circom                                                │
-│  ────────────────                                               │
-│  private inputs:  secret, nullifier, pathElements[], indices[]  │
-│  public inputs:   root (Merkle root), recipient address         │
-│  public outputs:  nullifierHash                                 │
-│  constraints:     Merkle membership + nullifier derivation      │
-│                                                                 │
-│  collateral.circom                                              │
-│  ─────────────────                                              │
-│  private inputs:  exact_collateral_amount                       │
-│  public inputs:   min_ratio, borrowed_amount                    │
-│  constraints:     exact_collateral * 100 >= min_ratio * borrowed│
-└──────────────────────────────┬──────────────────────────────────┘
-                               │ Groth16 proof
-              ┌────────────────┴────────────────┐
-              │                                 │
-┌─────────────▼──────────────┐  ┌──────────────▼──────────────┐
-│  SMART CONTRACTS           │  │  ZKVERIFY CHAIN             │
-│  (Solidity on Horizen L3)  │  │                             │
-│                            │  │  1. Receive proof via       │
-│  ShieldedPool.sol          │  │     zkVerifyJS SDK          │
-│  ─────────────────         │  │                             │
-│  • Incremental Merkle tree │  │  2. Verify Groth16 proof    │
-│  • insertCommitment()      │  │     (91% cheaper than L1)   │
-│  • getRoot() → Merkle root │  │                             │
-│  • MerkleProof events      │  │  3. Emit attestation event  │
-│                            │  │                             │
-│  NullifierRegistry.sol     │  │  4. Relayer reads event     │
-│  ──────────────────────    │  │     → calls back to         │
-│  • mapping: nullifier→bool │  │       ShieldedPool.sol      │
-│  • markSpent(nullifier)    │  │                             │
-│  • isSpent(nullifier)      │  └─────────────────────────────┘
-│                            │
-│  LendingPool.sol           │
-│  ────────────────          │
-│  • Forked from Aave V3     │
-│  • deposit(commitment)     │
-│  • borrow(proof, amount)   │
-│  • repay()                 │
-│  • withdraw(proof)         │
-│  • Calls NullifierRegistry │
-└────────────────────────────┘
+USER BROWSER
+Next.js + wagmi/viem + snarkjs (WASM) + circomlibjs (Poseidon)
 
-Deployment: Horizen L3 testnet  (fallback: Base Sepolia)
+Deposit Tab            Withdraw Tab            Borrow/Repay Tab
+Select denomination    Select encrypted note   Select collateral note
+Compute commitment     Wait 50-block epoch     Enter borrow amount
+Encrypt + save note     OR auto-flush          Ring proof generation
+Submit deposit tx      Ring proof (~25s)       zkVerify submission
+                       zkVerify submission     borrow() on-chain
+                       withdraw() on-chain     Dropdown: auto-load loans
+
+Note Storage: AES-256-GCM
+Key = HKDF(keccak("ShieldLend note key"), MetaMask sig seed)
+
+                    |
+                    | Groth16 ring proof + tx
+           ---------+---------
+           |                 |
+SMART CONTRACTS         ZKVERIFY VOLTA TESTNET
+(Solidity, Base)
+                        1. Receive ring proof via /api/zkverify
+ShieldedPool.sol        2. Verify Groth16 proof (91% cheaper than L1)
+- Single ETH vault      3. Return domainId + aggId
+- pendingCommitments[]  4. Route calls submitAggregation(domainId, aggId,
+- EPOCH_BLOCKS=50            aggRoot=keccak256(statementHash(...)))
+- flushEpoch():
+    prevrandao shuffle
+    adaptive dummies
+    _insert() depth-24
+- lockNullifier()
+- disburseLoan()
+- settleCollateral()
+- LEVELS=24
+
+LendingPool.sol
+- Accounting only
+- Aave v3 two-slope rate
+- HF-based liquidation
+- hasActiveLoan mapping
+- activeLoanByNote mapping
+- getLoanDetails()
+
+NullifierRegistry.sol
+- isSpent / markSpent
+- onlyShieldedPool
+
+ZkVerifyAggregation.sol
+- verifyProofAggregation()
+- submitAggregation()
 ```
 
 ---
@@ -91,133 +92,154 @@ Deployment: Horizen L3 testnet  (fallback: Base Sepolia)
 ## Data Flow — Private Deposit
 
 ```
-1. User opens ShieldLend frontend and connects wallet
-2. User enters deposit amount (e.g., 1 ETH)
-3. Browser generates locally (never sent to any server):
-   secret        = crypto.getRandomValues(32 bytes)
-   nullifier     = crypto.getRandomValues(32 bytes)
-   commitment    = Pedersen(amount || secret)    ← deposit.circom
-   nullifierHash = Poseidon(nullifier)           ← deposit.circom
-4. Browser runs deposit.circom WASM → Groth16 proof of correct commitment
-5. User receives a "note" = { amount, secret, nullifier, commitment, leafIndex }
-   → THIS IS THE ONLY WAY TO WITHDRAW — back it up securely
-6. Frontend calls ShieldedPool.deposit(commitment) with ETH attached
-7. Contract verifies proof → inserts commitment into Merkle tree → emits CommitmentInserted event
-8. ETH held in ShieldedPool contract
+1. Select denomination: 0.001/0.005/0.01/0.05/0.1/0.5 ETH
+2. Browser generates locally (never leaves device):
+     secret     = crypto.getRandomValues(32 bytes) as field element
+     nullifier  = crypto.getRandomValues(32 bytes) as field element
+     commitment = Poseidon(secret, nullifier)   <- V2A: 2 inputs, secret first
+3. ShieldedPool.deposit(commitment) called with ETH
+4. Contract validates denomination, queues commitment in pendingCommitments[]
+   emits: Deposit(commitment, queueIndex, timestamp, amount)
+5. Commitment is NOT yet in Merkle tree
+6. Browser encrypts note with wallet-derived AES-256-GCM key
+7. Every ~50 blocks, flushEpoch() is called:
+     - Shuffles pending queue using block.prevrandao
+     - Inserts adaptive dummies (2/5/10 based on epoch size)
+     - _insert() called for each -> depth-24 Merkle tree updated
+     - emits: LeafInserted(commitment, leafIndex)  <- real Merkle position
 ```
+
+Critical: deposits are NOT immediately withdrawable. The 50-block wait (~100s on Base Sepolia) is a privacy mechanism — batching multiple deposits together breaks timing correlation.
 
 ---
 
 ## Data Flow — Private Withdrawal
 
 ```
-1. User loads their note (amount, secret, nullifier) — from local file or manual entry
-2. Frontend fetches current Merkle root from ShieldedPool.getRoot()
-3. Frontend reconstructs Merkle path for the commitment from on-chain CommitmentInserted events
-4. Browser runs withdraw.circom WASM → Groth16 proof proving:
-   - "This commitment exists in the Merkle tree at the given root"  (Merkle membership)
-   - "I know the secret that generated it"                          (preimage knowledge)
-   - "I haven't used this nullifier before"                         (fresh nullifier)
-5. Frontend sends proof + nullifierHash + root + recipient to zkVerifyJS SDK
-6. zkVerify chain verifies the Groth16 proof → emits ProofAttestation event with attestation ID
-7. Relayer (or frontend directly) calls ShieldedPool.withdraw(attestationId, nullifierHash, root, recipient)
-8. Contract checks:
-   - Attestation ID is valid and from zkVerify ✓
-   - Root is a known historical root ✓
-   - NullifierRegistry.isSpent(nullifierHash) == false ✓
-9. NullifierRegistry.markSpent(nullifierHash) — prevents double-withdrawal
-10. ETH sent to recipient address
-    → No on-chain link between deposit address and withdrawal address
+1. Decrypt note client-side using wallet-derived key
+2. Check for LeafInserted(commitment) event:
+   - Found: note is in tree, proceed
+   - Not found + epoch ready: auto-trigger flushEpoch() (first MetaMask tx)
+   - Not found + epoch not ready: show amber countdown (blocks/seconds)
+3. Fetch all LeafInserted events -> reconstruct Merkle tree
+4. Build Merkle path (24 siblings) for commitment
+5. Build ring: K=16 commitments from last 30 epoch flushes
+   ring[ring_index] = prover's real commitment (ring_index is PRIVATE)
+   ring[others]     = other real/dummy commitments from recent epochs
+6. withdraw_ring.circom WASM -> Groth16 proof (~25s):
+   - C_real = Poseidon(secret, nullifier)
+   - ring[ring_index] == C_real  (membership - ring_index hidden)
+   - C_real is leaf in depth-24 Merkle tree with root R
+   - nullifierHash = Poseidon(nullifier, ring_index)
+7. Proof -> /api/zkverify -> zkVerify Volta -> { domainId, aggId }
+   aggRoot = keccak256(statementHash([root, nullifierHash, uint160(recipient), amount]))
+   ZkVerifyAggregation.submitAggregation(domainId, aggId, aggRoot)
+8. ShieldedPool.withdraw(root, nullifierHash, recipient, amount,
+     domainId, aggId, merklePath=[], leafCount=1, leafIndex=0)
+9. verifyProofAggregation -> keccak256(leaf) == aggRoot pass
+   markSpent(nullifierHash) -> transfer ETH to recipient
+   if loan open: settleCollateral() deducted first
 ```
 
 ---
 
-## Smart Contract Interfaces
+## Data Flow — Borrow + Repay
+
+```
+BORROW
+1. Select collateral note (in Merkle tree, no active loan)
+2. Enter borrow amount - HF preview: collateral >= 110% of borrow
+3. collateral_ring.circom -> Groth16 proof
+4. Proof -> /api/zkverify -> attestation
+5. LendingPool.borrow(noteNullifierHash, borrowed, collateralAmount, recipient)
+   lockNullifier() -> create Loan -> activeLoanByNote -> disburseLoan()
+   emits: Borrowed(loanId)  <- only loanId (no amount, no recipient - privacy)
+
+REPAY
+1. UI auto-discovers loans: for each vault note:
+   hasActiveLoan -> activeLoanByNote -> getLoanDetails
+2. Select loan from dropdown (shows loanId, note label, principal shown)
+3. handleRepay re-reads getLoanDetails FRESH at click time
+   sends freshTotalOwed + 0.1% buffer (interest accrues per block)
+   contract refunds any overpayment
+```
+
+---
+
+## Smart Contract ABIs (V2A)
 
 ```solidity
 // ShieldedPool.sol
-interface IShieldedPool {
-    function deposit(bytes32 commitment) external payable;
+function deposit(bytes32 commitment) external payable;
+function withdraw(bytes32 root, bytes32 nullifierHash, address recipient,
+    uint256 amount, uint256 domainId, uint256 aggregationId,
+    bytes32[] merklePath, uint256 leafCount, uint256 leafIndex) external;
+function flushEpoch() external;
+function lockNullifier(bytes32 n) external;               // onlyLendingPool
+function disburseLoan(address payable to, uint256 amount) external; // onlyLendingPool
+function getLastRoot() external view returns (bytes32);
+function lastEpochBlock() external view returns (uint256);
+function EPOCH_BLOCKS() external view returns (uint256);
+function statementHash(uint256[] inputs) external view returns (bytes32);
 
-    function withdraw(
-        bytes32 attestationId,      // from zkVerify
-        bytes32 nullifierHash,      // prevent double-spend
-        bytes32 root,               // Merkle root at time of deposit
-        address payable recipient   // where to send funds
-    ) external;
-
-    function getRoot() external view returns (bytes32);
-    function isKnownRoot(bytes32 root) external view returns (bool);
-
-    event CommitmentInserted(bytes32 indexed commitment, uint32 leafIndex, bytes32 newRoot);
-    event Withdrawal(bytes32 indexed nullifierHash, address indexed recipient);
-}
-
-// NullifierRegistry.sol
-interface INullifierRegistry {
-    function isSpent(bytes32 nullifierHash) external view returns (bool);
-    function markSpent(bytes32 nullifierHash) external; // onlyShieldedPool
-}
-
-// LendingPool.sol (extends ShieldedPool with borrow mechanics)
-interface ILendingPool {
-    function borrow(
-        bytes calldata collateralProof, // prove collateral > min ratio (collateral.circom)
-        bytes32 collateralAttestation,  // from zkVerify
-        uint256 borrowAmount,
-        bytes32 collateralNullifier     // ties borrow to a specific shielded deposit
-    ) external;
-
-    function repay(bytes32 collateralNullifier) external payable;
-}
+// LendingPool.sol
+function borrow(bytes32 noteNullifierHash, uint256 borrowed,
+    uint256 collateralAmount, address payable recipient) external;
+function repay(uint256 loanId) external payable;
+function getLoanDetails(uint256 loanId) external view returns (
+    bytes32, uint256 borrowed, uint256 currentInterest, uint256 totalOwed, bool repaid);
+function hasActiveLoan(bytes32 noteNullifierHash) external view returns (bool);
+function activeLoanByNote(bytes32 noteNullifierHash) external view returns (uint256);
 ```
 
 ---
 
-## zkVerify Integration
-
-zkVerify is a modular proof verification chain. Instead of each dApp deploying its own on-chain Groth16 verifier (expensive — ~500K gas per call on Ethereum L1), zkVerify provides a shared verification service.
+## zkVerify Flow — Single-Leaf Aggregation
 
 ```
-PROOF SUBMISSION FLOW
+leaf    = ShieldedPool.statementHash([root, nullifierHash, uint160(recipient), amount])
+aggRoot = keccak256(abi.encode(leaf))
 
-Browser (withdraw.circom proof)
-        │
-        ▼
-zkVerifyJS SDK
-  ZkVerifySession.start().Testnet().withWallet(relayerWallet)
-        │
-        ▼
-zkVerify Chain
-  • Accepts Groth16 proof + verification key
-  • Verifies the proof (amortized cost — 91% cheaper than L1 verification)
-  • Emits: ProofAttestation { attestationId, proofHash, timestamp }
-        │
-        ▼
-Relayer (watches for ProofAttestation events)
-        │
-        ▼
-ShieldedPool.withdraw(attestationId, ...)
-  • Queries zkVerify: isAttestationValid(attestationId) == true
-  • Proceeds with withdrawal
+ZkVerifyAggregation.submitAggregation(domainId, aggId, aggRoot)
+
+ShieldedPool.withdraw(..., domainId, aggId, merklePath=[], leafCount=1, leafIndex=0)
+  -> verifyProofAggregation(domainId, aggId, aggRoot, [], 1, 0, leaf)
+  -> Merkle.verifyProofKeccak(aggRoot, [], 1, 0, leaf)
+  -> keccak256(leaf) == aggRoot  PASS
 ```
 
-**Why not on-chain verification?**
-On Ethereum L1, a `verifyProof()` call for a Groth16 proof costs ~500,000 gas. At 20 gwei and $3,000/ETH, that is ~$30 per withdrawal. zkVerify amortizes verification across all proof submitters, reducing the per-user cost by ~91%.
+Required env vars (missing either causes gas estimate 140M error):
+- DEPLOYER_PRIVATE_KEY
+- ZKVERIFY_AGGREGATION_ADDRESS=0x8b722840538d9101bfd8c1c228fb704fbe47f460
 
 ---
 
-## Merkle Tree Design
+## Merkle Tree
 
-- **Depth**: 20 levels → 2^20 = 1,048,576 possible commitments
-- **Hash function**: Poseidon (ZK-friendly — far fewer constraints than SHA-256 in a Circom circuit)
-- **Type**: Incremental Merkle tree — new leaves appended at the next available index; no full tree rebuild on each deposit
-- **Historical roots**: Contract stores the last N roots so that users who deposited before recent deposits can still withdraw with their old root
+- Depth: 24 -> 2^24 = 16,777,216 leaves
+- Hash: Poseidon(2) — same as circuits
+- Insertion: only at flushEpoch() — tree stable between flushes
+- Zero values: zeros[0]=0, zeros[i]=Poseidon(zeros[i-1], zeros[i-1])
+- Historical roots: last 30 stored
+
+---
+
+## Interest Rate Model
 
 ```
-Level 20 (root):  H(H(H(...)))
-Level 19:         H(L, R)
-...
-Level 0 (leaves): [commitment_0, commitment_1, ..., commitment_N, 0, 0, ...]
-                                                    ^ next insert here
+U <= 80%:  rate = 1% + (U/80%) x 4%
+U >  80%:  rate = 1% + 4% + ((U-80%)/20%) x 40%
+
+Interest = principal x rate x elapsed / (365 days x 10000)
 ```
+
+---
+
+## Deployed Contracts — Base Sepolia
+
+| Contract | Address |
+|---|---|
+| ShieldedPool | 0xfaeD6bf64a513aCEC9E8f1672d5e6584F869661a |
+| LendingPool | 0xdBc459EC670deE0ae70cbF8b9Ea43a00b7A9184D |
+| NullifierRegistry | 0x685E69Fa36521f527C00E05cf3e18eE4d18aD10C |
+| ZkVerifyAggregation | 0x8b722840538d9101bfd8c1c228fb704fbe47f460 |
