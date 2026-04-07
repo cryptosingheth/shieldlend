@@ -244,7 +244,7 @@ contract ShieldedPool {
         bytes32 root,
         bytes32 nullifierHash,
         address payable recipient,
-        uint256 amount,
+        uint256 denomination,
         uint256 domainId,
         uint256 aggregationId,
         bytes32[] calldata merklePath,
@@ -259,7 +259,7 @@ contract ShieldedPool {
 
         if (
             !_verifyAttestation(
-                root, nullifierHash, recipient, amount,
+                root, nullifierHash, recipient, denomination,
                 domainId, aggregationId, merklePath, leafCount, leafIndex
             )
         ) {
@@ -271,10 +271,10 @@ contract ShieldedPool {
         // ── AUTO-SETTLE PATH: locked note → repay loan atomically ────────────
         if (lockedAsCollateral[nullifierHash]) {
             uint256 totalOwed = ILendingPool(lendingPool).getOwed(nullifierHash);
-            if (amount < totalOwed) revert InsufficientCollateralForSettlement();
+            if (denomination < totalOwed) revert InsufficientCollateralForSettlement();
             lockedAsCollateral[nullifierHash] = false; // release lock
             ILendingPool(lendingPool).settleCollateral{value: totalOwed}(nullifierHash);
-            uint256 remainder = amount - totalOwed;
+            uint256 remainder = denomination - totalOwed;
             if (remainder > 0) {
                 (bool ok,) = recipient.call{value: remainder}("");
                 require(ok, "Transfer failed");
@@ -284,10 +284,10 @@ contract ShieldedPool {
         }
 
         // ── NORMAL WITHDRAWAL ────────────────────────────────────────────────
-        (bool success, ) = recipient.call{value: amount}("");
+        (bool success, ) = recipient.call{value: denomination}("");
         require(success, "Transfer failed");
 
-        emit Withdrawal(recipient, nullifierHash, amount);
+        emit Withdrawal(recipient, nullifierHash, denomination);
     }
 
     // -- LendingPool interface -------------------------------------------------

@@ -83,25 +83,34 @@ template MerkleTreeChecker(levels) {
  *     -> C_real was actually deposited (it is a leaf in the global Merkle tree).
  *     -> Without this, a prover could forge a commitment not in the tree.
  *
- *  4. NULLIFIER BINDING: nullifierHash == Poseidon(nullifier, ring_index)
- *     -> Binds the nullifier to a specific ring position. This prevents the
- *        same note from being withdrawn twice using different ring configurations
- *        (replay across different ring instantiations would produce different
- *        nullifierHashes since ring_index would differ).
+ *  4. NULLIFIER BINDING: nullifierHash == Poseidon(nullifier)
+ *     -> Binds the nullifier to the note itself, independent of ring position.
+ *        A note produces the same nullifierHash regardless of which ring it
+ *        appears in or at which index — preventing cross-ring replay attacks.
  *     -> The contract marks nullifierHash as spent, preventing double-spend.
+ *
+ *  5. DENOMINATION OUTPUT: denomination_out == denomination
+ *     -> Exposes the note's denomination as a public signal.
+ *        The contract verifies that the caller's `amount` parameter equals
+ *        the circuit-proven denomination, preventing a depositor from claiming
+ *        more ETH than they originally put in (H-1 fix).
  */
 template WithdrawRing(levels, ringSize) {
     // -- Private inputs -------------------------------------------------------
     signal input secret;                  // authentication secret (never revealed)
     signal input nullifier;               // spending key (never revealed directly)
+    signal input denomination;            // note value in wei (e.g., 1e17 = 0.1 ETH)
     signal input pathElements[levels];    // Merkle sibling hashes along path to root
     signal input pathIndices[levels];     // 0=left, 1=right at each Merkle level
     signal input ring_index;              // position of C_real within the ring (0..ringSize-1)
 
     // -- Public inputs --------------------------------------------------------
     signal input ring[ringSize];          // 16 commitments from last 30 epochs (posted on-chain)
-    signal input nullifierHash;           // = Poseidon(nullifier, ring_index); checked for double-spend
+    signal input nullifierHash;           // = Poseidon(nullifier); checked for double-spend
     signal input root;                    // current global Merkle root from ShieldedPool
+
+    // -- Public outputs -------------------------------------------------------
+    signal output denomination_out;       // proven denomination — contract verifies amount == this
 
     // -------------------------------------------------------------------------
     // Step 1: Verify ring_index is in range [0, ringSize-1]
@@ -117,29 +126,39 @@ template WithdrawRing(levels, ringSize) {
     rangeCheck.out === 1;
 
     // -------------------------------------------------------------------------
-    // Step 2: Compute the commitment C_real = Poseidon(secret, nullifier)
+    // Step 2: Compute the commitment C_real = Poseidon(secret, nullifier, denomination)
     //
-    // V2 change from V1: removed `amount` as a third input.
-    // Fixed denominations make the amount implicit.
+    // H-1 fix: denomination is now part of the commitment hash. The Merkle
+    // inclusion proof (Step 5) then guarantees the denomination matches what
+    // was originally deposited — preventing a prover from claiming a larger
+    // withdrawal than their actual deposit.
     // -------------------------------------------------------------------------
-    component commitHasher = Poseidon(2);
+    component commitHasher = Poseidon(3);
     commitHasher.inputs[0] <== secret;
     commitHasher.inputs[1] <== nullifier;
+    commitHasher.inputs[2] <== denomination;
     signal c_real;
     c_real <== commitHasher.out;
 
     // -------------------------------------------------------------------------
-    // Step 3: Verify nullifierHash == Poseidon(nullifier, ring_index)
+    // Step 2b: Expose denomination as a public output
     //
-    // Binding ring_index into the nullifier prevents a prover from using the
-    // same note in two different ring instantiations: if they tried, the
-    // ring_index would differ (since ring composition changes each epoch),
-    // producing a different nullifierHash -- but the on-chain spent set is
-    // keyed by nullifierHash, not nullifier.
+    // The on-chain withdraw() call passes `amount`; the contract verifies
+    // amount == denomination_out so the caller cannot claim more than proven.
     // -------------------------------------------------------------------------
-    component nullifierHasher = Poseidon(2);
+    denomination_out <== denomination;
+
+    // -------------------------------------------------------------------------
+    // Step 3: Verify nullifierHash == Poseidon(nullifier)
+    //
+    // H-3 fix: ring_index removed from nullifier hash. The same note now
+    // produces the same nullifierHash regardless of ring position. This prevents
+    // the cross-ring replay attack where the same note could be spent once per
+    // epoch (each time landing at a different ring_index, producing a different
+    // hash that the spent registry had not yet seen).
+    // -------------------------------------------------------------------------
+    component nullifierHasher = Poseidon(1);
     nullifierHasher.inputs[0] <== nullifier;
-    nullifierHasher.inputs[1] <== ring_index;
     nullifierHash === nullifierHasher.out;
 
     // -------------------------------------------------------------------------
@@ -186,6 +205,7 @@ template WithdrawRing(levels, ringSize) {
 // levels=24 -> 2^24 = ~16M possible deposit slots (accommodates dummies)
 // ringSize=16 -> 16 commitments sampled from last 30 epochs
 //
-// Public inputs:  ring[16], nullifierHash, root
-// Private inputs: secret, nullifier, pathElements[24], pathIndices[24], ring_index
+// Public outputs: denomination_out  (index 0 in publicSignals — outputs come first)
+// Public inputs:  ring[16], nullifierHash, root  (indices 1-18)
+// Private inputs: secret, nullifier, denomination, pathElements[24], pathIndices[24], ring_index
 component main {public [ring, nullifierHash, root]} = WithdrawRing(24, 16);

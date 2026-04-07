@@ -109,20 +109,25 @@ export async function POST(req: NextRequest) {
           transport: http("https://sepolia.base.org"),
         });
 
-        // withdraw_ring.circom public signal order: [ring[0..15], nullifierHash, root]
-        // Indices: 0-15 = ring, 16 = nullifierHash, 17 = root
+        // withdraw_ring.circom public signal order (outputs before inputs in snarkjs):
+        //   [0]    denomination_out  (public output — H-1 fix)
+        //   [1-16] ring[0..15]
+        //   [17]   nullifierHash
+        //   [18]   root
         const sigs = publicSignals as string[];
-        const rootVal = BigInt(sigs[17]);
-        const nullifierHashVal = BigInt(sigs[16]);
+        const denominationVal  = BigInt(sigs[0]);
+        const nullifierHashVal = BigInt(sigs[17]);
+        const rootVal          = BigInt(sigs[18]);
 
         // Build the 4-input statement that _verifyAttestation computes on-chain:
-        //   statementHash([root, nullifierHash, uint160(recipient), amount])
+        //   statementHash([root, nullifierHash, uint160(recipient), denomination])
+        // denomination replaces the free-form `amount` — the circuit has proven it.
         // MUST match exactly — any difference causes verifyProofAggregation to reject.
         const contractInputs = [
           rootVal,
           nullifierHashVal,
           BigInt(recipient) & ((1n << 160n) - 1n),
-          BigInt(amount),
+          denominationVal,
         ];
 
         const leaf = await publicClient.readContract({

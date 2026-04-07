@@ -48,7 +48,7 @@ export const SHIELDED_POOL_ABI = parseAbi([
   "function pendingCommitments(uint256 index) view returns (bytes32)",
   // Write
   "function deposit(bytes32 commitment) payable",
-  "function withdraw(bytes32 root, bytes32 nullifierHash, address recipient, uint256 amount, uint256 domainId, uint256 aggregationId, bytes32[] merklePath, uint256 leafCount, uint256 leafIndex)",
+  "function withdraw(bytes32 root, bytes32 nullifierHash, address recipient, uint256 denomination, uint256 domainId, uint256 aggregationId, bytes32[] merklePath, uint256 leafCount, uint256 leafIndex)",
   "function flushEpoch()",
   // Events
   "event Deposit(bytes32 indexed commitment, uint32 leafIndex, uint256 timestamp, uint256 amount)",
@@ -183,7 +183,7 @@ export function useWithdraw() {
     root: `0x${string}`,
     nullifierHash: `0x${string}`,
     recipient: Address,
-    amount: bigint,
+    denomination: bigint,
     domainId: bigint,
     aggregationId: bigint,
     merklePath: `0x${string}`[],
@@ -197,7 +197,7 @@ export function useWithdraw() {
       address: SHIELDED_POOL_ADDRESS,
       abi: SHIELDED_POOL_ABI,
       functionName: "withdraw",
-      args: [root, nullifierHash, recipient, amount, domainId, aggregationId, merklePath, leafCount, leafIndex],
+      args: [root, nullifierHash, recipient, denomination, domainId, aggregationId, merklePath, leafCount, leafIndex],
     });
   };
 

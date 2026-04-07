@@ -6,9 +6,9 @@ Solidity smart contracts for ShieldLend V2A. Built and tested with Foundry.
 
 | Contract | Address |
 |---------|---------|
-| `ShieldedPool` | `0xdd477c9Abe05a66741D28bae57B4b1eD484232E7` |
-| `LendingPool` | `0x456Ad285F2E12Adc2dAe8e14Bb0b0229c906f959` |
-| `NullifierRegistry` | `0xd696a77dB8C8289f97CE0d558A612809E71049C7` |
+| `ShieldedPool` | `0x9365e995F8aF1051db68100677a6C9cf225055A9` |
+| `LendingPool` | `0x1aacF59792404b23287Faa9b0fbC3c9505cc56c9` |
+| `NullifierRegistry` | `0xD0e7D0A083544144a4EFf2ADAa6318E3a28722e7` |
 | `ZkVerifyAggregation` | `0x8b722840538d9101bfd8c1c228fb704fbe47f460` |
 
 ## Source Files

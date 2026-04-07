@@ -804,9 +804,9 @@ All bugs below were found during live end-to-end testing on Base Sepolia. All ar
 
 | Contract | Address |
 |---|---|
-| ShieldedPool | `0xdd477c9Abe05a66741D28bae57B4b1eD484232E7` |
-| LendingPool | `0x456Ad285F2E12Adc2dAe8e14Bb0b0229c906f959` |
-| NullifierRegistry | `0xd696a77dB8C8289f97CE0d558A612809E71049C7` |
+| ShieldedPool | `0x9365e995F8aF1051db68100677a6C9cf225055A9` |
+| LendingPool | `0x1aacF59792404b23287Faa9b0fbC3c9505cc56c9` |
+| NullifierRegistry | `0xD0e7D0A083544144a4EFf2ADAa6318E3a28722e7` |
 | ZkVerifyAggregation | `0x8b722840538d9101bfd8c1c228fb704fbe47f460` |
 
 **Deployer**: `0x6d4b038b3345acb06b8fdca1beac24c731a44fb2`
@@ -817,7 +817,7 @@ All bugs below were found during live end-to-end testing on Base Sepolia. All ar
 - Borrow → zkVerify circuit recompiled, frontend wired — not yet live-tested
 - Repay → dropdown auto-discovers loans; stale totalOwed bug fixed — not yet live-tested end-to-end
 
-**Status**: All Tier 1 security fixes applied (C-1, C-2, H-2, M-1). Redeployed 2026-04-07 from `v2a-architecture` branch. These addresses are the fixed versions — safe for live borrow/repay testing.
+**Status**: All Tier 1 and Tier 2 fixes applied (C-1, C-2, H-1, H-2, H-3, M-1). Redeployed 2026-04-07 from `v2a-architecture` branch with circuit recompile. These addresses are the final fixed versions — safe for live borrow/repay testing.
 
 ### zkVerify
 

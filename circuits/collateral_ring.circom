@@ -84,9 +84,10 @@ template MerkleTreeChecker(levels) {
  *  3. GLOBAL INCLUSION: MerkleTreeChecker(C_real, pathElements, pathIndices, root)
  *     -> C_real was actually deposited into the pool.
  *
- *  4. NULLIFIER BINDING: nullifierHash == Poseidon(nullifier, ring_index)
- *     -> Links this borrow to one specific ring slot; prevents the same note
- *        from being used as collateral for multiple loans simultaneously.
+ *  4. NULLIFIER BINDING: nullifierHash == Poseidon(nullifier)
+ *     -> Links this borrow to the note itself, independent of ring position.
+ *        Matches the H-3 fix in withdraw_ring: the same note produces the same
+ *        nullifierHash regardless of which ring epoch it lands in.
  *
  *  5. COLLATERAL SUFFICIENCY: denomination * minRatioBps >= borrowed * 10000
  *     -> The note's value is sufficient collateral for the loan at the
@@ -103,7 +104,7 @@ template CollateralRing(levels, ringSize) {
 
     // -- Public inputs --------------------------------------------------------
     signal input ring[ringSize];          // 16 collateral commitments from last 30 epochs
-    signal input nullifierHash;           // = Poseidon(nullifier, ring_index); tracks open borrow positions
+    signal input nullifierHash;           // = Poseidon(nullifier); tracks open borrow positions
     signal input root;                    // current global Merkle root
     signal input borrowed;               // loan amount in wei (posted on-chain by borrower)
     signal input minRatioBps;            // minimum collateral ratio in basis points (e.g., 5000 = 50% LTV)
@@ -120,30 +121,30 @@ template CollateralRing(levels, ringSize) {
     rangeCheck.out === 1;
 
     // -------------------------------------------------------------------------
-    // Step 2: Compute C_real = Poseidon(secret, nullifier)
+    // Step 2: Compute C_real = Poseidon(secret, nullifier, denomination)
     //
-    // Matches withdraw_ring.circom exactly — no denomination in the hash.
-    // The on-chain leaf stored at deposit time is Poseidon(secret, nullifier),
-    // so the Merkle inclusion check (Step 5) passes for the same deposited note.
-    // denomination is kept as a private witness for the LTV check in Step 6;
-    // the prover cannot lie about it because any wrong value would violate the
-    // inequality constraint denomination * minRatioBps >= borrowed * 10000.
+    // H-1 consistency fix: matches withdraw_ring.circom's updated commitment
+    // formula. The denomination is now part of the commitment hash, so the
+    // Merkle inclusion proof guarantees the prover cannot lie about the note's
+    // value in the LTV check — any wrong denomination produces a different
+    // c_real that won't match any ring member or Merkle leaf.
     // -------------------------------------------------------------------------
-    component commitHasher = Poseidon(2);
+    component commitHasher = Poseidon(3);
     commitHasher.inputs[0] <== secret;
     commitHasher.inputs[1] <== nullifier;
+    commitHasher.inputs[2] <== denomination;
     signal c_real;
     c_real <== commitHasher.out;
 
     // -------------------------------------------------------------------------
-    // Step 3: Verify nullifierHash == Poseidon(nullifier, ring_index)
+    // Step 3: Verify nullifierHash == Poseidon(nullifier)
     //
-    // Binds this borrow proof to a specific (nullifier, ring_index) pair.
-    // The lending contract stores nullifierHash for each open loan.
+    // H-3 fix: ring_index removed. The lending contract stores nullifierHash to
+    // mark an open borrow position. Using just Poseidon(nullifier) ensures the
+    // same note produces the same collateral lock tag across epochs.
     // -------------------------------------------------------------------------
-    component nullifierHasher = Poseidon(2);
+    component nullifierHasher = Poseidon(1);
     nullifierHasher.inputs[0] <== nullifier;
-    nullifierHasher.inputs[1] <== ring_index;
     nullifierHash === nullifierHasher.out;
 
     // -------------------------------------------------------------------------
@@ -213,5 +214,5 @@ template CollateralRing(levels, ringSize) {
 // ringSize=16 -> 16 collateral commitments from last 30 epochs
 //
 // Public inputs:  ring[16], nullifierHash, root, borrowed, minRatioBps
-// Private inputs: secret, nullifier, pathElements[24], pathIndices[24], ring_index, denomination
+// Private inputs: secret, nullifier, denomination, pathElements[24], pathIndices[24], ring_index
 component main {public [ring, nullifierHash, root, borrowed, minRatioBps]} = CollateralRing(24, 16);

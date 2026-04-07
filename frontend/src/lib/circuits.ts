@@ -5,10 +5,16 @@
  *
  * V2 changes from V1:
  *   - withdraw_ring.circom (LEVELS=24, K=16 ring)
- *   - commitment    = Poseidon(secret, nullifier)         [2 inputs]
- *   - nullifierHash = Poseidon(nullifier, ring_index)     [ring-index dependent]
+ *   - commitment    = Poseidon(secret, nullifier, denomination)  [3 inputs — H-1 fix]
+ *   - nullifierHash = Poseidon(nullifier)                        [ring-index independent — H-3 fix]
  *   - Ring inputs: ring[16], ring_index required for withdrawal proof
  *   - No separate deposit circuit — commitment computed client-side
+ *
+ * Public signal order for withdraw_ring (snarkjs outputs before inputs):
+ *   [0]    denomination_out   (public output)
+ *   [1-16] ring[0..15]        (public inputs)
+ *   [17]   nullifierHash      (public input)
+ *   [18]   root               (public input)
  *
  * All proving happens CLIENT-SIDE — nullifier and secret never leave the browser.
  */
@@ -38,9 +44,9 @@ const RING_SIZE = 16;
 export interface Note {
   nullifier: bigint;
   secret: bigint;
-  amount: bigint;        // wei
-  commitment: bigint;    // Poseidon(secret, nullifier)
-  nullifierHash: bigint; // Poseidon(nullifier, 0) — ring_index=0 default
+  amount: bigint;        // wei — same as denomination
+  commitment: bigint;    // Poseidon(secret, nullifier, denomination)
+  nullifierHash: bigint; // Poseidon(nullifier) — ring-index independent
 }
 
 export interface WithdrawProof {
@@ -77,22 +83,22 @@ export function randomFieldElement(): bigint {
 /**
  * Compute V2 commitment and nullifierHash.
  *
- * commitment    = Poseidon(secret, nullifier)     — matches withdraw_ring.circom
- * nullifierHash = Poseidon(nullifier, ring_index) — ring_index=0 for single-note proofs
+ * commitment    = Poseidon(secret, nullifier, denomination) — H-1 fix: denomination bound to leaf
+ * nullifierHash = Poseidon(nullifier)                       — H-3 fix: ring-index independent
  *
- * ring_index is baked into nullifierHash because the circuit emits it as a
- * public signal that gets registered on-chain as the spend tag.
+ * denomination must be passed so the commitment matches both the on-chain leaf
+ * (deposited via deposit()) and what the withdraw/collateral circuits prove.
  */
 export async function computeCommitment(
   nullifier: bigint,
   secret: bigint,
-  ringIndex: bigint = 0n
+  denomination: bigint
 ): Promise<{ commitment: bigint; nullifierHash: bigint }> {
   const poseidon = await buildPoseidon();
   const F = poseidon.F;
 
-  const commitment    = F.toObject(poseidon([secret, nullifier])) as bigint;
-  const nullifierHash = F.toObject(poseidon([nullifier, ringIndex])) as bigint;
+  const commitment    = F.toObject(poseidon([secret, nullifier, denomination])) as bigint;
+  const nullifierHash = F.toObject(poseidon([nullifier])) as bigint;
 
   return { commitment, nullifierHash };
 }
@@ -104,7 +110,7 @@ export async function computeCommitment(
 export async function createNote(amount: bigint): Promise<Note> {
   const nullifier = randomFieldElement();
   const secret    = randomFieldElement();
-  const { commitment, nullifierHash } = await computeCommitment(nullifier, secret, 0n);
+  const { commitment, nullifierHash } = await computeCommitment(nullifier, secret, amount);
   return { nullifier, secret, amount, commitment, nullifierHash };
 }
 
@@ -137,8 +143,9 @@ function buildRing(commitment: bigint): { ring: bigint[]; ringIndex: number } {
 /**
  * Generate a V2 withdrawal proof via withdraw_ring.circom.
  *
- * Private: secret, nullifier, ring_index, pathElements, pathIndices
- * Public:  ring[16], root, nullifierHash
+ * Private: secret, nullifier, denomination, ring_index, pathElements, pathIndices
+ * Public outputs: denomination_out  (index 0 in publicSignals)
+ * Public inputs:  ring[16] (1-16), nullifierHash (17), root (18)
  *
  * Note: recipient is accepted as a parameter for future use (e.g. passing to
  * the contract call) but is NOT a circuit signal — withdraw_ring.circom has no
@@ -163,6 +170,7 @@ export async function generateWithdrawProof(
     // Private inputs
     secret:       note.secret.toString(),
     nullifier:    note.nullifier.toString(),
+    denomination: note.amount.toString(),   // H-1: now part of commitment hash
     ring_index:   ringIndex.toString(),
     pathElements: merklePath.pathElements.map((e) => e.toString()),
     pathIndices:  merklePath.pathIndices.map((i) => i.toString()),
@@ -189,8 +197,8 @@ export async function generateWithdrawProof(
  * Private: secret, nullifier, denomination, ring_index, pathElements[24], pathIndices[24]
  * Public:  ring[16], nullifierHash, root, borrowed, minRatioBps
  *
- * Commitment formula matches withdraw_ring: Poseidon(secret, nullifier) — no denomination.
- * denomination is a private witness used only for the LTV inequality check.
+ * Commitment formula matches withdraw_ring: Poseidon(secret, nullifier, denomination).
+ * denomination is a private witness used for both the commitment hash and the LTV check.
  * This ensures the same on-chain leaf works for both withdraw and borrow proofs.
  */
 export async function generateCollateralProof(
