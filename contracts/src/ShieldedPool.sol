@@ -28,6 +28,9 @@ interface ILendingPool {
     function isValidRoot(bytes32 root) external view returns (bool);
     // Called after each Merkle insertion to register this root globally
     function pushRoot(bytes32 root) external;
+    // Global collateral lock check — used by cross-shard withdrawals.
+    // lockedAsCollateral is per-shard; this mapping is authoritative across all shards.
+    function hasActiveLoan(bytes32 nullifierHash) external view returns (bool);
 }
 
 contract ShieldedPool {
@@ -307,10 +310,17 @@ contract ShieldedPool {
         nullifierRegistry.markSpent(nullifierHash);
 
         // ── AUTO-SETTLE PATH: locked note → repay loan atomically ────────────
-        if (lockedAsCollateral[nullifierHash]) {
+        // Use the global LendingPool lock (hasActiveLoan) rather than the per-shard
+        // lockedAsCollateral flag. This handles cross-shard withdrawals correctly:
+        // a note locked on shard X has lockedAsCollateral=false on shard Y, but
+        // LendingPool.hasActiveLoan() is true regardless of which shard executes the withdraw.
+        bool globallyLocked = lendingPool != address(0) &&
+                              ILendingPool(lendingPool).hasActiveLoan(nullifierHash);
+        if (globallyLocked) {
             uint256 totalOwed = ILendingPool(lendingPool).getOwed(nullifierHash);
             if (denomination < totalOwed) revert InsufficientCollateralForSettlement();
-            lockedAsCollateral[nullifierHash] = false; // release lock
+            // Clear per-shard flag if set (same-shard case) — harmless no-op cross-shard
+            lockedAsCollateral[nullifierHash] = false;
             ILendingPool(lendingPool).settleCollateral{value: totalOwed}(nullifierHash);
             uint256 remainder = denomination - totalOwed;
             if (remainder > 0) {

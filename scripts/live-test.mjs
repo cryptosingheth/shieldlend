@@ -1,5 +1,5 @@
 /**
- * ShieldLend V2A+ — Live End-to-End Privacy Test Suite
+ * ShieldLend V2B — Live End-to-End Privacy Test Suite
  * =====================================================
  * Verifies all on-chain privacy claims without the browser.
  *
@@ -28,15 +28,16 @@ import path from "path";
 // ─── Config ──────────────────────────────────────────────────────────────────
 
 const DEPLOYER_KEY = "0x409542d1bbb7480819721001ea39ca1f717e0c2653a1f1ab5c9875cfbdcdb76b";
+// V2B addresses (deployed 2026-04-10, cross-shard withdrawal)
 const SHARDS = [
-  "0xa99F12A4340A47FD3075Ae0352Fca77b13bF0d61",
-  "0x7488f4f7Ae7A98e1C7B3815C310404f7bFDc2203",
-  "0xf859Ab35bC212dc2bBC90DF8d86Ff36243b698d8",
-  "0x5F9298DaeB820dC40AF9C8cf2a9B339a111b52Ea",
-  "0x1a1070AcB0542F9A39E18b32151A18dF97Eaf3E4",
+  "0xcF78eaEA131747c67BBD1869130f0710bA646D8D",
+  "0x3110C104542745c55cCA31A63839F418d1354F5D",
+  "0x39769faD54c21d3D8163D9f24F63473eCC528bE0",
+  "0x02dfe4aed5Ba2A2085c80F8Fe7c20686d047111B",
+  "0xf3F7C4c1a352371eC3ae7e70387c259c7051b348",
 ];
-const LENDING_POOL   = "0x1Ff7FD0bdF660c82158729A9c74F6DD6F6f2988d";
-const NULL_REGISTRY  = "0xe7B4C2B6ae962EFFCDc9797c5E23E592275ac411";
+const LENDING_POOL   = "0xA1d0F1A35F547698031F14fE984981632AC26240";
+const NULL_REGISTRY  = "0xEBC14761D4A2E30771E422F52677ed17896ec21F";
 const ZK_VERIFY      = "0x8b722840538D9101bFd8c1c228fB704Fbe47f460";
 const RELAY_ADDRESS  = "0x6D4b038B3345acb06B8fDCA1bEAC24c731A44Fb2";
 

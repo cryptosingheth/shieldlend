@@ -315,25 +315,33 @@ contract LendingPool {
         Loan storage loan = loans[loanId];
         require(!loan.repaid, "Already repaid");
 
-        // Only the shard that holds the collateral can settle it.
-        // Prevents a different registered shard from settling a loan it doesn't own.
-        require(msg.sender == loan.collateralShard, "Wrong shard for collateral");
+        // V2B: cross-shard settlement allowed.
+        // Any registered shard can settle — msg.sender may be a different shard than
+        // the one that locked the collateral. The collateral lock is released explicitly
+        // on loan.collateralShard below, not assumed to be the caller.
 
         // Validate: caller must send enough ETH to cover the full debt
         uint256 totalOwed = loan.borrowed + _calculateInterest(loan.borrowed, loan.timestamp);
         require(msg.value >= totalOwed, "Insufficient settlement amount");
 
+        address collShard = loan.collateralShard;
         address disShard = loan.disburseShard;
 
-        // Checks-Effects-Interactions: update all state before external call
+        // Checks-Effects-Interactions: update all state before external calls
         loan.repaid = true;
         hasActiveLoan[nullifierHash] = false;
         totalBorrowed -= loan.borrowed;
 
         emit Repaid(loanId, msg.value);
 
+        // Release the collateral lock on the shard that actually holds it.
+        // Same-shard flow: ShieldedPool already cleared lockedAsCollateral before
+        // calling settleCollateral, so this is a no-op (false → false).
+        // Cross-shard flow: collateralShard still has lockedAsCollateral=true because
+        // the withdrawal happened on a different shard — this call clears it.
+        IShieldedPool(collShard).unlockNullifier(nullifierHash);
+
         // Return ETH to the shard that originally disbursed the loan.
-        // Without this, every auto-settle permanently drains ETH from the pool ecosystem.
         (bool fwd,) = payable(disShard).call{value: msg.value}("");
         require(fwd, "Forward to shard failed");
     }

@@ -80,14 +80,25 @@ export function DepositForm() {
       await publicClient.waitForTransactionReceipt({ hash: userTxHash });
 
       // Feature D: Encrypt note data with viewing key for on-chain recovery.
-      // Stored in the Deposit event — only decryptable by the viewing key holder.
+      // Binary-packed format: nullifier(32B) + secret(32B) + amount(8B) = 72B plaintext
+      // AES-GCM output: IV(12B) + ciphertext+tag(88B) = 100B — well under the 256B contract cap.
+      // commitment and nullifierHash are omitted; they are Poseidon-derivable from nullifier+secret+amount.
       let encryptedNote: string | undefined;
       if (viewingKey) {
         try {
-          const noteJson = new TextEncoder().encode(serialized);
+          // Pack: nullifier (32 bytes BE) | secret (32 bytes BE) | amount (8 bytes BE uint64)
+          const plain = new Uint8Array(72);
+          const writeU256 = (offset: number, v: bigint) => {
+            for (let i = 0; i < 32; i++) { plain[offset + 31 - i] = Number(v & 0xffn); v >>= 8n; }
+          };
+          writeU256(0, newNote.nullifier);
+          writeU256(32, newNote.secret);
+          const amt = newNote.amount;
+          for (let i = 0; i < 8; i++) plain[64 + 7 - i] = Number((amt >> BigInt(i * 8)) & 0xffn);
+
           const iv = crypto.getRandomValues(new Uint8Array(12));
-          const cipherBuf = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, viewingKey, noteJson);
-          const combined = new Uint8Array(iv.length + cipherBuf.byteLength);
+          const cipherBuf = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, viewingKey, plain);
+          const combined = new Uint8Array(iv.length + cipherBuf.byteLength); // 12 + 88 = 100 bytes
           combined.set(iv);
           combined.set(new Uint8Array(cipherBuf), iv.length);
           encryptedNote = "0x" + Array.from(combined).map(b => b.toString(16).padStart(2, "0")).join("");

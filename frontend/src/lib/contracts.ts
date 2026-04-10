@@ -25,7 +25,21 @@ import {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const SHIELDED_POOL_ADDRESS = (process.env.NEXT_PUBLIC_SHIELDED_POOL_ADDRESS ||
+  process.env.NEXT_PUBLIC_SHARD_1 ||
   "0x0000000000000000000000000000000000000000") as Address;
+
+// All 5 shard addresses — used for multi-shard log scanning on withdrawal.
+// Deposits are randomly routed, so we must search all shards to find a commitment.
+export const ALL_SHARD_ADDRESSES: Address[] = ([
+  process.env.NEXT_PUBLIC_SHARD_1,
+  process.env.NEXT_PUBLIC_SHARD_2,
+  process.env.NEXT_PUBLIC_SHARD_3,
+  process.env.NEXT_PUBLIC_SHARD_4,
+  process.env.NEXT_PUBLIC_SHARD_5,
+].filter(Boolean) as string[]).map(a => a as Address);
+
+// Fall back to SHIELDED_POOL_ADDRESS if shard env vars are not set
+if (ALL_SHARD_ADDRESSES.length === 0) ALL_SHARD_ADDRESSES.push(SHIELDED_POOL_ADDRESS);
 
 export const LENDING_POOL_ADDRESS = (process.env.NEXT_PUBLIC_LENDING_POOL_ADDRESS ||
   "0x0000000000000000000000000000000000000000") as Address;
@@ -190,13 +204,14 @@ export function useWithdraw() {
     aggregationId: bigint,
     merklePath: `0x${string}`[],
     leafCount: bigint,
-    leafIndex: bigint
+    leafIndex: bigint,
+    shardAddress?: Address  // which shard to call — defaults to SHIELDED_POOL_ADDRESS
   ) => {
     if (chainId !== baseSepolia.id) {
       await switchChainAsync({ chainId: baseSepolia.id });
     }
     return writeContractAsync({
-      address: SHIELDED_POOL_ADDRESS,
+      address: shardAddress ?? SHIELDED_POOL_ADDRESS,
       abi: SHIELDED_POOL_ABI,
       functionName: "withdraw",
       args: [root, nullifierHash, recipient, denomination, domainId, aggregationId, merklePath, leafCount, leafIndex],

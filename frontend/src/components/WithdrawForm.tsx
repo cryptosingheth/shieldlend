@@ -11,7 +11,7 @@ import {
   generateWithdrawProof,
   type MerklePath,
 } from "@/lib/circuits";
-import { SHIELDED_POOL_ADDRESS, SHIELDED_POOL_ABI, fieldToBytes32 } from "@/lib/contracts";
+import { SHIELDED_POOL_ADDRESS, SHIELDED_POOL_ABI, ALL_SHARD_ADDRESSES, fieldToBytes32 } from "@/lib/contracts";
 import { loadNotes, markNoteSpent, storedNoteToNote, noteLabel, type StoredNote } from "@/lib/noteStorage";
 import { useNoteKey } from "@/lib/noteKeyContext";
 import { useStealthKey } from "@/lib/stealthKeyContext";
@@ -20,7 +20,7 @@ import { useStealthKey } from "@/lib/stealthKeyContext";
 const LEVELS = 24;
 
 // Deployment block of the V2A final contracts (2026-04-09, Base Sepolia block ~40,000,000)
-const DEPLOY_BLOCK = 40000000n;
+const DEPLOY_BLOCK = 40034191n; // V2B deploy block (2026-04-10)
 const CHUNK_SIZE = 9000n;
 
 // keccak256("LeafInserted(bytes32,uint32)") — used to filter only flushEpoch events,
@@ -51,6 +51,34 @@ async function getAllLogs(
     allLogs.push(...chunk);
   }
   return allLogs;
+}
+
+// Scan all 5 shards in parallel — needed because deposits are randomly routed.
+// Returns per-shard {shard, logs} so the caller can identify which shard holds a commitment.
+async function getAllLogsAllShards(
+  publicClient: NonNullable<ReturnType<typeof usePublicClient>>,
+  upToBlock?: bigint
+): Promise<{ shard: Address; logs: Log[] }[]> {
+  return Promise.all(
+    ALL_SHARD_ADDRESSES.map(async (shard) => ({
+      shard,
+      logs: await getAllLogs(publicClient, shard, upToBlock),
+    }))
+  );
+}
+
+// Find which shard holds a Deposit event for `commitment`. Returns that shard's address + logs,
+// or null if the commitment isn't found on any shard.
+function findShardForCommitment(
+  shardResults: { shard: Address; logs: Log[] }[],
+  commitment: string
+): { shard: Address; logs: Log[] } | null {
+  for (const r of shardResults) {
+    if (r.logs.some((l) => l.topics[1]?.toLowerCase() === commitment.toLowerCase())) {
+      return r;
+    }
+  }
+  return null;
 }
 
 type ZkVerifyResult = {
@@ -133,7 +161,12 @@ export function WithdrawForm({ onStatusChange }: { onStatusChange?: (s: Withdraw
     setCheckingFlushStatus(true);
 
     publicClient.getBlockNumber()
-      .then((snapshotBlock) => getAllLogs(publicClient, SHIELDED_POOL_ADDRESS, snapshotBlock))
+      .then((snapshotBlock) => getAllLogsAllShards(publicClient, snapshotBlock))
+      .then((shardResults) => {
+        // Merge logs from all shards — commitment/LeafInserted matching works across shards
+        const logs = shardResults.flatMap((r) => r.logs);
+        return logs;
+      })
       .then((logs) => {
         if (cancelled) return;
         const newFlushMap = new Map<string, "pending" | "ready">();
@@ -193,10 +226,11 @@ export function WithdrawForm({ onStatusChange }: { onStatusChange?: (s: Withdraw
         : 0n
       : null;
 
-  async function fetchMerklePath(leafIndex: number, root: `0x${string}`, upToBlock?: bigint): Promise<MerklePath> {
+  async function fetchMerklePath(leafIndex: number, root: `0x${string}`, shardAddress: Address, upToBlock?: bigint): Promise<MerklePath> {
     if (!publicClient) throw new Error("No public client");
 
-    const logs = await getAllLogs(publicClient, SHIELDED_POOL_ADDRESS, upToBlock);
+    // Only scan the specific shard — each shard has its own independent Merkle tree.
+    const logs = await getAllLogs(publicClient, shardAddress, upToBlock);
 
     // Build commitMap ONLY from LeafInserted events (topics[0] = LEAF_INSERTED_TOPIC).
     // Deposit events also have topics[1] = indexed commitment but their data encodes
@@ -285,14 +319,39 @@ export function WithdrawForm({ onStatusChange }: { onStatusChange?: (s: Withdraw
       const note = selectedStored ? storedNoteToNote(selectedStored) : deserializeNote(noteJson);
       if (!publicClient) throw new Error("No public client");
 
-      const logs = await getAllLogs(publicClient, SHIELDED_POOL_ADDRESS);
       const noteCommitment = fieldToBytes32(note.commitment);
 
-      // Check if deposit exists on-chain at all (Deposit event, any topics[1] match)
-      const depositLog = logs.find((l) =>
-        l.topics[1]?.toLowerCase() === noteCommitment.toLowerCase()
-      );
-      if (!depositLog) throw new Error("Deposit not found on-chain. Wrong network or address?");
+      // Scan all 5 shards — deposits are randomly routed so we don't know which shard to look at.
+      const shardResults = await getAllLogsAllShards(publicClient);
+      const shardMatch = findShardForCommitment(shardResults, noteCommitment);
+      if (!shardMatch) throw new Error("Deposit not found on-chain. Wrong network or address?");
+
+      // depositShard: where the commitment lives — used for Merkle path + epoch state.
+      // withdrawalShard: the shard that will execute withdraw() and pay ETH to recipient.
+      //   V2B cross-shard: choose a DIFFERENT random shard so on-chain observers see
+      //   "shard Y → stealth address" and cannot reverse-link to "relay → shard X → user".
+      const depositShard = shardMatch.shard;
+      const logs = shardMatch.logs;
+
+      // Pick a random withdrawal shard with sufficient ETH, preferring != depositShard.
+      const denomination = note.amount;
+      const candidateShards = ALL_SHARD_ADDRESSES.filter((s) => s.toLowerCase() !== depositShard.toLowerCase());
+      let withdrawalShard: Address = depositShard; // fallback if no others have liquidity
+      for (let attempt = 0; attempt < candidateShards.length; attempt++) {
+        const idx = Math.floor(Math.random() * candidateShards.length);
+        const candidate = candidateShards[idx];
+        const bal = await publicClient.getBalance({ address: candidate });
+        if (bal >= denomination) {
+          withdrawalShard = candidate;
+          break;
+        }
+      }
+      // If no other shard has enough ETH, fall back to the deposit shard itself
+      if (withdrawalShard === depositShard) {
+        const depBal = await publicClient.getBalance({ address: depositShard });
+        if (depBal < denomination) throw new Error("No shard has sufficient ETH to pay withdrawal.");
+      }
+      console.log(`[withdraw] depositShard=${depositShard.slice(0,10)} withdrawalShard=${withdrawalShard.slice(0,10)}`);
 
       // Look specifically for LeafInserted (topics[0] = LEAF_INSERTED_TOPIC).
       // Deposit events also have topics[1] = commitment but store queue position, not tree index.
@@ -309,12 +368,12 @@ export function WithdrawForm({ onStatusChange }: { onStatusChange?: (s: Withdraw
       if (!resolvedLeafLog) {
         // Deposit is queued. Check whether the epoch is ready to flush.
         const lastEpochBlockOnChain = await publicClient.readContract({
-          address: SHIELDED_POOL_ADDRESS,
+          address: depositShard,
           abi: SHIELDED_POOL_ABI,
           functionName: "lastEpochBlock",
         }) as bigint;
         const epochBlocksOnChain = await publicClient.readContract({
-          address: SHIELDED_POOL_ADDRESS,
+          address: depositShard,
           abi: SHIELDED_POOL_ABI,
           functionName: "EPOCH_BLOCKS",
         }) as bigint;
@@ -327,10 +386,10 @@ export function WithdrawForm({ onStatusChange }: { onStatusChange?: (s: Withdraw
           );
         }
 
-        // Epoch is ready. Auto-flush — user confirms one MetaMask tx, then proof continues.
+        // Epoch is ready. Auto-flush on the deposit shard (that's where the commitment is queued).
         setStatus("flushing");
         const flushTxHash = await writeContractAsync({
-          address: SHIELDED_POOL_ADDRESS,
+          address: depositShard,   // flush the DEPOSIT shard's epoch — not the withdrawal shard
           abi: SHIELDED_POOL_ABI,
           functionName: "flushEpoch",
         });
@@ -358,7 +417,7 @@ export function WithdrawForm({ onStatusChange }: { onStatusChange?: (s: Withdraw
         });
 
         setStatus("fetching-path");
-        const freshLogs = await getAllLogs(publicClient, SHIELDED_POOL_ADDRESS, logUpToBlock);
+        const freshLogs = await getAllLogs(publicClient, depositShard, logUpToBlock);
         resolvedLeafLog = freshLogs.find((l) =>
           l.topics[0]?.toLowerCase() === LEAF_INSERTED_TOPIC &&
           l.topics[1]?.toLowerCase() === noteCommitment.toLowerCase()
@@ -369,17 +428,16 @@ export function WithdrawForm({ onStatusChange }: { onStatusChange?: (s: Withdraw
 
       const leafIndex = parseInt(resolvedLeafLog.data.slice(2, 66), 16);
 
-      // Always read root AFTER any potential flush — this is the root the proof
-      // will be generated against. The same root is passed to withdraw() and
-      // sent to the zkverify route so all three agree on the same value.
+      // Read root from the DEPOSIT shard — proof is generated against its tree.
+      // The withdrawal shard accepts this root via LendingPool.isValidRoot() (V2B cross-shard).
       const freshRoot = (await publicClient.readContract({
-        address: SHIELDED_POOL_ADDRESS,
+        address: depositShard,
         abi: SHIELDED_POOL_ABI,
         functionName: "getLastRoot",
       })) as `0x${string}`;
 
-      // fetchMerklePath needs the same log range used to find resolvedLeafLog.
-      const merklePath = await fetchMerklePath(leafIndex, freshRoot, logUpToBlock);
+      // Merkle path is built from the deposit shard's LeafInserted events (its own tree).
+      const merklePath = await fetchMerklePath(leafIndex, freshRoot, depositShard, logUpToBlock);
 
       setStatus("proving");
       // V2: circuit name is "withdraw_ring" — server maps to withdraw_ring_vkey.json
@@ -403,6 +461,8 @@ export function WithdrawForm({ onStatusChange }: { onStatusChange?: (s: Withdraw
       setStatus("submitting");
       const nullifierHashHex = fieldToBytes32(note.nullifierHash);
 
+      // Call withdraw() on the WITHDRAWAL shard (V2B cross-shard: may differ from depositShard).
+      // The withdrawal shard accepts the root via LendingPool.isValidRoot() and pays ETH to stealth.
       await withdraw(
         freshRoot,
         nullifierHashHex,
@@ -412,7 +472,8 @@ export function WithdrawForm({ onStatusChange }: { onStatusChange?: (s: Withdraw
         BigInt(zkResult.aggregationId),
         (zkResult.merklePath ?? []) as `0x${string}`[],
         BigInt(zkResult.leafCount ?? 1),
-        BigInt(zkResult.leafIndex ?? 0)
+        BigInt(zkResult.leafIndex ?? 0),
+        withdrawalShard  // pays from a different shard than where the deposit landed
       );
 
       setTxHash(zkResult.txHash);

@@ -52,6 +52,11 @@ contract MockLP {
     function isValidRoot(bytes32 /*root*/) external pure returns (bool) {
         return false;
     }
+
+    /// @dev V2B: global active-loan check used by ShieldedPool.withdraw() for cross-shard settle.
+    function hasActiveLoan(bytes32 /*nullifierHash*/) external view returns (bool) {
+        return owedAmount > 0;
+    }
 }
 
 contract SecurityAuditTest is Test {
