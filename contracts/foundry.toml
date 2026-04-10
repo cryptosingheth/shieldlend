@@ -4,3 +4,16 @@ out = "out"
 libs = ["lib"]
 solc_version = "0.8.27"
 remappings = ["poseidon-solidity/=lib/poseidon-solidity/"]
+
+# ---------------------------------------------------------------------------
+# Dependencies (contracts/lib/ is gitignored — run `forge install` to restore)
+#
+#   forge install foundry-rs/forge-std --no-commit
+#   forge install iden3/circomlibjs --no-commit
+#   forge install iden3/ffiasm --no-commit
+#   forge install privacy-scaling-explorations/zk-kit.solidity --no-commit
+#   forge install iden3/contracts --no-commit
+#   forge install OpenZeppelin/openzeppelin-contracts --no-commit
+#
+# Or simply: forge install   (reads from git submodule config if present)
+# ---------------------------------------------------------------------------

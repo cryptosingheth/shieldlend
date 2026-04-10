@@ -22,6 +22,14 @@ node_modules/
 out/
 cache/
 broadcast/
+contracts/lib/
+
+# Claude Code IDE configs (local machine paths, not for sharing)
+.claude/
+**/.claude/
+
+# TypeScript build cache
+*.tsbuildinfo
 
 # macOS
 .DS_Store
