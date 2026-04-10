@@ -9,7 +9,17 @@ After EVERY session where ANY of the following happens:
 - A security audit finding leads to a code change
 - A cross-session architectural trade-off is made
 
-You MUST append a new ADR entry to `/Users/opinderpreetsingh/shieldlend-v2/ARCHITECTURE_DECISIONS.md`
+### 1. Create a dated session log
+
+Create `SESSION_LOGS/YYYY-MM-DD-sessionN-<short-title>.md` with:
+- What was built/changed (contracts, circuits, frontend, APIs)
+- Bugs found and fixed (ID, severity, description, fix)
+- Deployed contract addresses if redeployed
+- Test suite status (forge + live-test counts)
+
+### 2. Append ADR entries
+
+Append new ADR entries to `/Users/opinderpreetsingh/shieldlend-v2/ARCHITECTURE_DECISIONS.md`
 using the established format:
 
 ```
