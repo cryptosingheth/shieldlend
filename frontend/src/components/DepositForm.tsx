@@ -19,7 +19,7 @@ type DepositStatus = "idle" | "generating" | "sending" | "sent" | "relaying" | "
 export function DepositForm() {
   const { address } = useAccount();
   const { noteKey } = useNoteKey();
-  const { viewingKey } = useViewingKey();
+  const { viewingKey, loadKeys: loadViewingKey, isLoading: viewingKeyLoading } = useViewingKey();
   const publicClient = usePublicClient();
   const { sendTransactionAsync } = useSendTransaction();
   const DENOMINATIONS = ["0.001", "0.005", "0.01", "0.05", "0.1", "0.5"];
@@ -183,6 +183,26 @@ export function DepositForm() {
             </span>
           </div>
         </div>
+      )}
+
+      {/* Feature D: viewing key prompt — enables on-chain encrypted note recovery */}
+      {!viewingKey && !isLoading && (
+        <div className="border border-zinc-700 rounded-lg px-3 py-2 flex items-center justify-between gap-3 text-xs">
+          <span className="text-zinc-400">
+            Enable <span className="text-indigo-400">encrypted note recovery</span> — stores a viewing-key cipher on-chain so you can recover notes from any device.
+          </span>
+          <button
+            type="button"
+            disabled={viewingKeyLoading}
+            onClick={() => loadViewingKey()}
+            className="shrink-0 text-indigo-400 hover:text-indigo-300 underline disabled:opacity-50 whitespace-nowrap"
+          >
+            {viewingKeyLoading ? "Signing..." : "Load key"}
+          </button>
+        </div>
+      )}
+      {viewingKey && !isLoading && (
+        <p className="text-xs text-green-500/70">Viewing key loaded — note will be encrypted on-chain.</p>
       )}
 
       <button

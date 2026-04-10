@@ -36,7 +36,23 @@ export async function POST(req: NextRequest) {
     }
 
     const deployerKey = process.env.DEPLOYER_PRIVATE_KEY;
-    const poolAddress = process.env.NEXT_PUBLIC_SHIELDED_POOL_ADDRESS;
+
+    // Feature E: randomly select one of the 5 deployed shards per deposit.
+    // An on-chain observer sees the relay send to a random shard address —
+    // they cannot know which shard holds a given user's commitment without
+    // scanning all 5 shards' event logs.
+    const shards = [
+      process.env.NEXT_PUBLIC_SHARD_1,
+      process.env.NEXT_PUBLIC_SHARD_2,
+      process.env.NEXT_PUBLIC_SHARD_3,
+      process.env.NEXT_PUBLIC_SHARD_4,
+      process.env.NEXT_PUBLIC_SHARD_5,
+    ].filter(Boolean) as string[];
+
+    // Fallback to the single pool address if shards aren't configured
+    const poolAddress = shards.length > 0
+      ? shards[Math.floor(Math.random() * shards.length)]
+      : process.env.NEXT_PUBLIC_SHIELDED_POOL_ADDRESS;
 
     if (!deployerKey || !poolAddress) {
       return NextResponse.json({ error: "Server misconfigured — missing env vars" }, { status: 500 });
@@ -60,7 +76,7 @@ export async function POST(req: NextRequest) {
       value: BigInt(denomination),
     });
 
-    return NextResponse.json({ txHash });
+    return NextResponse.json({ txHash, shardAddress: poolAddress });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
     console.error("[/api/deposit]", message);

@@ -14,7 +14,8 @@ const BPS_DENOMINATOR = 10000n;
 
 // Merkle tree constants — must match ShieldedPool and collateral_ring.circom
 const LEVELS = 24;
-const DEPLOY_BLOCK = 39731476n;
+// Deployment block of the V2A final contracts (2026-04-09, Base Sepolia block ~40,000,000)
+const DEPLOY_BLOCK = 40000000n;
 const CHUNK_SIZE = 9000n;
 // keccak256("LeafInserted(bytes32,uint32)") — filter for post-flush tree insertions only
 const LEAF_INSERTED_TOPIC = "0xa4e4458df45cfeb7eebc696f262212e6721fac69466bfc59f43b6040425afce6";

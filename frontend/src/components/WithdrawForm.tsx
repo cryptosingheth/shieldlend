@@ -19,8 +19,8 @@ import { useStealthKey } from "@/lib/stealthKeyContext";
 // V2: LEVELS=24 — matches ShieldedPool and withdraw_ring.circom
 const LEVELS = 24;
 
-// Updated to actual deployment block of the V2 contracts on Base Sepolia
-const DEPLOY_BLOCK = 39731476n;
+// Deployment block of the V2A final contracts (2026-04-09, Base Sepolia block ~40,000,000)
+const DEPLOY_BLOCK = 40000000n;
 const CHUNK_SIZE = 9000n;
 
 // keccak256("LeafInserted(bytes32,uint32)") — used to filter only flushEpoch events,
