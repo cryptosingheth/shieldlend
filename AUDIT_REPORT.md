@@ -965,3 +965,165 @@ This session ran three independent audit agents against the V2A+ codebase. Each 
 ---
 
 *Session 6 completed 2026-04-09. Total bugs found across all sessions: 43 (27 prior + 16 new). All fixed except: H-3 (immutable ZkVerify operator — accepted for testnet) and M-2 (prevrandao sequencer bias — L2 limitation).*
+
+---
+
+---
+
+## 14. Session 7 — V2B Cross-Shard Withdrawal (2026-04-10/11)
+
+### Overview
+
+Session 7 identified a residual privacy vulnerability in V2A's multi-shard design and introduced the V2B architecture to close it. Two new smart contract bugs were found and fixed. A binary note packing fix resolved a contract revert. A testnet RPC limitation was worked around in the live test suite.
+
+### New Bugs Found and Fixed
+
+| ID | Severity | Title | File | Status |
+|---|---|---|---|---|
+| V2B-01 | HIGH | Cross-shard auto-settle silently skips loan repayment | `ShieldedPool.sol:withdraw()` | **Fixed** |
+| V2B-02 | HIGH | `settleCollateral()` restricted to same-shard caller — breaks V2B flow | `LendingPool.sol:settleCollateral()` | **Fixed** |
+| V2B-03 | MEDIUM | WithdrawForm only scanned Shard 1 for deposits — "Deposit not found" on all other shards | `WithdrawForm.tsx` | **Fixed** |
+| V2B-04 | MEDIUM | JSON-serialized encrypted note exceeds 256-byte contract cap — deposit reverts | `DepositForm.tsx` | **Fixed** |
+| V2B-05 | LOW | `getLogs` rejected by public Base Sepolia RPC — live-test T7 fails with "Invalid parameters" | `live-test.mjs` | **Fixed** |
+
+---
+
+### V2B-01 (HIGH) — Cross-Shard Auto-Settle Silently Skips Loan Repayment
+
+**File**: `contracts/src/ShieldedPool.sol:withdraw()`  
+**Introduced by**: V2A cross-shard withdrawal routing in WithdrawForm  
+**Impact**: Borrower can withdraw collateral note from a different shard (V2B design) without triggering loan repayment. Loan remains active; lender loses collateral with no repayment.
+
+**Root cause**: `withdraw()` checked `lockedAsCollateral[nullifierHash]` — a per-shard mapping set only on the shard where the note was locked as collateral. In V2B, the withdrawal executes on a different shard where the flag is always `false`. The auto-settle branch was never reached.
+
+**Fix**:
+```solidity
+// OLD — per-shard check (fails for cross-shard withdrawal):
+if (lockedAsCollateral[nullifierHash]) { ... }
+
+// NEW — global check via LendingPool:
+bool globallyLocked = lendingPool != address(0) &&
+    ILendingPool(lendingPool).hasActiveLoan(nullifierHash);
+if (globallyLocked) {
+    lockedAsCollateral[nullifierHash] = false; // no-op if already false (cross-shard)
+    ILendingPool(lendingPool).settleCollateral{value: totalOwed}(nullifierHash);
+    ...
+}
+```
+Added `hasActiveLoan(bytes32) external view returns (bool)` to `ILendingPool` interface. LendingPool's implementation checks its global `loans` mapping — authoritative regardless of calling shard.
+
+---
+
+### V2B-02 (HIGH) — `settleCollateral()` Same-Shard Restriction Breaks Cross-Shard Settlement
+
+**File**: `contracts/src/LendingPool.sol:settleCollateral()`  
+**Impact**: Cross-shard settlement reverts. The withdraw flow succeeds on chain (nullifier spent) but loan is never repaid — double-benefit for borrower.
+
+**Root cause**: V2A added `require(msg.sender == loan.collateralShard)` to prevent unauthorized settlement. In V2B, `msg.sender` is the withdrawal shard (≠ `loan.collateralShard`). The require always reverts.
+
+**Fix**:
+```solidity
+// REMOVED:
+require(msg.sender == loan.collateralShard, "Wrong shard");
+
+// ADDED — explicit unlock on the correct shard:
+address collShard = loan.collateralShard;
+IShieldedPool(collShard).unlockNullifier(nullifierHash); // unlock on correct shard
+(bool fwd,) = payable(loan.disburseShard).call{value: msg.value}("");
+require(fwd, "Forward to shard failed");
+```
+The nullifier lock is now explicitly cleared on `collateralShard` regardless of which shard calls `settleCollateral`.
+
+---
+
+### V2B-03 (MEDIUM) — WithdrawForm Only Scanned Shard 1
+
+**File**: `frontend/src/components/WithdrawForm.tsx`  
+**Impact**: "Deposit not found on-chain. Wrong network or address?" error for all deposits not on Shard 1. Users could not withdraw ~80% of deposits.
+
+**Root cause**: `WithdrawForm` used `SHIELDED_POOL_ADDRESS` (hardcoded to Shard 1) as the sole `getLogs` target. Server-side deposit relay routes deposits to randomly selected shards.
+
+**Fix**: Added `getAllLogsAllShards()` (5 parallel `getLogs` calls) and `findShardForCommitment()` that identifies which shard holds a commitment. Withdrawal logic then uses the correct `depositShard` for Merkle path retrieval and selects a random `withdrawalShard` (≠ `depositShard`) for the actual withdrawal transaction.
+
+---
+
+### V2B-04 (MEDIUM) — Binary Note Packing (Replaces JSON Serialization)
+
+**File**: `frontend/src/components/DepositForm.tsx`  
+**Impact**: Every deposit call reverted with "Note too large" — the 256-byte `encryptedNote` cap in `ShieldedPool.deposit()` was exceeded. Feature D (on-chain note recovery) was completely non-functional in V2A.
+
+**Root cause**: Encrypted note was built by JSON-serializing the full Note struct:
+```
+{"nullifier":"0x...32bytes...","secret":"0x...32bytes...","amount":"500000000000000000"}
+```
+JSON = ~390 bytes plaintext → ~418 bytes after AES-256-GCM (12B IV + 16B tag). Exceeds 256-byte cap.
+
+**Fix**: Binary pack only the three essential fields:
+```
+nullifier (32B) || secret (32B) || amount (8B) = 72B plaintext → 100B AES-GCM output
+```
+100 bytes is well under the 256-byte cap. Amount uses 8 bytes (supports up to ~18.4 ETH).
+
+---
+
+### V2B-05 (LOW) — Receipt-Based Log Parsing for Testnet RPC Compatibility
+
+**File**: `frontend/live-test.mjs` (T7 — Feature D verification)  
+**Impact**: T7 always failed on public Base Sepolia RPC with "Invalid parameters were provided to the RPC method". Live test suite showed 31/32 passing.
+
+**Root cause**: `eth_getLogs` with same-block `fromBlock`/`toBlock` range is rejected by the public Base Sepolia endpoint. ±1 block offset workaround also failed for some block ranges.
+
+**Fix**: Store the full transaction receipt from `waitForTransactionReceipt()` in T6. Parse `receipt.logs` directly in T7 — no `getLogs` call needed. Receipt contains all logs from the transaction regardless of block position.
+
+---
+
+### V2B Privacy Architecture Change
+
+**Privacy gap closed (not a bug — a design limitation of V2A):**
+
+In V2A, deposits and withdrawals were both routed to the same shard (the shard assigned at deposit time). An on-chain observer could correlate: `ShardPool_2 deposit event` ↔ `ShardPool_2 withdrawal event` via the shared shard address — even with server relay hiding `tx.from` and stealth addresses hiding the recipient.
+
+**V2B fix**: After locating the note on `depositShard`, `WithdrawForm` picks a random `withdrawalShard` (≠ `depositShard`) with sufficient ETH balance. Observer now sees two unrelated shard addresses with no shared on-chain history.
+
+This is only possible because all shards share `vkHash` (same circuit for all denominations). A proof generated against `depositShard`'s Merkle root is accepted by `withdrawalShard` via LendingPool's global root registry.
+
+---
+
+### Session 7 Deployment State
+
+**V2B deployed — Base Sepolia (chain ID 84532) — 2026-04-10, block 40034191**
+
+| Contract | Address |
+|---|---|
+| `NullifierRegistry` V2B | `0xEBC14761D4A2E30771E422F52677ed17896ec21F` |
+| `LendingPool` V2B | `0xA1d0F1A35F547698031F14fE984981632AC26240` |
+| `ShieldedPool` — Shard 1 | `0xcF78eaEA131747c67BBD1869130f0710bA646D8D` |
+| `ShieldedPool` — Shard 2 | `0x3110C104542745c55cCA31A63839F418d1354F5D` |
+| `ShieldedPool` — Shard 3 | `0x39769faD54c21d3D8163D9f24F63473eCC528bE0` |
+| `ShieldedPool` — Shard 4 | `0x02dfe4aed5Ba2A2085c80F8Fe7c20686d047111B` |
+| `ShieldedPool` — Shard 5 | `0xf3F7C4c1a352371eC3ae7e70387c259c7051b348` |
+| `ZkVerifyAggregation` | `0x8b722840538D9101bFd8c1c228fB704Fbe47f460` (unchanged) |
+| `PoseidonT3` library | `0x30F4D804AF57f405ba427dF1f90fd950C27c1Cc8` (unchanged) |
+
+**VK Hash (withdraw_ring)**: `0x1702813c4e71d1e48547214eae39ad1b2d07d3643713094e92e619f4f2b0e572` (unchanged)
+
+**Test suite**: 86/86 passing (GasTest: 8, LendingPoolTest: 35, SecurityAuditTest: 10, ShieldedPoolTest: 33)  
+**Live test**: 32/32 passing against V2B contracts
+
+---
+
+### Cumulative Bug Count
+
+| Session | Bugs Found | Bugs Fixed | Open |
+|---------|-----------|-----------|------|
+| Sessions 1–6 | 43 | 41 | 2 (accepted) |
+| Session 7 (V2B) | 5 | 5 | 0 |
+| **Total** | **48** | **46** | **2** |
+
+**2 open accepted findings** (carried from Session 6, not fixed by design):
+- R3-H3: ZkVerify operator is immutable — requires multisig + timelock before mainnet
+- R3-M2: `block.prevrandao` Fisher-Yates shuffle biased by L2 sequencer — VRF would require circuit change
+
+---
+
+*Session 7 completed 2026-04-11. V2B is the current production deployment.*
