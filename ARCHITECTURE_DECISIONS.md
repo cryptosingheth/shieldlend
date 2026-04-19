@@ -373,5 +373,47 @@ This is only possible because all shards share the same `vkHash` (ADR-06, ADR-15
 
 ---
 
-*Last updated: Session 7 / V2B — 2026-04-11*  
+---
+
+## Session 8 — 2026-04-19 — Borrow/Repay Privacy Audit
+
+### ADR-26: Apply full withdrawal privacy model to the borrow flow
+
+**Status**: Decided  
+**When**: Session 8 / V2B post-audit  
+**Decision**: Borrow must provide the same privacy guarantees as withdrawal: multi-shard scan to locate the note, stealth address as on-chain recipient, and cross-shard disbursement routing.  
+**Alternatives considered**: Accept borrow as a "less private" operation — the user explicitly takes out a loan so some linkability is acceptable. Keep `recipient = user's wallet` as a known privacy trade-off.  
+**Rationale**: Inconsistency in the privacy model is a security gap. If withdrawal hides the user's wallet behind a stealth address but borrow sends funds directly to `user.address`, an observer monitoring LendingPool Borrowed events can extract the recipient and link it to the user's MetaMask wallet — the same wallet that previously called Repay. Three sub-decisions follow:
+- **Multi-shard scan**: BorrowForm was scanning only Shard 1 (`SHIELDED_POOL_ADDRESS`) for the collateral note's Merkle path. Deposits are randomly routed to all 5 shards. Any note on Shards 2–5 would produce a wrong leafIndex (from a different shard's event) → garbage Merkle path → proof fails → "exceeds max gas" from MetaMask. Fixed with `getAllLogsAllShards()` identical to WithdrawForm.
+- **Stealth recipient**: `recipient = address` (user's MetaMask wallet) replaced with a freshly generated ERC-5564 stealth address per borrow. This matches ADR-11 which applied the same principle to withdrawal.
+- **Auto-forward**: After the borrow confirms, the borrowed ETH lands on the stealth address. BorrowForm computes the stealth private key and forwards the balance minus gas to the connected wallet — identical to WithdrawForm's forwarding block.  
+**Consequences**: Borrow flow now requires a MetaMask stealth key signature (same one-per-session signature as withdrawal). The `recipient` field in the LendingPool Loan struct always contains a stealth address — never a raw user wallet. The Loan record is therefore not directly deanonymizable by inspecting the recipient field.
+
+---
+
+### ADR-27: Six-parameter `LendingPool.borrow()` for explicit cross-shard disbursement
+
+**Status**: Decided  
+**When**: Session 8 / V2B post-audit  
+**Decision**: Frontend and API route must call the 6-param `borrow(noteNullifierHash, borrowed, collateralAmount, recipient, collateralShard, disburseShard)` rather than the 4-param version that defaults both shards to `_defaultShard`.  
+**Alternatives considered**: Keep 4-param; use `_defaultShard` (Shard 1) for both collateral lock and disbursement. Simple but doesn't route liquidity optimally and breaks cross-shard privacy.  
+**Rationale**: The 4-param version (`_defaultShard` fallback) was added for backwards-compatibility in V2A. In V2B, deposits are randomly routed — a note may be on Shard 3 while Shard 1 is `_defaultShard`. Using 4-param would lock the nullifier on Shard 1 but the commitment is on Shard 3 → `lockNullifier` on the wrong shard → the collateral note can still be withdrawn. Additionally, if the observer sees that both the collateral shard and the disburse shard are always Shard 1, the cross-shard privacy benefit is lost. The 6-param call allows:
+  - `collateralShard` = the shard where the note actually lives (determined by frontend's multi-shard scan)
+  - `disburseShard` = a randomly chosen funded shard ≠ `collateralShard` (selected server-side in `/api/borrow`)  
+**Consequences**: The API route now requires `collateralShard` from the frontend. Server reads all 5 shard ETH balances and Fisher-Yates shuffles candidate shards to pick `disburseShard`. If no other shard has sufficient liquidity, falls back to `collateralShard` itself (the 4-param equivalent) with a warning log.
+
+---
+
+### ADR-28: 20% gas price buffer for stealth address auto-forward transactions
+
+**Status**: Decided  
+**When**: Session 8 / V2B post-audit  
+**Decision**: When computing the ETH amount to forward from a stealth address to the final recipient, reserve `gasPrice * 1.2 * 21000` instead of `gasPrice * 21000`.  
+**Alternatives considered**: (a) Exact gas cost — caused "insufficient funds for gas" failures in browser testing because `getGasPrice()` returns the current base fee but by the time `sendTransaction` executes, the effective fee can be higher. (b) EIP-1559 with `maxFeePerGas` / `maxPriorityFeePerGas` — more accurate but adds complexity and the stealth key is a throwaway account that only ever sends one transaction. (c) Fixed 50,000 wei buffer — too small on high-gas moments.  
+**Rationale**: The stealth address is a one-time account with exactly one incoming transfer (the withdrawal or borrow disbursement). Its entire balance must be forwarded out minus gas. Using the exact current gas price leaves zero margin: if the node's tip or the base fee increases by even 1 wei between `getGasPrice()` and execution, `sendAmount = balance - gasCost` becomes negative → transaction reverted with "insufficient funds". A 20% buffer was chosen because Base Sepolia gas price variance observed in testing is within ±15%.  
+**Consequences**: The user receives slightly less ETH than the full denomination (the unused gas buffer stays on the stealth address and is unrecoverable since the private key is discarded). Maximum lost amount: 20% of 21000 * gasPrice ≈ 4200 * gasPrice. At typical testnet gas (~1 gwei) this is ~4200 gwei ≈ 0.0000042 ETH — negligible. On mainnet at higher gas prices this becomes more significant; a future improvement could use `eth_estimateGas` before sending rather than the fixed 21000 gas limit.
+
+---
+
+*Last updated: Session 8 / V2B post-audit — 2026-04-19*  
 *Next update: auto-appended at end of next session with design changes (see CLAUDE.md)*
