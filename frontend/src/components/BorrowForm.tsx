@@ -1,12 +1,15 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { parseEther, formatEther, type Log } from "viem";
+import { parseEther, formatEther, type Log, type Address, createWalletClient, http } from "viem";
 import { useAccount, usePublicClient, useWriteContract } from "wagmi";
+import { privateKeyToAccount } from "viem/accounts";
+import { baseSepolia } from "viem/chains";
 import { deserializeNote, generateCollateralProof, type MerklePath } from "@/lib/circuits";
-import { useHasActiveLoan, fieldToBytes32, LENDING_POOL_ADDRESS, LENDING_POOL_ABI, SHIELDED_POOL_ADDRESS, SHIELDED_POOL_ABI } from "@/lib/contracts";
+import { useHasActiveLoan, fieldToBytes32, LENDING_POOL_ADDRESS, LENDING_POOL_ABI, SHIELDED_POOL_ABI, ALL_SHARD_ADDRESSES } from "@/lib/contracts";
 import { loadNotes, storedNoteToNote, noteLabel, type StoredNote } from "@/lib/noteStorage";
 import { useNoteKey } from "@/lib/noteKeyContext";
+import { useStealthKey } from "@/lib/stealthKeyContext";
 
 // V2: MIN_HEALTH_FACTOR_BPS = 11000 (110%) in LendingPool.sol
 const MIN_HEALTH_FACTOR_BPS = 11000n;
@@ -34,10 +37,16 @@ function healthLabel(hf: number): string {
 
 async function getAllLogs(
   publicClient: NonNullable<ReturnType<typeof usePublicClient>>,
-  address: `0x${string}`
+  address: `0x${string}`,
+  upToBlock?: bigint
 ): Promise<Log[]> {
-  const rawLatest = await publicClient.getBlockNumber();
-  const latest = rawLatest > 1n ? rawLatest - 1n : rawLatest;
+  let latest: bigint;
+  if (upToBlock !== undefined) {
+    latest = upToBlock;
+  } else {
+    const rawLatest = await publicClient.getBlockNumber();
+    latest = rawLatest > 1n ? rawLatest - 1n : rawLatest;
+  }
   const allLogs: Log[] = [];
   for (let from = DEPLOY_BLOCK; from <= latest; from += CHUNK_SIZE) {
     const to = from + CHUNK_SIZE - 1n < latest ? from + CHUNK_SIZE - 1n : latest;
@@ -47,9 +56,36 @@ async function getAllLogs(
   return allLogs;
 }
 
+// Scan all 5 shards in parallel — deposits are randomly routed so we must check all.
+async function getAllLogsAllShards(
+  publicClient: NonNullable<ReturnType<typeof usePublicClient>>,
+  upToBlock?: bigint
+): Promise<{ shard: Address; logs: Log[] }[]> {
+  return Promise.all(
+    ALL_SHARD_ADDRESSES.map(async (shard) => ({
+      shard,
+      logs: await getAllLogs(publicClient, shard, upToBlock),
+    }))
+  );
+}
+
+// Find which shard holds a Deposit (or LeafInserted) event for `commitment`.
+function findShardForCommitment(
+  shardResults: { shard: Address; logs: Log[] }[],
+  commitment: string
+): { shard: Address; logs: Log[] } | null {
+  for (const r of shardResults) {
+    if (r.logs.some((l) => l.topics[1]?.toLowerCase() === commitment.toLowerCase())) {
+      return r;
+    }
+  }
+  return null;
+}
+
 export function BorrowForm() {
   const { address } = useAccount();
   const { noteKey } = useNoteKey();
+  const { stealthMetaAddressURI, spendingPrivateKey, viewingPrivateKey, isLoaded: stealthKeysLoaded, loadKeys } = useStealthKey();
   const publicClient = usePublicClient();
 
   // ── Note selection ────────────────────────────────────────────────────────
@@ -69,10 +105,11 @@ export function BorrowForm() {
   // ── Borrow state ──────────────────────────────────────────────────────────
   const [borrowEth, setBorrowEth] = useState("");
   const [borrowStatus, setBorrowStatus] = useState<
-    "idle" | "flushing" | "fetching-path" | "proving" | "zkverify" | "submitting" | "done" | "error"
+    "idle" | "flushing" | "fetching-path" | "proving" | "zkverify" | "submitting" | "forwarding" | "done" | "error"
   >("idle");
   const [borrowError, setBorrowError] = useState("");
   const [borrowTxHash, setBorrowTxHash] = useState<string | null>(null);
+  const [forwardedTo, setForwardedTo] = useState<string | null>(null);
 
   // ── Repay state ───────────────────────────────────────────────────────────
   const [repayStatus, setRepayStatus] = useState<"idle" | "submitting" | "done" | "error">("idle");
@@ -182,11 +219,11 @@ export function BorrowForm() {
     ? formatEther((collateral * BPS_DENOMINATOR) / MIN_HEALTH_FACTOR_BPS)
     : null;
 
-  // ── Merkle path fetcher (same implementation as WithdrawForm) ─────────────
-  async function fetchMerklePath(leafIndex: number, root: `0x${string}`, upToBlock?: bigint): Promise<MerklePath> {
+  // ── Merkle path fetcher — scans the specific shard the note was deposited on ──
+  async function fetchMerklePath(leafIndex: number, root: `0x${string}`, shardAddress: Address, upToBlock?: bigint): Promise<MerklePath> {
     if (!publicClient) throw new Error("No public client");
 
-    const logs = await getAllLogs(publicClient, SHIELDED_POOL_ADDRESS, upToBlock);
+    const logs = await getAllLogs(publicClient, shardAddress, upToBlock);
 
     const commitMap = new Map<number, bigint>();
     for (const log of logs) {
@@ -247,6 +284,7 @@ export function BorrowForm() {
 
     try {
       setBorrowError("");
+      setForwardedTo(null);
       const borrowAmount = parseEther(borrowEth);
 
       // Client-side health check: collateral * 10000 >= borrowed * MIN_HEALTH_FACTOR_BPS
@@ -255,28 +293,46 @@ export function BorrowForm() {
         throw new Error(`Insufficient collateral. Need ${minCollateral} ETH, have ${formatEther(note.amount)} ETH`);
       }
 
+      // ── Step 1: Derive stealth keys (same as WithdrawForm) ──────────────────
+      // Borrowed ETH is routed through a one-time stealth address so the
+      // on-chain recipient is never directly linked to the user's MetaMask wallet.
+      let keys: { uri: string; spendKey: string; viewKey: string } | null = null;
+      if (stealthKeysLoaded && stealthMetaAddressURI && spendingPrivateKey && viewingPrivateKey) {
+        keys = { uri: stealthMetaAddressURI, spendKey: spendingPrivateKey, viewKey: viewingPrivateKey };
+      } else {
+        keys = await loadKeys();
+      }
+      if (!keys) throw new Error("Stealth key derivation cancelled");
+
+      const { generateStealthAddress, computeStealthKey, VALID_SCHEME_ID } = await import("@scopelift/stealth-address-sdk");
+      const { stealthAddress, ephemeralPublicKey } = generateStealthAddress({ stealthMetaAddressURI: keys.uri });
+
+      // ── Step 2: Scan ALL shards to find which shard holds this note ─────────
+      // Deposits are randomly routed — we cannot assume the note is on Shard 1.
       setBorrowStatus("fetching-path");
-
-      // Borrow requires Merkle inclusion proof — note must be in the tree first.
-      const logs = await getAllLogs(publicClient, SHIELDED_POOL_ADDRESS);
       const noteCommitment = fieldToBytes32(note.commitment);
+      const shardResults = await getAllLogsAllShards(publicClient);
+      const shardMatch = findShardForCommitment(shardResults, noteCommitment);
+      if (!shardMatch) throw new Error("Deposit not found on-chain. Wrong network or old note?");
 
-      let leafLog = logs.find((l) =>
+      const depositShard = shardMatch.shard;
+      const shardLogs = shardMatch.logs;
+
+      let leafLog = shardLogs.find((l) =>
         l.topics[0]?.toLowerCase() === LEAF_INSERTED_TOPIC &&
         l.topics[1]?.toLowerCase() === noteCommitment.toLowerCase()
       );
-
       let logUpToBlock: bigint | undefined = undefined;
 
       if (!leafLog) {
-        // Note is pending — check if epoch is ready to flush.
+        // Note is queued — check if epoch on the DEPOSIT shard is ready to flush.
         const lastEpochBlockOnChain = await publicClient.readContract({
-          address: SHIELDED_POOL_ADDRESS,
+          address: depositShard,
           abi: SHIELDED_POOL_ABI,
           functionName: "lastEpochBlock",
         }) as bigint;
         const epochBlocksOnChain = await publicClient.readContract({
-          address: SHIELDED_POOL_ADDRESS,
+          address: depositShard,
           abi: SHIELDED_POOL_ABI,
           functionName: "EPOCH_BLOCKS",
         }) as bigint;
@@ -289,10 +345,10 @@ export function BorrowForm() {
           );
         }
 
-        // Epoch overdue — auto-flush before generating proof.
+        // Epoch overdue — auto-flush the deposit shard before generating proof.
         setBorrowStatus("flushing" as typeof borrowStatus);
         const flushTxHash = await writeContractAsync({
-          address: SHIELDED_POOL_ADDRESS,
+          address: depositShard,
           abi: SHIELDED_POOL_ABI,
           functionName: "flushEpoch",
         });
@@ -300,15 +356,9 @@ export function BorrowForm() {
         logUpToBlock = flushReceipt.blockNumber;
 
         setBorrowStatus("fetching-path");
-        const freshLogs = await getAllLogs(publicClient, SHIELDED_POOL_ADDRESS, logUpToBlock);
-        const leafInserted = freshLogs.filter(l => l.topics[0]?.toLowerCase() === LEAF_INSERTED_TOPIC);
-        console.log("[borrow] noteCommitment:", noteCommitment);
-        console.log("[borrow] LeafInserted count after flush:", leafInserted.length);
-        console.log("[borrow] LeafInserted topics[1]:", leafInserted.map(l => l.topics[1]).join("\n"));
-        // Also check Deposit events for this commitment
-        const depositMatch = freshLogs.find(l => l.topics[1]?.toLowerCase() === noteCommitment.toLowerCase());
-        console.log("[borrow] Deposit event found for commitment:", !!depositMatch, depositMatch?.topics[0]);
-        leafLog = leafInserted.find((l) =>
+        const freshLogs = await getAllLogs(publicClient, depositShard, logUpToBlock);
+        leafLog = freshLogs.find((l) =>
+          l.topics[0]?.toLowerCase() === LEAF_INSERTED_TOPIC &&
           l.topics[1]?.toLowerCase() === noteCommitment.toLowerCase()
         );
         if (!leafLog) throw new Error("Flush succeeded but note not found in tree. Try again.");
@@ -316,13 +366,15 @@ export function BorrowForm() {
 
       const leafIndex = parseInt(leafLog.data.slice(2, 66), 16);
 
+      // Read root from the deposit shard — proof is generated against its specific tree.
       const freshRoot = (await publicClient.readContract({
-        address: SHIELDED_POOL_ADDRESS,
+        address: depositShard,
         abi: SHIELDED_POOL_ABI,
         functionName: "getLastRoot",
       })) as `0x${string}`;
 
-      const merklePath = await fetchMerklePath(leafIndex, freshRoot, logUpToBlock);
+      // Merkle path is built from the deposit shard's LeafInserted events.
+      const merklePath = await fetchMerklePath(leafIndex, freshRoot, depositShard, logUpToBlock);
 
       setBorrowStatus("proving");
       const { proof, publicSignals } = await generateCollateralProof(
@@ -333,25 +385,69 @@ export function BorrowForm() {
       );
 
       setBorrowStatus("zkverify");
-      // /api/borrow handles both zkVerify submission AND the on-chain borrow()
-      // call using the operator (DEPLOYER_PRIVATE_KEY). The user's wallet never
-      // calls borrow() directly — it can't, because borrow() is onlyOperator.
+      // /api/borrow handles zkVerify submission AND the on-chain borrow() call via
+      // operator key. It picks a random disburseShard ≠ collateralShard (V2B privacy).
+      // Borrowed ETH goes to stealthAddress — NOT the user's MetaMask wallet directly.
       const borrowRes = await fetch("/api/borrow", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           proof,
           publicSignals,
-          noteNullifierHash: fieldToBytes32(note.nullifierHash),
-          borrowed:          borrowAmount.toString(),
-          collateralAmount:  note.amount.toString(),
-          recipient:         address,
+          noteNullifierHash:  fieldToBytes32(note.nullifierHash),
+          borrowed:           borrowAmount.toString(),
+          collateralAmount:   note.amount.toString(),
+          recipient:          stealthAddress,     // stealth address — not user's wallet
+          collateralShard:    depositShard,        // tells server which shard to lock
         }),
       });
       if (!borrowRes.ok) throw new Error(`Borrow failed: ${await borrowRes.text()}`);
       const borrowResult = await borrowRes.json();
-
       setBorrowTxHash(borrowResult.txHash);
+
+      // ── Step 3: Auto-forward stealthAddress → user's wallet ─────────────────
+      // Same pattern as WithdrawForm: compute stealth private key, create a client
+      // for it, poll until balance arrives, then forward to connected wallet.
+      setBorrowStatus("forwarding");
+      const stealthPrivKey = computeStealthKey({
+        ephemeralPublicKey,
+        spendingPrivateKey: keys.spendKey as `0x${string}`,
+        viewingPrivateKey:  keys.viewKey as `0x${string}`,
+        schemeId: VALID_SCHEME_ID.SCHEME_ID_1,
+      });
+
+      const stealthAccount = privateKeyToAccount(stealthPrivKey as `0x${string}`);
+      const stealthClient = createWalletClient({
+        account:   stealthAccount,
+        chain:     baseSepolia,
+        transport: http("https://sepolia.base.org"),
+      });
+
+      // Poll until borrowed ETH lands in the stealth address (borrow tx must confirm)
+      let balance = 0n;
+      for (let attempt = 0; attempt < 10; attempt++) {
+        balance = await publicClient.getBalance({ address: stealthAddress as Address });
+        if (balance > 0n) break;
+        await new Promise((r) => setTimeout(r, 3000));
+      }
+
+      if (balance > 0n) {
+        const gasPrice = await publicClient.getGasPrice();
+        // Add a 20% gas price buffer so the forward doesn't fail if price ticks up
+        const bufferedGasPrice = gasPrice + gasPrice / 5n;
+        const gasCost = bufferedGasPrice * 21000n;
+        const sendAmount = balance > gasCost ? balance - gasCost : 0n;
+        if (sendAmount > 0n) {
+          await stealthClient.sendTransaction({
+            to:       address as Address,  // forward to connected MetaMask wallet
+            value:    sendAmount,
+            gas:      21000n,
+            gasPrice: bufferedGasPrice,
+          });
+          setForwardedTo(address);
+        }
+      }
+
       setBorrowStatus("done");
     } catch (err) {
       setBorrowStatus("error");
@@ -394,7 +490,7 @@ export function BorrowForm() {
     }
   }
 
-  const isBorrowing = ["flushing", "fetching-path", "proving", "zkverify", "submitting"].includes(borrowStatus);
+  const isBorrowing = ["flushing", "fetching-path", "proving", "zkverify", "submitting", "forwarding"].includes(borrowStatus);
 
   const borrowLabel: Record<typeof borrowStatus, string> = {
     idle: "Borrow",
@@ -403,6 +499,7 @@ export function BorrowForm() {
     proving: "Generating collateral ring proof (~25s)...",
     zkverify: "Verifying proof + confirming borrow...",
     submitting: "Confirming borrow...",
+    forwarding: "Forwarding to your wallet...",
     done: "Borrowed",
     error: "Borrow",
   };
@@ -514,9 +611,16 @@ export function BorrowForm() {
           <p className="text-sm text-red-400 border border-red-900 rounded-lg px-4 py-3">{borrowError}</p>
         )}
         {borrowStatus === "done" && borrowTxHash && (
-          <p className="text-sm text-green-400">
-            Loan disbursed · tx: {borrowTxHash.slice(0, 10)}...
-          </p>
+          <div className="border border-green-800 rounded-lg p-4 bg-green-950/20 space-y-2 text-xs">
+            <p className="text-sm text-green-400 font-medium">Loan disbursed — funds forwarded privately</p>
+            {forwardedTo && (
+              <p className="text-zinc-400">
+                Routed through a one-time stealth address and forwarded to{" "}
+                <span className="font-mono text-zinc-300">{forwardedTo.slice(0, 10)}...{forwardedTo.slice(-6)}</span>
+              </p>
+            )}
+            <p className="text-zinc-500">tx: {borrowTxHash.slice(0, 10)}...</p>
+          </div>
         )}
       </div>
 

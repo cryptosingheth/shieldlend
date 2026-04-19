@@ -88,7 +88,9 @@ Full addresses in `frontend/.env.local` (not committed).
 - [ ] Viewing key recovery UI (Feature C): `viewingKeyContext.tsx` exists but no recovery page yet
 - [ ] Replace ZkVerify operator with multisig before mainnet (accepted audit finding H-3)
 - [ ] Consider Chainlink VRF for Fisher-Yates shuffle (accepted audit finding M-2)
-- [ ] Auto-forward ETH from stealth address to MetaMask wallet (UX improvement — currently user must manually import key)
+- [x] Auto-forward ETH from stealth address to MetaMask wallet — DONE Session 8 (withdraw + borrow both forward automatically)
+- [x] Borrow privacy: all-shards scan, stealth recipient, random disburseShard — DONE Session 8
+- [ ] Repay through relay (low priority — user's wallet calling repay reveals "this wallet had a loan" but not which note or depositor; accepted privacy trade-off)
 
 ---
 

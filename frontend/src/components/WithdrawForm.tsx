@@ -507,13 +507,19 @@ export function WithdrawForm({ onStatusChange }: { onStatusChange?: (s: Withdraw
 
       if (balance > 0n) {
         const gasPrice = await publicClient.getGasPrice();
-        const gasCost = gasPrice * 21000n;
+        // Add 20% buffer: getGasPrice() returns the current base fee but by the
+        // time sendTransaction executes the effective fee may be slightly higher.
+        // Without a buffer: sendAmount = balance - exactCost, but the TX costs
+        // (exactCost + a few wei) → "insufficient funds for gas" revert.
+        const bufferedGasPrice = gasPrice + gasPrice / 5n;
+        const gasCost = bufferedGasPrice * 21000n;
         const sendAmount = balance > gasCost ? balance - gasCost : 0n;
         if (sendAmount > 0n) {
           await stealthClient.sendTransaction({
-            to: effectiveRecipient,
-            value: sendAmount,
-            gas: 21000n,
+            to:       effectiveRecipient,
+            value:    sendAmount,
+            gas:      21000n,
+            gasPrice: bufferedGasPrice,
           });
         }
       }

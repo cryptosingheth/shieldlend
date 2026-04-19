@@ -78,7 +78,10 @@ export const LENDING_POOL_ABI = parseAbi([
   "function activeLoanByNote(bytes32 noteNullifierHash) view returns (uint256)",
   "function getOwed(bytes32 nullifierHash) view returns (uint256)",
   // V2 borrow: no Groth16 proof args — collateral verified off-chain via zkVerify
+  // 4-param version: uses _defaultShard for both collateral + disburse (legacy)
   "function borrow(bytes32 noteNullifierHash, uint256 borrowed, uint256 collateralAmount, address recipient)",
+  // 6-param version: explicit collateralShard + disburseShard (V2B cross-shard disburse)
+  "function borrow(bytes32 noteNullifierHash, uint256 borrowed, uint256 collateralAmount, address recipient, address collateralShard, address disburseShard)",
   "function repay(uint256 loanId) payable",
   // Events — V2: Borrowed emits only loanId for privacy
   "event Borrowed(uint256 indexed loanId)",
