@@ -39,3 +39,4 @@ contracts/lib/
 .idea/
 *.swp
 frontend/package-lock.json
+CLAUDE.md
