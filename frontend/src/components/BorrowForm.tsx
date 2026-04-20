@@ -110,6 +110,7 @@ export function BorrowForm() {
   const [borrowError, setBorrowError] = useState("");
   const [borrowTxHash, setBorrowTxHash] = useState<string | null>(null);
   const [forwardedTo, setForwardedTo] = useState<string | null>(null);
+  const [forwardFailKey, setForwardFailKey] = useState<string | null>(null);
 
   // ── Repay state ───────────────────────────────────────────────────────────
   const [repayStatus, setRepayStatus] = useState<"idle" | "submitting" | "done" | "error">("idle");
@@ -285,6 +286,7 @@ export function BorrowForm() {
     try {
       setBorrowError("");
       setForwardedTo(null);
+      setForwardFailKey(null);
       const borrowAmount = parseEther(borrowEth);
 
       // Client-side health check: collateral * 10000 >= borrowed * MIN_HEALTH_FACTOR_BPS
@@ -406,8 +408,6 @@ export function BorrowForm() {
       setBorrowTxHash(borrowResult.txHash);
 
       // ── Step 3: Auto-forward stealthAddress → user's wallet ─────────────────
-      // Same pattern as WithdrawForm: compute stealth private key, create a client
-      // for it, poll until balance arrives, then forward to connected wallet.
       setBorrowStatus("forwarding");
       const stealthPrivKey = computeStealthKey({
         ephemeralPublicKey,
@@ -416,38 +416,39 @@ export function BorrowForm() {
         schemeId: VALID_SCHEME_ID.SCHEME_ID_1,
       });
 
-      const stealthAccount = privateKeyToAccount(stealthPrivKey as `0x${string}`);
-      const stealthClient = createWalletClient({
-        account:   stealthAccount,
-        chain:     baseSepolia,
-        transport: http("https://sepolia.base.org"),
-      });
+      try {
+        const stealthAccount = privateKeyToAccount(stealthPrivKey as `0x${string}`);
+        const stealthClient = createWalletClient({
+          account:   stealthAccount,
+          chain:     baseSepolia,
+          transport: http("https://sepolia.base.org"),
+        });
 
-      // Poll until borrowed ETH lands in the stealth address (borrow tx must confirm)
-      let balance = 0n;
-      for (let attempt = 0; attempt < 10; attempt++) {
-        balance = await publicClient.getBalance({ address: stealthAddress as Address });
-        if (balance > 0n) break;
-        await new Promise((r) => setTimeout(r, 3000));
-      }
-
-      if (balance > 0n) {
-        const gasPrice = await publicClient.getGasPrice();
-        const bufferedGasPrice = gasPrice + gasPrice / 5n;
-        // Base L2 charges an L1 data fee on top of L2 gas — not in getGasPrice().
-        // Reserve 10B wei extra to cover it (observed ~910M wei on Base Sepolia).
-        const L1_DATA_FEE_RESERVE = 10_000_000_000n;
-        const gasCost = bufferedGasPrice * 21000n + L1_DATA_FEE_RESERVE;
-        const sendAmount = balance > gasCost ? balance - gasCost : 0n;
-        if (sendAmount > 0n) {
-          await stealthClient.sendTransaction({
-            to:       address as Address,
-            value:    sendAmount,
-            gas:      21000n,
-            gasPrice: bufferedGasPrice,
-          });
-          setForwardedTo(address);
+        let balance = 0n;
+        for (let attempt = 0; attempt < 10; attempt++) {
+          balance = await publicClient.getBalance({ address: stealthAddress as Address });
+          if (balance > 0n) break;
+          await new Promise((r) => setTimeout(r, 3000));
         }
+
+        if (balance > 0n) {
+          const gasPrice = await publicClient.getGasPrice();
+          const bufferedGasPrice = gasPrice + gasPrice / 5n;
+          const L1_DATA_FEE_RESERVE = 10_000_000_000n;
+          const gasCost = bufferedGasPrice * 21000n + L1_DATA_FEE_RESERVE;
+          const sendAmount = balance > gasCost ? balance - gasCost : 0n;
+          if (sendAmount > 0n) {
+            await stealthClient.sendTransaction({
+              to:       address as Address,
+              value:    sendAmount,
+              gas:      21000n,
+              gasPrice: bufferedGasPrice,
+            });
+            setForwardedTo(address);
+          }
+        }
+      } catch {
+        setForwardFailKey(stealthPrivKey as string);
       }
 
       setBorrowStatus("done");
@@ -634,6 +635,23 @@ export function BorrowForm() {
               </p>
             )}
             <p className="text-zinc-500">tx: {borrowTxHash.slice(0, 10)}...</p>
+          </div>
+        )}
+        {borrowStatus === "done" && forwardFailKey && (
+          <div className="border border-amber-700 rounded-lg p-4 bg-amber-950/20 space-y-3 text-xs">
+            <p className="text-sm text-amber-400 font-medium">Borrow succeeded — manual recovery needed</p>
+            <p className="text-zinc-400">Funds were disbursed but the auto-forward failed. Import this key into MetaMask to access your ETH.</p>
+            <div className="space-y-1">
+              <p className="text-zinc-500">Stealth private key:</p>
+              <div className="flex items-start gap-2">
+                <span className="font-mono text-amber-300 text-xs break-all leading-relaxed">{forwardFailKey}</span>
+                <button
+                  onClick={() => navigator.clipboard.writeText(forwardFailKey)}
+                  className="shrink-0 text-xs px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 transition-colors"
+                >Copy</button>
+              </div>
+            </div>
+            <p className="text-red-400 font-medium">Delete this key from your clipboard after importing.</p>
           </div>
         )}
       </div>
