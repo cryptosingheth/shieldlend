@@ -107,6 +107,9 @@ export function WithdrawForm({ onStatusChange }: { onStatusChange?: (s: Withdraw
   const [noteJson, setNoteJson] = useState("");
   const [recipient, setRecipient] = useState("");
   const [forwardedTo, setForwardedTo] = useState<string | null>(null);
+  // Set when auto-forward fails: the stealth key is needed for manual ETH recovery.
+  // Shown in a warning panel so the user can import it to MetaMask and access the funds.
+  const [forwardFailKey, setForwardFailKey] = useState<string | null>(null);
   const [status, setStatus] = useState<WithdrawStatus>("idle");
 
   // Notify parent whenever status changes so it can show a cross-tab progress indicator.
@@ -300,6 +303,7 @@ export function WithdrawForm({ onStatusChange }: { onStatusChange?: (s: Withdraw
     try {
       setErrorMsg("");
       setForwardedTo(null);
+      setForwardFailKey(null);
 
       // Derive stealth keys — MetaMask signature once per session, then cached
       let keys: { uri: string; spendKey: string; viewKey: string } | null = null;
@@ -478,7 +482,18 @@ export function WithdrawForm({ onStatusChange }: { onStatusChange?: (s: Withdraw
 
       setTxHash(zkResult.txHash);
 
-      // Compute stealth private key — used once to forward funds, then discarded
+      // Mark note spent immediately after the on-chain withdrawal confirms.
+      // Must happen BEFORE the auto-forward attempt — if the forward fails,
+      // the nullifier is already spent on-chain and the note must not appear
+      // as withdrawable in the UI (retrying would always revert on-chain).
+      if (address) {
+        const nhex = selectedNullifierHash || fieldToBytes32(note.nullifierHash);
+        await markNoteSpent(address, nhex, noteKey);
+        setSavedNotes((prev) => prev.filter((n) => n.nullifierHash !== selectedNullifierHash));
+      }
+
+      // Compute stealth private key — used once to forward funds.
+      // Stored in forwardFailKey only if the forward fails (for manual recovery).
       const stealthPrivKey = computeStealthKey({
         ephemeralPublicKey,
         spendingPrivateKey: keys.spendKey as `0x${string}`,
@@ -486,53 +501,57 @@ export function WithdrawForm({ onStatusChange }: { onStatusChange?: (s: Withdraw
         schemeId: VALID_SCHEME_ID.SCHEME_ID_1,
       });
 
-      // Auto-forward from stealth address → final recipient.
-      // If user left recipient blank, default to their connected wallet — never expose private key.
       const effectiveRecipient = (recipient.trim() || address) as Address;
       setStatus("forwarding");
-      const stealthAccount = privateKeyToAccount(stealthPrivKey as `0x${string}`);
-      const stealthClient = createWalletClient({
-        account: stealthAccount,
-        chain: baseSepolia,
-        transport: http("https://sepolia.base.org"),
-      });
+      setForwardFailKey(null);
 
-      // Poll until stealth address has balance (withdrawal must fully confirm first)
-      let balance = 0n;
-      for (let attempt = 0; attempt < 10; attempt++) {
-        balance = await publicClient.getBalance({ address: stealthAddress as Address });
-        if (balance > 0n) break;
-        await new Promise((r) => setTimeout(r, 3000));
-      }
+      // Auto-forward wrapped in its own try/catch — the withdrawal already succeeded.
+      // If the forward fails, we show the stealth private key so the user can
+      // import it to MetaMask and manually access the funds.
+      try {
+        const stealthAccount = privateKeyToAccount(stealthPrivKey as `0x${string}`);
+        const stealthClient = createWalletClient({
+          account: stealthAccount,
+          chain: baseSepolia,
+          transport: http("https://sepolia.base.org"),
+        });
 
-      if (balance > 0n) {
-        const gasPrice = await publicClient.getGasPrice();
-        // Add 20% buffer: getGasPrice() returns the current base fee but by the
-        // time sendTransaction executes the effective fee may be slightly higher.
-        // Without a buffer: sendAmount = balance - exactCost, but the TX costs
-        // (exactCost + a few wei) → "insufficient funds for gas" revert.
-        const bufferedGasPrice = gasPrice + gasPrice / 5n;
-        const gasCost = bufferedGasPrice * 21000n;
-        const sendAmount = balance > gasCost ? balance - gasCost : 0n;
-        if (sendAmount > 0n) {
-          await stealthClient.sendTransaction({
-            to:       effectiveRecipient,
-            value:    sendAmount,
-            gas:      21000n,
-            gasPrice: bufferedGasPrice,
-          });
+        // Poll until stealth address has balance (withdrawal must fully confirm first)
+        let balance = 0n;
+        for (let attempt = 0; attempt < 10; attempt++) {
+          balance = await publicClient.getBalance({ address: stealthAddress as Address });
+          if (balance > 0n) break;
+          await new Promise((r) => setTimeout(r, 3000));
         }
-      }
-      // stealthPrivKey is never stored — discarded after forwarding
-      setForwardedTo(effectiveRecipient);
 
+        if (balance > 0n) {
+          const gasPrice = await publicClient.getGasPrice();
+          const bufferedGasPrice = gasPrice + gasPrice / 5n;
+          // Base is an L2: every tx pays an L1 data fee on top of L2 gas.
+          // getGasPrice() returns only the L2 fee. The L1 data fee (~910M wei
+          // on testnet) must be reserved separately — without this reserve the
+          // tx fails with "insufficient funds" even when the L2 gas is covered.
+          const L1_DATA_FEE_RESERVE = 10_000_000_000n; // 10B wei, ~10x observed L1 fee
+          const gasCost = bufferedGasPrice * 21000n + L1_DATA_FEE_RESERVE;
+          const sendAmount = balance > gasCost ? balance - gasCost : 0n;
+          if (sendAmount > 0n) {
+            await stealthClient.sendTransaction({
+              to:       effectiveRecipient,
+              value:    sendAmount,
+              gas:      21000n,
+              gasPrice: bufferedGasPrice,
+            });
+          }
+        }
+        setForwardedTo(effectiveRecipient);
+      } catch {
+        // Forward failed — withdrawal already succeeded and note is marked spent.
+        // Show the stealth private key so the user can recover funds from MetaMask.
+        setForwardFailKey(stealthPrivKey as string);
+      }
+
+      // Withdrawal succeeded regardless of auto-forward result.
       setStatus("done");
-
-      if (address) {
-        const nhex = selectedNullifierHash || fieldToBytes32(note.nullifierHash);
-        await markNoteSpent(address, nhex, noteKey);
-        setSavedNotes((prev) => prev.filter((n) => n.nullifierHash !== selectedNullifierHash));
-      }
     } catch (err) {
       setStatus("error");
       setErrorMsg(err instanceof Error ? err.message : "Unknown error");
@@ -763,6 +782,29 @@ export function WithdrawForm({ onStatusChange }: { onStatusChange?: (s: Withdraw
             <span className="font-mono text-zinc-300">{forwardedTo.slice(0, 10)}...{forwardedTo.slice(-6)}</span>
           </p>
           <p className="text-zinc-600">Stealth key destroyed after use — not linkable to your deposit address.</p>
+        </div>
+      )}
+
+      {status === "done" && forwardFailKey && (
+        <div className="border border-amber-700 rounded-lg p-4 bg-amber-950/20 space-y-3 text-xs">
+          <p className="text-sm text-amber-400 font-medium">Withdrawal succeeded — manual recovery needed</p>
+          <p className="text-zinc-400">
+            Your ETH was withdrawn from the pool but the auto-forward to your wallet failed.
+            Your funds are sitting on a one-time stealth address. Import the key below into MetaMask to access them.
+          </p>
+          <div className="space-y-1">
+            <p className="text-zinc-500">Stealth private key (import to MetaMask):</p>
+            <div className="flex items-start gap-2">
+              <span className="font-mono text-amber-300 text-xs break-all leading-relaxed">{forwardFailKey}</span>
+              <button
+                onClick={() => navigator.clipboard.writeText(forwardFailKey)}
+                className="shrink-0 text-indigo-400 hover:text-indigo-300 underline whitespace-nowrap"
+              >
+                Copy
+              </button>
+            </div>
+          </div>
+          <p className="text-red-400 font-medium">Delete this key from your clipboard after importing it.</p>
         </div>
       )}
     </div>

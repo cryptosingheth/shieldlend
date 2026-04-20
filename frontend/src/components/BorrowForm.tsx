@@ -433,13 +433,15 @@ export function BorrowForm() {
 
       if (balance > 0n) {
         const gasPrice = await publicClient.getGasPrice();
-        // Add a 20% gas price buffer so the forward doesn't fail if price ticks up
         const bufferedGasPrice = gasPrice + gasPrice / 5n;
-        const gasCost = bufferedGasPrice * 21000n;
+        // Base L2 charges an L1 data fee on top of L2 gas — not in getGasPrice().
+        // Reserve 10B wei extra to cover it (observed ~910M wei on Base Sepolia).
+        const L1_DATA_FEE_RESERVE = 10_000_000_000n;
+        const gasCost = bufferedGasPrice * 21000n + L1_DATA_FEE_RESERVE;
         const sendAmount = balance > gasCost ? balance - gasCost : 0n;
         if (sendAmount > 0n) {
           await stealthClient.sendTransaction({
-            to:       address as Address,  // forward to connected MetaMask wallet
+            to:       address as Address,
             value:    sendAmount,
             gas:      21000n,
             gasPrice: bufferedGasPrice,
