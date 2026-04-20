@@ -135,7 +135,9 @@ export function DepositForm() {
     } catch (err) {
       setStatus("error");
       setErrorMsg(err instanceof Error ? err.message : "Unknown error");
-      setNoteDisplay(null);
+      // Do NOT clear noteDisplay — if the relay step failed after the user already
+      // sent ETH to the relay, this note is the only evidence of the commitment.
+      // Keep it visible so the user can copy it for manual recovery.
     }
   }
 
@@ -234,11 +236,13 @@ export function DepositForm() {
         </p>
       )}
 
-      {/* Show note while tx is in-flight — user should back it up now */}
+      {/* Show note while tx is in-flight OR if the relay step failed (ETH may be in relay) */}
       {noteDisplay && status !== "done" && (
-        <div className="border border-amber-800 rounded-lg p-4 bg-amber-950/30">
-          <p className="text-amber-400 text-xs font-semibold mb-2 uppercase tracking-wider">
-            Back up your note now — waiting for confirmation
+        <div className={`border rounded-lg p-4 ${status === "error" ? "border-red-800 bg-red-950/20" : "border-amber-800 bg-amber-950/30"}`}>
+          <p className={`text-xs font-semibold mb-2 uppercase tracking-wider ${status === "error" ? "text-red-400" : "text-amber-400"}`}>
+            {status === "error"
+              ? "Relay failed — copy this note immediately"
+              : "Back up your note now — waiting for confirmation"}
           </p>
           <textarea
             readOnly
@@ -247,8 +251,9 @@ export function DepositForm() {
                        border border-zinc-800 rounded p-2 focus:outline-none"
           />
           <p className="text-xs text-zinc-500 mt-2">
-            Copy this note before the transaction confirms. It will be auto-saved to your vault
-            once confirmed.
+            {status === "error"
+              ? "Your ETH may be in the relay. Save this note — it contains your commitment and can be used to retry or recover."
+              : "Copy this note before the transaction confirms. It will be auto-saved to your vault once confirmed."}
           </p>
         </div>
       )}
