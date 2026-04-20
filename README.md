@@ -8,16 +8,43 @@ Built for the **Colosseum Frontier Hackathon 2026**.
 
 ## The Problem
 
-Every on-chain lending protocol leaks information:
+On-chain lending has a fundamental privacy problem — and it is not just about hiding amounts.
+
+Every interaction with a lending protocol creates a permanent, public record that an observer can use to build a profile of a user:
 
 | Observable data | What it reveals |
 |---|---|
-| Deposit transaction | Depositor's wallet and amount |
-| Loan disbursement | Borrower's wallet and loan size |
-| Repayment transaction | Borrower's identity |
-| Withdrawal | Links depositor to withdrawal destination |
+| Deposit transaction | Depositor's wallet, amount, and timing |
+| Loan disbursement | Borrower's wallet, loan size, and collateral |
+| Repayment transaction | Confirmation that a wallet is a borrower |
+| Withdrawal | Links the depositor's wallet to a withdrawal destination |
 
-ShieldLend makes none of this observable.
+This matters for individuals who want financial privacy, for institutions that cannot reveal their treasury positions on-chain, and for anyone whose on-chain credit history should not be public record.
+
+Existing privacy tools address one layer at a time: mixers hide amounts but not identities; stealth addresses hide destinations but not deposits; ZK proofs hide which commitment was spent but not who authorized the relay. ShieldLend addresses all four layers simultaneously.
+
+---
+
+## Design Philosophy
+
+Privacy in DeFi is not a feature — it is a stack.
+
+A protocol that hides withdrawal destinations but not deposit origins is broken. A protocol that encrypts balances but leaves signing keys exposed to a single operator is broken. ShieldLend treats each privacy dimension as an independent layer, designed so that each layer holds even if another is weakened:
+
+- **Execution privacy** (Layer 1 — MagicBlock PER): *Who* deposited is hidden. Deposits execute inside an Intel TDX enclave. No observer can link a user's wallet to a specific commitment in the pool.
+- **Authorization privacy** (Layer 2 — IKA dWallet): *Who authorized* each operation is hidden behind 2PC-MPC. No single operator key exists. Loan disbursements require both program-gated LTV validation AND IKA MPC consensus.
+- **Data privacy** (Layer 3 — Encrypt FHE): *How much* was borrowed is hidden. Loan balances and interest are stored as FHE ciphertext accounts. Interest accrues homomorphically — validators compute on encrypted values.
+- **Address privacy** (Layer 4 — Umbra SDK): *Where* funds went is hidden. Every output — withdrawal destinations and loan disbursements — routes to a one-time Umbra stealth address with no prior chain history.
+
+Defense-in-depth: if any single layer is analyzed, the others still protect the user.
+
+---
+
+## Protocol Selection
+
+Every protocol in ShieldLend's stack was chosen to close a specific privacy gap that no other tool addressed. The design started from privacy requirements and worked backwards to protocols — not the other way around.
+
+The component-to-protocol mapping tables below show this gap → choice relationship for every function in the protocol. For the full decision rationale (alternatives considered, tradeoffs evaluated), see [`docs/DESIGN_DECISIONS.md`](docs/DESIGN_DECISIONS.md).
 
 ---
 
@@ -315,11 +342,11 @@ shieldlend-solana/
 
 ## Hackathon Tracks
 
-| Track | Prize | Submission deadline | Why ShieldLend qualifies |
-|---|---|---|---|
-| IKA + Encrypt Frontier (Superteam) | $15,000 USDC | Jun 1 | dWallet relay + FutureSign + FHE ciphertext accounts + encrypted oracle |
-| Colosseum Privacy Track (MagicBlock) | $5,000 + $250K accelerator | May 27 | PER deposit batching + VRF shuffle + Session Keys + Magic Actions + ER liquidation |
-| Umbra Side Track (Frontier) | $10,000 USDC | May 26 | Umbra SDK powers ALL output addresses; payroll integration use case |
+| Track | Sponsor | ShieldLend implements |
+|---|---|---|
+| IKA + Encrypt Frontier | Superteam | dWallet relay + FutureSign + FHE ciphertext accounts + encrypted oracle |
+| Colosseum Privacy Track | MagicBlock | PER deposit batching + VRF shuffle + Session Keys + Magic Actions + ER liquidation |
+| Umbra Side Track | Frontier | Umbra SDK powers all output addresses; payroll integration use case |
 
 These tracks address orthogonal privacy dimensions — no overlap, fully complementary.
 

@@ -1,4 +1,4 @@
-# ShieldLend — Hackathon Submission Guide
+# ShieldLend — Hackathon Track Integrations
 
 **Event**: Colosseum Frontier Hackathon 2026
 
@@ -8,15 +8,15 @@ ShieldLend targets three tracks simultaneously. Each track covers an orthogonal 
 
 ## Track Overview
 
-| Track | Sponsor | Prize | Deadline | Privacy layer |
-|---|---|---|---|---|
-| IKA + Encrypt Frontier | Superteam | $15,000 USDC | Jun 1 | Authorization + data confidentiality |
-| Colosseum Privacy Track | MagicBlock | $5,000 + $250K accelerator | May 27 | Execution environment + randomness + UX |
-| Umbra Side Track | Frontier | $10,000 USDC | May 26 | Output address privacy |
+| Track | Sponsor | ShieldLend implements |
+|---|---|---|
+| IKA + Encrypt Frontier | Superteam | dWallet relay + FutureSign liquidation + FHE ciphertext accounts + encrypted oracle |
+| Colosseum Privacy Track | MagicBlock | PER deposit batching + VRF shuffle + Session Keys + Magic Actions + ER liquidation bot |
+| Umbra Side Track | Frontier | Umbra SDK for all output addresses (withdrawals + loan disbursements) + payroll integration |
 
 ---
 
-## Track 1 — IKA + Encrypt Frontier ($15,000 USDC)
+## Track 1 — IKA + Encrypt Frontier
 
 ### Track theme
 "Bridgeless Capital Markets + Encrypted Capital Markets"
@@ -61,7 +61,7 @@ IKA provides signing authorization infrastructure. Encrypt provides FHE computat
 
 ---
 
-## Track 2 — Colosseum Privacy Track — MagicBlock ($5,000 + $250K accelerator)
+## Track 2 — Colosseum Privacy Track — MagicBlock
 
 ### Track theme
 "Privacy infrastructure for DeFi — execution environment, randomness, and session UX"
@@ -105,7 +105,7 @@ Integration: `#[delegate]` on health monitor state; liquidation instruction disp
 
 ---
 
-## Track 3 — Umbra Side Track ($10,000 USDC)
+## Track 3 — Umbra Side Track
 
 ### Track theme
 "Stealth addresses as the unified output privacy layer for DeFi"
