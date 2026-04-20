@@ -11,8 +11,12 @@ import { useNoteKey } from "@/lib/noteKeyContext";
 import { useViewingKey } from "@/lib/viewingKeyContext";
 
 const RELAY_ADDRESS = process.env.NEXT_PUBLIC_RELAY_ADDRESS as `0x${string}`;
-// Gas limit for ShieldedPool.deposit() (Merkle insertion + event emit). Padded 2× for safety.
+// Gas limit for ShieldedPool.deposit() — actual cost ~80k, padded ~3.75× for L2 price volatility.
 const RELAY_GAS_LIMIT = 300_000n;
+// Base charges a separate L1 data fee per tx that getGasPrice() does not include.
+// Observed on testnet: ~910M wei. 10B wei gives ~11× headroom.
+// Collecting this upfront makes the relay self-sustaining across any number of deposits.
+const RELAY_L1_DATA_FEE = 10_000_000_000n;
 
 type DepositStatus = "idle" | "generating" | "sending" | "sent" | "relaying" | "confirming" | "done" | "error";
 
@@ -34,7 +38,7 @@ export function DepositForm() {
     if (!amountEth || !publicClient) { setGasBuffer(0n); return; }
     let cancelled = false;
     publicClient.getGasPrice().then((gasPrice) => {
-      if (!cancelled) setGasBuffer(gasPrice * RELAY_GAS_LIMIT);
+      if (!cancelled) setGasBuffer(gasPrice * RELAY_GAS_LIMIT + RELAY_L1_DATA_FEE);
     }).catch(() => { if (!cancelled) setGasBuffer(0n); });
     return () => { cancelled = true; };
   }, [amountEth, publicClient]);
@@ -70,7 +74,7 @@ export function DepositForm() {
       // amount is the deposit; gasBuffer is pre-paid relay fee.
       setStatus("sending");
       const currentGasPrice = await publicClient.getGasPrice();
-      const currentGasBuffer = currentGasPrice * RELAY_GAS_LIMIT;
+      const currentGasBuffer = currentGasPrice * RELAY_GAS_LIMIT + RELAY_L1_DATA_FEE;
       const userTxHash = await sendTransactionAsync({
         to: RELAY_ADDRESS,
         value: amount + currentGasBuffer,
@@ -182,7 +186,7 @@ export function DepositForm() {
             <span className="font-mono text-zinc-300">{amountEth} ETH</span>
           </div>
           <div className="flex justify-between">
-            <span>Relay fee (gas estimate)</span>
+            <span>Relay fee (L2 gas + L1 data fee)</span>
             <span className="font-mono text-zinc-400">
               {gasBuffer > 0n ? `~${parseFloat(formatEther(gasBuffer)).toFixed(7)} ETH` : "estimating..."}
             </span>
