@@ -415,5 +415,38 @@ This is only possible because all shards share the same `vkHash` (ADR-06, ADR-15
 
 ---
 
-*Last updated: Session 8 / V2B post-audit — 2026-04-19*  
+### ADR-29: Reserve Base L1 data fee in stealth auto-forward gas calculation
+
+**Status**: Decided  
+**When**: Session 9 / V2B bug fix  
+**Decision**: When computing the ETH amount to forward from a stealth address, add a fixed `L1_DATA_FEE_RESERVE = 10_000_000_000n` (10 billion wei) to the `gasCost` in addition to the 20% buffered L2 gas cost.  
+**Alternatives considered**: (a) No L1 fee reserve (ADR-28 state) — failed in every browser test: browser reported "have 1000000000000000 want 1000000910355150" — deficit is exactly 910,355,150 wei, matching the L1 data fee charged by the Base sequencer. (b) Dynamic L1 fee via `OptimismPortal.getL1Fee()` — accurate but requires an additional RPC call and the ABI; overkill for a single 21000-gas transfer. (c) EIP-1559 `maxFeePerGas` — only covers L2 fee volatility, not the separate L1 calldata posting fee. (d) Larger L2 gas buffer — cannot solve the problem because `getGasPrice()` is structurally unaware of the L1 data fee.  
+**Rationale**: Base is an L2 that posts calldata to Ethereum L1. Every transaction on Base incurs two fees: (1) the L2 execution fee returned by `getGasPrice()`, and (2) an L1 data fee charged by the sequencer for writing the calldata to Ethereum (~910M wei on Base Sepolia for a 21000-gas ETH transfer). The L1 fee is not included in `getGasPrice()`. Computing `sendAmount = balance - L2gasCost` and then submitting a tx whose total cost is `L2gasCost + L1fee` means `balance - sendAmount = L2gasCost < L2gasCost + L1fee` → always fails. A fixed reserve of 10B wei was chosen as ~10× the observed 910M wei L1 fee — providing a safety margin without wasting meaningfully more ETH than the buffer from ADR-28.  
+**Consequences**: Maximum unrecoverable ETH on stealth address rises from ~4200 gwei (ADR-28 L2 buffer) to ~4200 gwei + 10B wei ≈ 0.00001 ETH per withdrawal/borrow at typical gas. Still negligible on testnet. On mainnet, a dynamic `getL1Fee()` call would be preferable; tracked as a future improvement.
+
+---
+
+### ADR-30: Move markNoteSpent before the auto-forward attempt
+
+**Status**: Decided  
+**When**: Session 9 / V2B bug fix  
+**Decision**: Call `markNoteSpent(address, nullifierHash, noteKey)` immediately after the on-chain `withdraw()` transaction confirms, BEFORE the auto-forward attempt and outside the auto-forward try/catch block.  
+**Alternatives considered**: (a) Call after successful auto-forward (prior state) — caused a split-brain state: nullifier spent on-chain but note still appeared as withdrawable in the UI. If the user retried, the on-chain call would revert with "nullifier already used" but the UI would not explain why. (b) Keep track via a separate "forward_failed" status flag — adds state without solving the underlying split-brain. (c) Rely on on-chain nullifier check at withdraw time to prevent double-spend — correct for contract security, but does not fix the UX confusion.  
+**Rationale**: The withdrawal succeeded the moment the on-chain tx confirms — the note's nullifier is spent regardless of whether the auto-forward succeeds. Keeping the note as "withdrawable" in local storage after that point is incorrect: any retry attempt will always fail on-chain (nullifier double-spend), and the note will appear to be stuck rather than withdrawn. Marking it spent immediately after the on-chain confirmation is the only state that is always consistent with on-chain truth.  
+**Consequences**: If the auto-forward fails, the user sees a recovery panel (ADR-31) rather than a confusingly unspent note. The note is correctly hidden from the UI. No risk of accidental double-spend retry.
+
+---
+
+### ADR-31: Stealth private key recovery panel on auto-forward failure
+
+**Status**: Decided  
+**When**: Session 9 / V2B bug fix  
+**Decision**: If the stealth auto-forward fails (caught in a separate try/catch block), store the stealth private key in `forwardFailKey` React state and render a recovery panel in the UI showing the key with a "Copy" button and instructions to import into MetaMask.  
+**Alternatives considered**: (a) Discard key silently and set status to "done" — user has no way to access funds from the stealth address; ETH is stuck permanently (key is derived deterministically but requires the ephemeralPublicKey that is not stored). (b) Retry auto-forward automatically — risk of an infinite retry loop; underlying cause (L1 fee, balance mismatch) is not self-correcting. (c) Store the key in localStorage for later recovery — unnecessary complexity; the key should only exist in memory and be destroyed after import.  
+**Rationale**: The withdrawal is already irreversible once on-chain. If the forward fails, the only safe path is to give the user access to the funds. The stealth private key is the minimum viable recovery artifact: import to MetaMask → access the ETH. It must not be stored persistently (localStorage, server) because that creates a durable copy of a private key which is a security risk. Displaying it on screen with a "Copy" button and a deletion reminder is the minimal footprint approach.  
+**Consequences**: Users are never left with silently inaccessible funds after a successful withdrawal. The recovery panel is shown only when needed and does not change the happy-path UX. The panel includes a warning to delete the key from clipboard after import.
+
+---
+
+*Last updated: Session 9 / V2B bug fix — 2026-04-20*  
 *Next update: auto-appended at end of next session with design changes (see CLAUDE.md)*
