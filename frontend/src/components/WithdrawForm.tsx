@@ -96,7 +96,7 @@ type WithdrawStatus = "idle" | "flushing" | "fetching-path" | "proving" | "zkver
 export function WithdrawForm({ onStatusChange }: { onStatusChange?: (s: WithdrawStatus) => void }) {
   const { address } = useAccount();
   const publicClient = usePublicClient();
-  const { noteKey } = useNoteKey();
+  const { noteKey, isUnlocked, isUnlocking, unlock } = useNoteKey();
   const { stealthMetaAddressURI, spendingPrivateKey, viewingPrivateKey, isLoaded: stealthKeysLoaded, loadKeys } = useStealthKey();
 
   const { lastEpochBlock, epochBlocks } = useEpochStatus();
@@ -579,6 +579,18 @@ export function WithdrawForm({ onStatusChange }: { onStatusChange?: (s: Withdraw
     <div className="space-y-5">
       <div>
         <label className="block text-sm text-zinc-400 mb-2">Note (from deposit)</label>
+        {!isUnlocked && (
+          <div className="flex items-center gap-3 mb-3 p-3 rounded-lg border border-zinc-700 bg-zinc-900/50">
+            <span className="text-xs text-zinc-400 flex-1">Vault locked — sign to load saved notes</span>
+            <button
+              onClick={unlock}
+              disabled={isUnlocking}
+              className="text-xs px-3 py-1.5 rounded-md bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 transition-colors"
+            >
+              {isUnlocking ? "Signing…" : "Unlock vault"}
+            </button>
+          </div>
+        )}
         {savedNotes.length > 0 && (
           <select
             value={selectedNullifierHash}
