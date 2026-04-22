@@ -51,52 +51,117 @@ The component-to-protocol mapping tables below show this gap → choice relation
 
 ## Architecture
 
-ShieldLend is four sequential privacy protections over a single Anchor program core.
+### Programs
+
+ShieldLend is three Anchor programs. All SOL stays in one place. The other two programs only keep state.
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  shielded_pool                                               │
+│  Holds ALL SOL. Poseidon Merkle tree (depth 24, ~16M leaves) │
+│  Verifies Groth16 withdrawal proofs. Releases SOL on exit.   │
+└──────────────────────┬───────────────────────────────────────┘
+                       │ CPI
+┌──────────────────────▼───────────────────────────────────────┐
+│  lending_pool                                                │
+│  Zero SOL custody — accounting only.                         │
+│  Kamino klend fork (poly-linear 11-point interest model).    │
+│  Verifies collateral + repay proofs. Manages LoanAccount PDAs│
+└──────────────────────┬───────────────────────────────────────┘
+                       │ CPI
+┌──────────────────────▼───────────────────────────────────────┐
+│  nullifier_registry                                          │
+│  Shared state between both programs.                         │
+│  PDA per nullifier: Active → Locked (borrow) → Spent (exit)  │
+└──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Transaction Lifecycle
+
+Every user journey starts with a deposit. A deposited note can then be withdrawn or used as collateral to borrow. After borrowing, the note is locked until the loan is repaid or liquidated.
+
+```
+                    ┌─────────────────────────────────┐
+                    │  User has SOL                   │
+                    └────────────────┬────────────────┘
+                                     │
+                                  DEPOSIT
+                         IKA relay → PER enclave
+                         → Commitment in Merkle tree
+                         → Encrypted note saved locally
+                                     │
+                    ┌────────────────▼────────────────┐
+                    │  Note (secret + nullifier)      │
+                    │  Status: Active                 │
+                    └──────────┬──────────────────────┘
+                               │
+               ┌───────────────┴───────────────┐
+               │                               │
+           WITHDRAW                          BORROW
+     ZK ring proof                    ZK collateral proof
+     Nullifier: Active→Spent          Nullifier: Active→Locked
+     SOL → PER exit → stealth         SOL → PER exit → stealth
+                                               │
+                                  ┌────────────▼───────────────┐
+                                  │  Active Loan               │
+                                  │  LoanAccount PDA created   │
+                                  │  IKA FutureSign stored     │
+                                  └──────────┬─────────────────┘
+                                             │
+                              ┌──────────────┴──────────────┐
+                              │                             │
+                            REPAY                      LIQUIDATE
+                    ZK repay proof               IKA FutureSign triggers
+                    Nullifier: Locked→Active      Nullifier: Locked→Spent
+                    LoanAccount closed            LoanAccount closed
+                              │
+                    ┌─────────▼─────────────┐
+                    │  Note back to Active  │
+                    │  → can now WITHDRAW   │
+                    └───────────────────────┘
+```
+
+---
+
+### Privacy Stack
+
+Each protocol layer closes a specific privacy gap that no other component addresses:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  USER INTERFACE (Next.js + snarkjs + Umbra SDK)             │
+│  ENTRY — Who deposited, when, which commitment              │
+│  MagicBlock PER (Intel TDX) + VRF                           │
+│  Deposits batch inside enclave before hitting Merkle tree.  │
+│  VRF dummies make real and fake commitments indistinguishable│
 └──────────────────────────┬──────────────────────────────────┘
                            │
 ┌──────────────────────────▼──────────────────────────────────┐
-│  EXIT PROTECTION — ADDRESS PRIVACY                          │
-│  Umbra SDK                                                  │
-│  All outputs (withdrawals, loan disbursements) route to     │
-│  one-time stealth addresses. User spends directly.          │
-│  Address abandoned after single use.                        │
+│  RELAY — Which wallet submitted any protocol transaction     │
+│  IKA dWallet (2PC-MPC)                                      │
+│  All on-chain signers are the relay wallet, never the user.  │
+│  No single key exists. User + IKA MPC both required.        │
 └──────────────────────────┬──────────────────────────────────┘
                            │
 ┌──────────────────────────▼──────────────────────────────────┐
-│  STATE PROTECTION — ON-CHAIN DATA                           │
+│  SPEND — Which commitment was withdrawn or used as collateral│
+│  Groth16 ring proofs (K=16 + VRF dummies)                   │
+│  Proves ownership without revealing index. 1-of-16 minimum. │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────┐
+│  EXIT — Where funds went, which type of exit occurred       │
+│  MagicBlock PER exit batch + Umbra SDK stealth addresses     │
+│  Withdrawals and borrow disbursements batch together.        │
+│  Each destination is a fresh ECDH-derived one-time address.  │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────┐
+│  ORACLE — Liquidation price data readable in mempool         │
 │  Encrypt FHE                                                │
-│  Oracle price feeds submitted as FHE ciphertexts.           │
-│  Health factor computed homomorphically — MEV-resistant.    │
-│  Aggregate solvency via homomorphic sum. Threshold          │
-│  decryption for targeted compliance disclosure.             │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────┐
-│  RELAY PROTECTION — TRANSACTION ROUTING                     │
-│  IKA dWallet                                                │
-│  All operations submitted by relay wallet, not user.        │
-│  2PC-MPC: no single key. Disbursements require on-chain     │
-│  LTV + IKA MPC consensus. FutureSign enables trustless      │
-│  pre-authorized liquidation. Unified exit path mixes        │
-│  withdrawals and borrow disbursements indistinguishably.    │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────┐
-│  ENTRY PROTECTION — EXECUTION PRIVACY                       │
-│  MagicBlock PER + VRF                                       │
-│  Deposits and exits batch inside Intel TDX enclave.         │
-│  VRF-randomized dummy insertions enlarge anonymity set.     │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────┐
-│  CORE PROGRAMS                                              │
-│  shielded_pool · lending_pool (Kamino fork) ·               │
-│  nullifier_registry                                         │
-│  groth16-solana · Poseidon hash · Anchor PDAs               │
+│  Price feeds as ciphertexts. Health factor computed          │
+│  homomorphically. MEV bots cannot front-run liquidations.   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -125,9 +190,11 @@ No observer can connect the depositor's wallet to the withdrawal destination.
 3. User sends proof to the **IKA relay** (off-chain). Relay submits the withdrawal transaction on-chain — relay wallet is the signer, not the user's wallet.
 4. `groth16-solana` verifies the proof on-chain (< 200k compute units). SOL released from ShieldedPool to relay.
 5. The exit is queued in **MagicBlock PER** alongside other withdrawals and borrow disbursements. PER flushes the batch to respective **Umbra stealth addresses**.
-6. User derives the private key for their stealth address via Umbra SDK and spends directly — no forwarding to a main wallet needed.
+6. User derives the private key for their stealth address via Umbra SDK and imports it into Phantom or Solflare — the stealth address is a standard Solana wallet. SOL can be spent from it directly, just like any other wallet.
 
-The ring proof hides *which* commitment was spent. Relay routing hides *who* submitted the proof. The stealth address hides *where* the funds went.
+**Why no auto-forward to the main wallet:** forwarding from stealth address → main wallet would create an on-chain link between the two, permanently undoing the exit privacy. The Umbra stealth address IS the user's receiving wallet for this operation — it has a full Solana private key, derived once via ECDH. There is no friction beyond importing that key. Users can continue to use the stealth address for any on-chain activity or re-deposit into ShieldLend for continued privacy.
+
+The ring proof hides *which* commitment was spent. Relay routing hides *who* submitted the proof. The stealth address hides *where* the funds went. No auto-forward preserves all three.
 
 ### Borrow
 
@@ -153,265 +220,249 @@ Repayment does not reveal the borrower's identity or the repayment amount.
 
 ---
 
-## Detailed Privacy Flow Diagrams
+## Flow Diagrams
 
-The diagrams below trace each operation step-by-step, showing exactly which data is visible to an on-chain observer at each stage, why each component is present, and what privacy property it closes.
+The diagrams below trace each operation step-by-step. Teal nodes indicate where a privacy property is actively being enforced. Rendered by GitHub's native Mermaid support.
+
+### Overall Transaction Journey
+
+```mermaid
+flowchart TD
+    classDef privacy fill:#0d9488,stroke:#134e4a,color:#fff
+    classDef actor fill:#1e293b,stroke:#0f172a,color:#fff
+
+    User([User Browser]):::actor
+    Relay([IKA Relay]):::actor
+    PER([MagicBlock PER]):::actor
+    Pool([ShieldedPool]):::actor
+    Lend([LendingPool]):::actor
+    Null([NullifierRegistry]):::actor
+    Umbra([Umbra Stealth Address]):::actor
+
+    User -->|SOL + commitment| Relay
+    Relay --> PER
+    PER -->|batched TX| Pool
+    Pool --> Note[Note saved locally]
+
+    Note --> Choice{Use note}
+    Choice -->|Withdraw| W[Ring proof]
+    Choice -->|Borrow| B[Collateral proof]
+
+    W --> WNull[Nullifier: Active → Spent]:::privacy
+    WNull --> WExit[PER exit batch]:::privacy
+    WExit --> Umbra
+
+    B --> LockA[Nullifier: Active → Locked]:::privacy
+    LockA --> Loan[LoanAccount PDA]
+    Loan --> BExit[PER exit batch]:::privacy
+    BExit --> Umbra
+
+    Loan --> Status{Loan status}
+    Status -->|Repay| Unlock[Nullifier: Locked → Active]:::privacy
+    Unlock --> Note
+    Status -->|Liquidate| Spent[Nullifier: Locked → Spent]:::privacy
+    Spent --> Closed([Loan Closed])
+```
+
+---
 
 ### Flow 1: Deposit
 
-```
-USER BROWSER
-│
-│  Generates: (secret, nullifier, denomination) — stays in browser WASM
-│  Computes:  commitment = Poseidon(secret, nullifier, denomination)
-│  Stores:    AES-256-GCM encrypted note → local vault
-│
-│  TX1: user wallet → IKA relay (SOL transfer, on-chain)
-│       Observer sees: "wallet sent SOL to relay address"
-│       Observer does not see: which commitment, that this is ShieldLend
-│
-▼
-IKA RELAY inside MagicBlock PER (Intel TDX Enclave)
-│
-│  Multiple users' (SOL + commitment) pairs accumulate in enclave
-│  Epoch trigger fires
-│
-│  VRF generates: n_dummies + dummy positions
-│    Dummy commitments = valid Poseidon(vrf_seed_1, vrf_seed_2, denomination)
-│    No backing SOL. Unredeemable. Structurally identical to real commitments.
-│    Remain in Merkle tree permanently as ring proof candidates.
-│
-│    WHY VRF NOT BLOCK HASH: validators can manipulate block hash to make
-│    dummy positions predictable; VRF proof included on-chain is verifiably unbiasable
-│
-│  PER submits TX2 (single batch):
-│    Signer = IKA relay wallet (not any user)
-│    Inserts: [commitment_A, commitment_B, commitment_C, dummy_1, dummy_2, ...]
-│    All simultaneously — T₁, T₂, T₃ → single T_batch
-│
-▼
-SHIELDED POOL — MERKLE TREE
-│
-│  All commitments inserted, new root posted
-│  Real and dummy commitments: visually identical on-chain
-│
-│  onAccountChange() listener in frontend detects root update →
-│  signals deposit confirmed to user
+```mermaid
+flowchart TD
+    classDef privacy fill:#0d9488,stroke:#134e4a,color:#fff
+    classDef actor fill:#1e293b,stroke:#0f172a,color:#fff
 
-PRIVACY AT DEPOSIT:
-  Who deposited:         hidden — relay is TX2 signer
-  Which commitment:      hidden — N users + dummies batch, no T₁→commit mapping
-  Anonymity set:         expanded — VRF dummies permanently in ring candidate pool
-  Denomination class:    visible (required by ZK circuit design — accepted)
+    subgraph Browser[User Browser]
+        G1[Generate secret, nullifier, denomination]
+        G2[commitment = Poseidon hash]
+        G3[AES-256-GCM encrypt note]
+        G4[Save to local vault]
+        G1 --> G2 --> G3 --> G4
+    end
+
+    subgraph RelaySG[IKA Relay]
+        R1[TX1: receive SOL]
+        R2[Queue deposit]
+        R1 --> R2
+    end
+
+    subgraph PERSG[MagicBlock PER — Intel TDX Enclave]
+        P1[Accumulate deposits from multiple users]
+        P2[VRF: generate dummy commitments]
+        P3[VRF: shuffle insertion positions]
+        P4[Build single batch]
+        P1 --> P2 --> P3 --> P4
+    end
+
+    subgraph Chain[On-Chain]
+        C1[TX2: ShieldedPool batch insert]
+        C2[Merkle tree updated — new root]
+        C1 --> C2
+    end
+
+    U([User]):::actor
+    U --> G1
+    G4 --> R1
+    R2 --> P1
+    P4 --> C1
+    C2 --> Done([onAccountChange fires — deposit confirmed])
+
+    TxUnlink[TX1 and TX2 not linked]:::privacy
+    R1 -.-> TxUnlink
+    C1 -.-> TxUnlink
 ```
 
 ---
 
 ### Flow 2: Withdrawal
 
-```
-USER BROWSER
-│
-│  Loads note: (secret, nullifier, denomination) from AES-256-GCM vault
-│  Fetches Merkle root, builds ring of K=16 commitments from pool
-│    Ring includes: own commitment + 15 others, including VRF dummies
-│    (VRF dummies inserted at deposit time are already in the tree)
-│
-│  Generates Groth16 ring proof (snarkjs WASM, ~1.2s):
-│    PRIVATE: secret, nullifier, denomination, Merkle path[24], ring_index
-│    PUBLIC:  ring[16], nullifierHash, root, denomination_out
-│
-│  Sends proof + Umbra stealth meta-address to IKA relay (off-chain)
-│
-│    WHY WITHDRAWAL GOES THROUGH RELAY:
-│      Direct on-chain submission makes the user's wallet the transaction signer.
-│      The chain permanently records: "wallet_X submitted a ring proof
-│      with ring = [c₁...c₁₆]" — linking wallet_X to 16 ring candidates.
-│      Relay routing makes the relay wallet the signer for both deposits
-│      and withdrawals — both flows are indistinguishable on-chain.
-│
-▼
-IKA RELAY submits on-chain (relay wallet = signer)
-│
-│  shielded_pool::withdraw instruction
-│
-▼
-ON-CHAIN
-│
-│  groth16_solana::verify — ring proof verified atomically with fund release
-│  nullifier_registry::mark_spent(nullifierHash) — double-spend prevention
-│  ShieldedPool releases SOL → IKA relay account
-│
-▼
-IKA RELAY / PER — EXIT BATCH
-│
-│  This withdrawal exit queued alongside borrow disbursement exits
-│  All exits: same source (relay), same destination format (Umbra stealth)
-│  PER batch flushes → each exit sent to its respective stealth address
-│
-│    WHY EXITS ALSO BATCH THROUGH PER:
-│      Withdrawal and borrow disbursement exits are structurally identical
-│      in the batch. Observer sees: "relay sent SOL to stealth addresses"
-│      Cannot classify: withdrawal vs. borrow disbursement
-│
-▼
-UMBRA STEALTH ADDRESS
-│
-│  Fresh one-time ECDH-derived address — zero prior chain history
-│  Only recipient can derive private key (from stealth meta-address)
-│  User spends directly from stealth address
-│
-│  onAccountChange() detects state update → frontend derives stealth key + shows balance
+```mermaid
+flowchart TD
+    classDef privacy fill:#0d9488,stroke:#134e4a,color:#fff
+    classDef actor fill:#1e293b,stroke:#0f172a,color:#fff
 
-PRIVACY AT WITHDRAWAL:
-  Who submitted ring proof:   hidden — relay is on-chain signer
-  Which commitment was spent: hidden — ring proof 1-of-16
-  Withdrawal destination:     hidden — Umbra stealth (fresh, no history)
-  Exit type classification:   hidden — same batch path as borrow disbursements
-  NullifierHash:              visible (necessary for double-spend prevention, one-way)
-  Denomination class:         visible (necessary — contract must know release amount)
+    subgraph Browser[User Browser]
+        B1[Load note from vault]
+        B2[Fetch Merkle root]
+        B3[Build ring K=16 incl. VRF dummies]
+        B4[snarkjs Groth16 proof ~1.2s]
+        B1 --> B2 --> B3 --> B4
+    end
+
+    subgraph RelaySG[IKA Relay — off-chain receipt]
+        R1[Receive proof + stealth meta-address]
+        R2[Submit withdraw tx — relay is signer]:::privacy
+        R1 --> R2
+    end
+
+    subgraph Chain[On-Chain]
+        C1[groth16-solana verify]
+        C2{Proof valid?}
+        C3[Nullifier: Active → Spent]:::privacy
+        C4[SOL released from ShieldedPool]
+        C1 --> C2
+        C2 -->|yes| C3 --> C4
+        C2 -->|no| Rej([Rejected])
+    end
+
+    subgraph PERSG[MagicBlock PER — exit batch]
+        P1[Queue alongside borrow disbursements]:::privacy
+        P2[Flush batch to stealth addresses]
+        P1 --> P2
+    end
+
+    U([User]):::actor
+    Um([Umbra Stealth Address]):::actor
+
+    U --> B1
+    B4 --> R1
+    R2 --> C1
+    C4 --> P1
+    P2 --> Um
+    Um --> End([User imports key into Phantom / Solflare])
+
+    RingPr[Ring proof hides which commitment]:::privacy
+    B4 -.-> RingPr
 ```
 
 ---
 
 ### Flow 3: Borrow
 
-```
-USER BROWSER
-│
-│  Loads collateral note: (secret, nullifier, denomination)
-│  Chooses borrow amount — this is a ZK public input, visible on-chain
-│    (required: verifier must bind the LTV claim to the actual disbursement amount)
-│
-│  Generates Groth16 collateral ring proof (snarkjs WASM):
-│    PRIVATE: secret, nullifier, denomination, Merkle path[24], ring_index
-│    PUBLIC:  ring[16], nullifierHash, root, borrowed, minRatioBps
-│    CIRCUIT: denomination × 10000 ≥ borrowed × minRatioBps (LTV check in-circuit)
-│
-│  VRF dummies already in Merkle tree from deposit time →
-│  ring[16] naturally includes dummy commitments as candidates
-│
-│  Sends proof + borrow amount + Umbra stealth address to IKA relay (off-chain)
-│
-▼
-IKA RELAY submits on-chain (relay wallet = signer)
-│
-│  lending_pool::borrow instruction
-│
-▼
-ON-CHAIN
-│
-│  groth16_solana::verify — collateral proof verified
-│  nullifier_registry: Active → Locked (note held as collateral, not spent)
-│  LoanAccount PDA created: stores nullifierHash + loan terms
-│
-│  IKA dWallet co-signs disbursement:
-│    On-chain LTV verification (ZK proof) AND IKA MPC network approval
-│    Both required — neither party can disburse alone
-│
-│  IKA FutureSign stored:
-│    Borrower pre-authorizes: "liquidate loan X if health_factor < Y"
-│    Stored at borrow time. Borrower cannot block a valid liquidation later.
-│    Operator cannot execute without the health factor condition being met.
-│
-│  ShieldedPool releases SOL → IKA relay account
-│
-▼
-IKA RELAY / PER — EXIT BATCH (same path as withdrawal)
-│
-│  Disbursement queued alongside withdrawal exits
-│  Observer: "relay sent SOL to stealth address" — same as withdrawal
-│  PER batch flush → SOL to Umbra stealth address
-│
-▼
-UMBRA STEALTH ADDRESS (borrow recipient)
-│
-│  Fresh one-time address — borrower's wallet never appears on-chain
-│  User spends directly from stealth address
+```mermaid
+flowchart TD
+    classDef privacy fill:#0d9488,stroke:#134e4a,color:#fff
+    classDef actor fill:#1e293b,stroke:#0f172a,color:#fff
 
-PRIVACY AT BORROW:
-  Borrower wallet:          hidden — ZK private input + relay signer
-  Which collateral note:    hidden — ring proof 1-of-16 (VRF dummies in ring)
-  Disbursement destination: hidden — Umbra stealth address
-  Borrow vs withdrawal:     hidden — same relay exit path + PER batch
-  Borrow amount:            visible (ZK public input — accepted)
-  That a borrow occurred:   visible (LoanAccount PDA created in tx — accepted)
+    subgraph Browser[User Browser]
+        B1[Load collateral note]
+        B2[Choose borrow amount]
+        B3{LTV satisfied?}
+        B4[Groth16 collateral proof]
+        B5[Generate Umbra stealth address]
+        B1 --> B2 --> B3
+        B3 -->|yes| B4 --> B5
+        B3 -->|no| Abort([Abort — LTV not met])
+    end
+
+    subgraph RelaySG[IKA Relay]
+        R1[Receive proof + stealth address]
+        R2[Submit borrow tx — relay is signer]:::privacy
+        R1 --> R2
+    end
+
+    subgraph Chain[On-Chain]
+        C1[groth16-solana verify collateral proof]
+        C2[Nullifier: Active → Locked]:::privacy
+        C3[LoanAccount PDA created]
+        C4[IKA dWallet co-sign disbursement]
+        C5[IKA FutureSign liquidation stored]
+        C1 --> C2 --> C3 --> C4 --> C5
+    end
+
+    subgraph PERSG[MagicBlock PER — exit batch]
+        P1[Queue alongside withdrawal exits]:::privacy
+        P2[Flush — exit type indistinguishable]:::privacy
+        P1 --> P2
+    end
+
+    U([User]):::actor
+    Um([Umbra Stealth Address]):::actor
+
+    U --> B1
+    B5 --> R1
+    R2 --> C1
+    C5 --> P1
+    P2 --> Um
+    Um --> End([Loan active — borrower wallet never on-chain])
 ```
 
 ---
 
 ### Flow 4: Repay
 
-```
-USER BROWSER
-│
-│  Loads collateral note: (secret, nullifier)
-│  Retrieves loanId (stored locally at borrow time)
-│
-│  Queries on-chain: current outstanding balance
-│    Outstanding balance = borrowed × compound(rate_history, elapsed_blocks)
-│    Kamino rate history is on-chain — program computes it at repay time
-│
-│  Generates Groth16 repay_ring proof (snarkjs WASM):
-│    PRIVATE: nullifier, repaymentAmount
-│    PUBLIC:  nullifierHash, loanId, outstanding_balance
-│    CIRCUIT: repaymentAmount ≥ outstanding_balance
-│             (sufficiency check in-circuit; repaymentAmount never on-chain)
-│
-│  Routes repayment SOL through IKA relay (same relay as deposits)
-│    Repayment traffic: indistinguishable from deposit traffic on-chain
-│
-▼
-IKA RELAY submits on-chain (relay wallet = signer)
-│
-│  lending_pool::repay instruction
-│
-▼
-ON-CHAIN
-│
-│  groth16_solana::verify — repay proof verified
-│    Confirms: repayer knows the nullifier (authorization)
-│    Confirms: repayment amount is sufficient (in-circuit, private)
-│
-│  nullifier_registry: Locked → Active
-│    Collateral note is free — can be withdrawn via standard withdrawal flow
-│
-│  LoanAccount PDA closed
+```mermaid
+flowchart TD
+    classDef privacy fill:#0d9488,stroke:#134e4a,color:#fff
+    classDef actor fill:#1e293b,stroke:#0f172a,color:#fff
 
-PRIVACY AT REPAY:
-  Repayer wallet:         hidden — relay signer + ZK private input
-  Repayment amount:       hidden — ZK private input, circuit verifies privately
-  Outstanding balance:    computed on-chain from public rate history (Kamino)
-                          — known to the contract, needed for verification
-  Repayer = borrower:     not provable on-chain — nullifier proves authorization,
-                          not wallet identity
-  Repay vs deposit:       indistinguishable via relay routing
-```
+    subgraph Browser[User Browser]
+        B1[Load note + loanId from local vault]
+        B2[Query on-chain outstanding balance]
+        B3[Compute: borrow × compound rate history]
+        B4[Groth16 repay proof]
+        B1 --> B2 --> B3 --> B4
+    end
 
----
+    subgraph RelaySG[IKA Relay]
+        R1[Receive SOL + proof]
+        R2[Submit repay tx — relay is signer]:::privacy
+        R1 --> R2
+    end
 
-### Liquidation
+    subgraph Chain[On-Chain]
+        C1[groth16-solana verify repay proof]
+        C2{repaymentAmount >= outstanding?}
+        C3[Nullifier: Locked → Active]:::privacy
+        C4[LoanAccount PDA closed]
+        C1 --> C2
+        C2 -->|yes — checked in-circuit| C3 --> C4
+        C2 -->|no| Rej([Rejected])
+    end
 
-```
-ENCRYPT FHE oracle inputs:
-│
-│  Price feed submitted as FHE ciphertext
-│  Health factor = FHE(collateral_value) / FHE(borrowed) — computed homomorphically
-│  MEV bots cannot compute breach condition from mempool ciphertext
-│
-│    WHY FHE HERE SPECIFICALLY:
-│      ZK proofs can prove a fact about a value, but cannot stream live
-│      oracle updates homomorphically. FHE is uniquely capable of allowing
-│      the health factor computation to run on a hidden, streaming value.
-│
-│  Threshold decryption (2/3 Encrypt MPC): reveals health_factor boolean only
-│
-IKA FutureSign executes:
-│  Pre-authorization from borrow time activates
-│  Collateral: Locked → Spent
-│  LoanAccount PDA closed
+    U([User]):::actor
+    U --> B1
+    B4 --> R1
+    R2 --> C1
+    C4 --> Free[Note status: Active]
+    Free --> Next([Withdraw via standard flow])
 
-PRIVACY: who was liquidated is not linkable to a wallet — loanId visible, wallet never was
+    AmtPr[Repayment amount stays private — never on-chain]:::privacy
+    B4 -.-> AmtPr
+
+    TxPr[Repayment traffic = deposit traffic on relay]:::privacy
+    R1 -.-> TxPr
 ```
 
 ---
