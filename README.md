@@ -485,15 +485,16 @@ Loan amounts are variable. The borrow amount appears as a public input to the co
 
 ## Protocol Solvency — Aggregate Without Individual Exposure
 
-ShieldLend maintains continuous solvency guarantees without revealing individual loan positions.
+ShieldLend maintains continuous solvency guarantees without revealing oracle price data or individual collateral positions.
 
-**Aggregate monitoring (always-on):** Encrypt FHE executor performs homomorphic addition across all encrypted loan balance accounts:
+**Aggregate monitoring (always-on):** Oracle price feeds are submitted as Encrypt FHE ciphertexts. Collateral values are computed homomorphically — price × denomination for each active loan — and summed without decrypting any individual position:
 ```
-total_outstanding = Σ(encrypted_loan_balance[i])   // FHE addition on ciphertexts
+total_collateral_value = Σ(FHE_price × denomination[i])   // FHE multiplication + addition
+total_outstanding      = Σ(borrow_amount[i])               // plaintext sum — borrow amounts are public
 ```
-Threshold decryption reveals ONLY the aggregate total. Individual amounts stay hidden.
+Threshold decryption reveals ONLY `total_collateral_value`. Individual collateral positions and the oracle price used for computation stay hidden. MEV bots monitoring the mempool cannot compute breach conditions from encrypted price inputs.
 
-**Targeted audit (on-demand):** For compliance disclosure of a specific loan, threshold decryption reveals that one account's balance to the auditor. Borrower identity is not revealed — only the amount.
+**Targeted audit (on-demand):** For compliance disclosure of a specific loan, threshold decryption reveals that loan's outstanding balance to the auditor. Borrower identity is not revealed — only the amount.
 
 ---
 
