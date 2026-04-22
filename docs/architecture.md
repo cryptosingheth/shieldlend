@@ -41,10 +41,14 @@ ShieldLend is three Anchor programs that communicate exclusively via CPI (Cross-
 
 ```
 ShieldedPoolState (singleton PDA)
-  - merkle_root: [u8; 32]
+  - current_root: [u8; 32]
+  - historical_roots: [[u8; 32]; 30]   // ring buffer — last 30 roots retained
+  - root_index: u8                      // head pointer for ring buffer
   - next_index: u64
   - epoch_commitments: Vec<[u8; 32]>   // pending queue
   - epoch_start_slot: u64
+  - epochs_without_per_flush: u8       // liveness tracking for fallback mode
+  - protocol_mode: ProtocolMode        // FullPrivacy | Degraded | Emergency
 
 CommitmentAccount (PDA per commitment_index)
   - commitment: [u8; 32]
@@ -128,13 +132,28 @@ PER exit flush (flush_exits):
 ### Account Model
 
 ```
-LoanAccount (PDA per loan_id)
+LoanAccount (PDA: seeds = [b"loan", collateral_nullifier_hash])
   - collateral_nullifier_hash: [u8; 32]
   - collateral_denomination_class: u8     // index into DENOMINATION_TABLE
   - loan_id: u64
-  - disbursed_at: i64
+  - disbursed_at_slot: u64
   - borrow_amount: u64                    // public — visible on-chain (ZK public input)
   - status: LoanStatus { Active, Repaid, Liquidated }
+
+  // FHE liquidation — handle pinning [inspired by Laolex/shieldlend C-01, Anchor PDA adaptation]
+  - is_liquidatable: EncryptedBool        // Encrypt FHE ciphertext
+  - liq_ciphertext_handle: [u8; 32]       // handle snapshot at liquidation request time
+  - pending_liquidation_reveal: bool
+  - confirmed_liquidatable: bool
+
+  // Breach confirmation [prevents single-epoch oracle manipulation]
+  - consecutive_breach_count: u8
+  - breach_first_slot: u64
+  - future_sign_authorized: bool
+
+  // Interest tracking
+  - last_accrual_slot: u64
+  - interest_rate_bps: u64
 
 InterestRateModel (singleton PDA)
   - utilization_kinks: [u16; 11]          // basis points — 11-point Kamino model
@@ -229,9 +248,10 @@ The outstanding balance at repay time is computed from the public rate history s
 
 ```
 NullifierAccount (PDA: seeds = [b"nullifier", nullifier_hash])
-  - nullifier_hash: [u8; 32]
+  - nullifier_hash: [u8; 32]          // Poseidon(nullifier, leaf_index, SHIELDED_POOL_PROGRAM_ID)
   - status: NullifierStatus { Active, Locked, Spent }
-  - registered_at: i64
+  - leaf_index: u64                   // position in Merkle tree — recorded at registration
+  - registered_at_slot: u64
 
 RegistryConfig (singleton PDA)
   - authorized_programs: [Pubkey; 8]  // shielded_pool + lending_pool
@@ -259,21 +279,27 @@ A Spent nullifier cannot be reused — prevents double-spend.
 ```
 Private inputs:
   secret, nullifier, denomination
+  leaf_index                          // position of commitment in Merkle tree [V-1 fix]
   pathElements[24], pathIndices[24]   // Merkle inclusion proof
   ring[16]                            // ring of K=16 commitments
   own_index                           // which ring element is yours
 
 Public outputs:
   ring[16]                            // revealed ring (for nullifier checking)
-  nullifierHash = Poseidon(nullifier)
-  root                                // Merkle root matched
+  nullifierHash                       // Poseidon(nullifier, leaf_index, SHIELDED_POOL_PROGRAM_ID)
+  root                                // Merkle root matched (must be in historical_roots[30])
   denomination_out                    // denomination being withdrawn
 
 Constraints:
   commitment = Poseidon(secret, nullifier, denomination)
   ring[own_index] == commitment
-  MerkleInclude(commitment, pathElements, pathIndices) == root
-  nullifierHash = Poseidon(nullifier)
+  MerkleInclude(commitment, pathElements, pathIndices, leaf_index) == root
+  nullifierHash = Poseidon(nullifier, leaf_index, SHIELDED_POOL_PROGRAM_ID)
+
+Notes:
+  - leaf_index added as private input [inspired by Penumbra position-dependent nullifiers]
+  - SHIELDED_POOL_PROGRAM_ID as domain separator [inspired by Aztec app-siloed nullifiers]
+  - root validated against historical_roots ring buffer (not just current_root)
 ```
 
 ### collateral_ring.circom
@@ -281,6 +307,7 @@ Constraints:
 ```
 Private inputs:
   secret, nullifier, denomination
+  leaf_index                          // position of commitment in Merkle tree [V-1 fix]
   pathElements[24], pathIndices[24]
   ring[16], own_index
   borrowed                            // loan amount
@@ -289,11 +316,13 @@ Private inputs:
 Public outputs:
   ring[16], nullifierHash, root
   borrowed, minRatioBps               // for on-chain LTV verification
+  NOTE: denomination is inferable from borrowed/minRatioBps — accepted tradeoff [V-2]
 
 Constraints:
   commitment = Poseidon(secret, nullifier, denomination)
   ring[own_index] == commitment
-  MerkleInclude(commitment, ...) == root
+  MerkleInclude(commitment, pathElements, pathIndices, leaf_index) == root
+  nullifierHash = Poseidon(nullifier, leaf_index, SHIELDED_POOL_PROGRAM_ID)
   denomination * minRatioBps >= borrowed * 10000   // LTV check in-circuit
 ```
 
@@ -302,17 +331,26 @@ Constraints:
 ```
 Private inputs:
   nullifier                           // proves knowledge of collateral secret
+  leaf_index                          // position of collateral commitment [V-1 fix]
   repaymentAmount                     // never published on-chain
 
 Public outputs:
-  nullifierHash = Poseidon(nullifier) // matches locked nullifier in registry
+  nullifierHash                       // Poseidon(nullifier, leaf_index, SHIELDED_POOL_PROGRAM_ID)
   loanId                              // identifies which loan PDA to clear
   outstanding_balance                 // computed on-chain from Kamino rate history
 
 Constraints:
-  nullifierHash = Poseidon(nullifier)
+  nullifierHash = Poseidon(nullifier, leaf_index, SHIELDED_POOL_PROGRAM_ID)
   repaymentAmount >= outstanding_balance   // sufficiency check in-circuit
 ```
+
+### Circuit Parameter: SHIELDED_POOL_PROGRAM_ID
+
+All three circuits include `SHIELDED_POOL_PROGRAM_ID` as a compile-time constant in the nullifierHash computation. This serves as a domain separator that:
+1. Prevents cross-contract nullifier correlation (if ShieldLend ever adds a V2 program or complementary protocol, notes cannot be linked across them)
+2. Binds proof validity to this specific program — a proof generated for ShieldLend cannot be replayed in a different protocol
+
+*Architecture inspiration: Aztec's app-siloed nullifier key derivation (`nullifier_app = Poseidon(nsk_master, app_contract_address)`)*
 
 ---
 
@@ -357,7 +395,7 @@ lending_pool::borrow {
 
 ---
 
-## Encrypt FHE — Oracle and Solvency Pattern
+## Encrypt FHE — Oracle, Solvency, and Liquidation Pattern
 
 ```rust
 // Oracle price submitted as FHE ciphertext — MEV bots cannot compute
@@ -372,14 +410,61 @@ fn compute_health_factor(
 
 // Aggregate solvency: homomorphic sum over all loan balances
 // reveals only total outstanding, not individual positions
+// Inspired by Penumbra's homomorphic ElGamal flow encryption for validator-aggregated sums
 #[encrypt_fn]
 fn aggregate_outstanding(
     balances: &[EncryptCiphertext],
 ) -> EncryptCiphertext {
     balances.iter().fold(EncryptCiphertext::zero(), |acc, b| acc + b)
 }
+
+// Interest accrual — called by keeper bot (not triggered inside FHE context)
+// Inspired by Laolex/shieldlend keeper pattern: accruing inside FHE would leak
+// encrypted debt aggregates during utilization computation
+fn accrue_interest(loan: &mut LoanAccount, current_slot: u64, rate_bps: u64) {
+    // Slots since last accrual (public computation — rate history is public)
+    let slots_elapsed = current_slot - loan.last_accrual_slot;
+    let rate_per_slot = rate_bps / (365 * 24 * 9000);  // ~9000 slots/hr
+
+    // FHE multiplication: interest = total_debt * rate_per_slot * slots_elapsed
+    loan.total_debt_encrypted = encrypt_mul(
+        &loan.total_debt_encrypted,
+        &encrypt_u64(1 + rate_per_slot * slots_elapsed)
+    );
+    loan.last_accrual_slot = current_slot;
+}
 ```
 
-Threshold decryption (2/3 IKA MPC) used for:
-1. **Aggregate solvency**: `Σ(outstanding[i])` → single decrypt → total outstanding, no individual exposure
-2. **Targeted audit**: single `loanId` balance decrypted for compliance disclosure
+### Three-Step Async Liquidation (FHE-Compatible)
+
+*Pattern adapted from Laolex/shieldlend EVM implementation, mapped to Anchor PDA model.*
+
+FHE decryption is asynchronous — health factor ciphertexts must be sent to Encrypt threshold network and decrypted before liquidation can proceed. This requires a three-step flow to prevent liquidating solvent positions.
+
+```
+Step 1: request_liquidation_reveal (permissionless)
+  - Snapshot liq_ciphertext_handle = loan.is_liquidatable.handle()
+  - Set pending_liquidation_reveal = true
+  - Emit event → Encrypt oracle initiates threshold decryption
+
+Step 2: verify_liquidation_reveal (called by Encrypt oracle keeper)
+  - Verify Encrypt re-encryption proof is signed over loan's PDA address [C-01 binding]
+  - Verify submitted handle matches liq_ciphertext_handle (snapshot from Step 1)
+  - Set confirmed_liquidatable = decrypted_value
+  - Set pending_liquidation_reveal = false
+
+Step 3: liquidate (permissionless, only if confirmed)
+  - Require confirmed_liquidatable == true
+  - Require consecutive_breach_count >= breach_confirmation_epochs
+  - Execute IKA FutureSign → consume collateral
+```
+
+**Handle Pinning Security Property [C-01]**:
+The PDA seed constraint `seeds = [b"loan", collateral_nullifier_hash]` cryptographically derives a unique address for each loan. The Encrypt oracle proof is signed over this PDA address. A decryption proof from Loan A cannot be submitted against Loan B's account — the PDA address mismatch causes verification failure.
+
+*Architecture inspiration: Laolex/shieldlend's handle pinning pattern. Solidity equivalent: `require(handlesList[0] == FHE.toBytes32(positions[borrower].isLiquidatable))`. Anchor equivalent: PDA seed uniqueness as structural binding.*
+
+Threshold decryption (2/3 Encrypt network) used for:
+1. **Liquidation confirmation**: `is_liquidatable` → three-step reveal → boolean result
+2. **Aggregate solvency**: `Σ(outstanding[i])` → single decrypt → total outstanding, no individual exposure
+3. **Targeted audit**: single `loanId` balance decrypted for compliance disclosure

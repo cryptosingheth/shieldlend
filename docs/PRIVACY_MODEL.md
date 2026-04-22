@@ -134,6 +134,20 @@ ShieldLend's threat model assumes adversaries up to and including Class C. Class
 
 ---
 
+## VRF Dummy Indistinguishability
+
+VRF dummy commitments must be computationally indistinguishable from real commitments. This is a security property, not just an operational requirement.
+
+**Real commitment**: `Poseidon(secret, nullifier, denomination)` where `secret` and `nullifier` are 256-bit randoms generated client-side and never published.
+
+**VRF dummy commitment**: `Poseidon(vrf_output_i, denomination)` where `vrf_output_i = hash(VRF_PROOF.output || epoch_index || dummy_index)`. The VRF output is held by MagicBlock's VRF contract — external observers cannot extract it from the on-chain VRF proof.
+
+**Property**: A polynomial-time adversary who sees the on-chain VRF proof cannot distinguish a dummy commitment from a real commitment without the VRF contract's internal state. Both are 256-bit BN254 field elements; both are Poseidon hashes over 256-bit inputs.
+
+**Guarantee this provides**: When VRF dummies appear in a ring alongside real commitments, the adversary cannot label which ring members are dummies. The effective anonymity set is truly K=16 (not K = number of real commitments).
+
+---
+
 ## Double-Spend Prevention
 
 The NullifierRegistry PDA is the single source of truth for whether a note has been used:
@@ -170,6 +184,53 @@ total_outstanding = Σ(encrypted_balance[i])   // FHE homomorphic addition
 FHE homomorphic addition preserves the encryption — the sum is still a ciphertext. A single threshold decryption of the sum reveals only `total_outstanding`. Individual `encrypted_balance[i]` values remain ciphertext throughout.
 
 The solvency invariant monitored: `total_outstanding ≤ shielded_pool.lamports × LTV_FLOOR`.
+
+---
+
+## Nullifier Security Properties
+
+### Position-Dependent Binding
+`nullifierHash = Poseidon(nullifier, leaf_index, SHIELDED_POOL_PROGRAM_ID)`
+
+**Why leaf_index is required**: If a commitment were re-inserted at a different tree position, the old formula `Poseidon(nullifier)` would produce the same nullifierHash regardless of position. A note spent at position 5 would have the same nullifier record as a freshly inserted copy at position 1000. Including `leaf_index` binds the spent record to the specific position — re-insertion at any other position produces a different nullifierHash and would not conflict with the existing spent record.
+
+*Inspired by Penumbra's position-dependent nullifier: `nf = Poseidon(domain_sep, nullifier_key, commitment, position_in_tree)`*
+
+### App-Siloed Domain Separation
+`SHIELDED_POOL_PROGRAM_ID` as domain separator prevents cross-contract nullifier correlation. If ShieldLend ever deploys a V2 or complementary protocol with its own nullifier registry, notes cannot be linked across registries by comparing nullifierHash values.
+
+*Inspired by Aztec's app-siloed nullifier keys: `nullifier_app = Poseidon(nsk_master, app_contract_address)`*
+
+---
+
+## Accepted Disclosures and Residual Risks
+
+### Accepted Disclosures (visible by design)
+These properties are intentionally public — required by the ZK circuit design or the lending protocol mechanics:
+
+| Disclosure | Why public | Inference possible |
+|---|---|---|
+| Borrow amount | ZK public input — required for on-chain LTV verification | Denomination inferable: `denom ≈ borrowed / minRatioBps × 10000` |
+| That a borrow occurred | LoanAccount PDA creation visible | Loan count is enumerable |
+| Denomination class on withdrawal | ZK public output — required for correct SOL release | None — denomination is fixed, not identity-linking |
+| Aggregate outstanding debt | Threshold decryption product — one value revealed | Protocol solvency status only |
+
+### Residual Risks (mitigated but not eliminated)
+
+| Risk | Mitigation | Residual exposure |
+|---|---|---|
+| Timing correlation on small pool | `min_real_deposits_before_flush = 8`, PER batching delay | Quiescent pool window may narrow anonymity |
+| Stealth address sweep deanonymization | None (user responsibility) | Post-exit sweep to known wallet creates on-chain link |
+| IP address exposure to IKA relay | None (user responsibility — use Tor/VPN) | Relay operator sees IP of proof submitter |
+| Single oracle epoch manipulation | `consecutive_breach_count >= 2`, `max_oracle_deviation_bps = 20%` | Two consecutive manipulated epochs could trigger liquidation |
+| PER operator timing visibility | Intel TDX hardware attestation | Operator knows batch timing, not individual user→commitment links |
+
+### Out-of-Scope Privacy Properties
+The following are explicitly not protected by the protocol:
+
+- **IP address privacy**: The IKA relay operator sees the IP address of the user submitting proofs. Users requiring IP privacy must use Tor or VPN at the application layer.
+- **Post-exit fund movement**: If a user forwards funds from their Umbra stealth address to a known wallet, that on-chain link is permanent. The protocol cannot prevent this.
+- **OFAC compliance proofs**: Currently no mechanism to prove deposits didn't originate from sanctioned addresses. *Roadmap: Railgun's Proof of Innocence pattern — ZK proof of non-inclusion in OFAC SDN list without identity reveal.*
 
 ---
 

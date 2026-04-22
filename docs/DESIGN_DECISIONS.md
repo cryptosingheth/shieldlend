@@ -167,6 +167,111 @@ The PER also handles the exit batch (see ADR: Unified Exit Path below) — the s
 
 ---
 
+## Historical Merkle Root Ring Buffer (30 roots)
+
+**Requirement**: Users who go offline for multiple epochs must still be able to withdraw their committed notes. With VRF dummy insertions changing the Merkle root at every epoch flush, a user offline for 2 epochs would find their proof root invalid against the current root.
+
+**Options considered**:
+- **Store only current root**: Simplest. Users must withdraw within the same epoch they deposited, or regenerate their proof every epoch. Impractical — forces users to be online continuously.
+- **Accept user lockout**: Notes become unspendable after sufficient epochs. Unacceptable — this is permanent loss of funds.
+- **Historical root ring buffer (N roots)**: Store the last N Merkle roots. The `withdraw` instruction checks `historical_roots.contains(proof.root)` instead of `proof.root == current_root`. Users can submit proofs against any of the last N roots.
+
+**Decision**: Ring buffer of 30 historical roots. With 5-minute epochs, this gives users approximately 2.5 hours of offline tolerance. 30 × 32 bytes = 960 bytes overhead in `ShieldedPoolState` — negligible for a singleton PDA.
+
+*Architecture inspiration: Railgun and Tornado Cash both retain N historical roots for exactly this reason. Tornado Cash's canonical implementation uses a fixed-size historical roots set checked with `require(isKnownRoot(root))`.*
+
+---
+
+## Nullifier Formula: Position-Dependent + App-Siloed
+
+**Previous formula**: `nullifierHash = Poseidon(nullifier)`
+
+**New formula**: `nullifierHash = Poseidon(nullifier, leaf_index, SHIELDED_POOL_PROGRAM_ID)`
+
+**Why the change — two independent reasons**:
+
+**Reason 1: Position-dependent binding (anti re-insertion attack)**
+
+*Inspiration: Penumbra's nullifier formula `nf = Poseidon(domain_separator, nullifier_key, commitment, position_in_tree)`*
+
+If a commitment is somehow re-inserted at a different leaf position (theoretically possible in a tree with millions of leaves — commitment collision is computationally infeasible but insertion ordering bugs exist), the old formula would produce the same nullifierHash for both positions. An attacker who controls the re-insertion could attempt to claim the note is unspent at the new position even after spending it at the old position.
+
+With `leaf_index` in the hash: the nullifierHash at position 5 is different from the nullifierHash at position 1000 for the same commitment. The double-spend record at position 5 does not conflict with a potential insertion at position 1000.
+
+**Reason 2: App-siloed domain separation (cross-contract unlinkability)**
+
+*Inspiration: Aztec's app-siloed nullifier derivation `nullifier_app = Poseidon(nsk_master, app_contract_address)`*
+
+If ShieldLend ever deploys a V2 program or integrates with a complementary protocol, two different programs would each maintain a nullifier registry. Without a domain separator, a nullifierHash appearing in one program's registry could be correlated with the same hash in another program — linking the user's note across protocols.
+
+Including `SHIELDED_POOL_PROGRAM_ID` as a compile-time constant in the circuit ensures nullifiers are siloed to this specific program. Notes cannot be correlated across protocol versions.
+
+**Circuit change**: `leaf_index` added as private input to all three circuits. Merkle inclusion proof already verifies the commitment is at a specific tree position — `leaf_index` extracts this position and includes it in the nullifierHash computation.
+
+---
+
+## Three-Step Async Liquidation (FHE-Compatible)
+
+**Requirement**: Liquidation requires knowing whether a loan's health factor has breached the threshold. With Encrypt FHE storing loan balances and oracle prices as ciphertexts, the health factor cannot be read directly — it must be threshold-decrypted.
+
+**The problem with single-step liquidation in FHE**: Threshold decryption is asynchronous (requires 2/3 of Encrypt network validators to process). A single-instruction liquidation would either: (a) block synchronously waiting for decryption (impossible in Solana's execution model), or (b) trust the submitter's claim about health factor (no verification — breaks security).
+
+**Pattern adopted from**: Laolex/shieldlend (`ConfidentialLending.sol`) — the most mature FHE lending implementation found in the competitive analysis. Their three-step flow (requestLiquidationReveal → verifyLiquidationReveal → liquidate) handles Zama's async coprocessor decryption. We adapt this to Solana's Anchor/PDA model.
+
+**Step 1** (permissionless): Emit event with FHE handle. Encrypt network initiates decryption.
+**Step 2** (called by Encrypt oracle keeper): Verify decryption proof; set `confirmed_liquidatable`.
+**Step 3** (permissionless if confirmed): Execute liquidation via IKA FutureSign.
+
+**Handle Pinning [C-01]**: Prevents replay of a decryption result from one loan against another. In EVM: `require(handlesList[0] == FHE.toBytes32(positions[borrower].isLiquidatable))`. In Anchor: the PDA `seeds = [b"loan", collateral_nullifier_hash]` is cryptographically unique per loan and serves as the binding — the Encrypt oracle proof is verified against this PDA address.
+
+**Stale flag clearing [CR-2]**: On any repayment or collateral increase, immediately clear `confirmed_liquidatable`, `pending_liquidation_reveal`, and reset `consecutive_breach_count`. Prevents race condition where position improves post-request but old confirmation executes.
+
+---
+
+## Keeper-Based Interest Accrual (Not In-FHE)
+
+**Requirement**: Interest must accrue on encrypted loan balances without leaking individual balance information.
+
+**Why automatic in-FHE accrual fails**: To compute an interest rate from utilization (`rate = base + utilization × multiplier`), you need to know total outstanding debt relative to total deposits. Total outstanding debt is the sum of all encrypted loan balances. Computing this sum homomorphically requires decryption — which reveals the aggregate and is an expensive MPC operation on every transaction. Triggering this on every deposit or repay would make transactions expensive and leak accrual timing.
+
+**Pattern adopted from**: Laolex/shieldlend — an admin keeper bot calls `accrueInterest(borrower)` for each active loan on a daily schedule. Utilization is estimated from publicly observable deposit counts (not encrypted balances) and the rate is updated via governance. This is a conscious tradeoff: the rate may lag true utilization by one admin update cycle.
+
+**Our implementation**: A keeper calls `lending_pool::accrue_interest(loan_account)` once per `keeper_min_accrual_slots` (default: ~1 day). The instruction computes `new_balance = balance × (1 + rate)` entirely as Encrypt FHE operations. The `last_accrual_slot` is a public plaintext field (only timing is revealed, not the amount).
+
+**Slot-based timing**: Solana uses slot numbers, not Unix timestamps. `keeper_min_accrual_slots = 216_000` ≈ 1 day at 400ms/slot.
+
+---
+
+## Breach Confirmation Epochs (Anti-Oracle-Manipulation)
+
+**Requirement**: Prevent a single manipulated oracle price update from triggering the liquidation of a healthy position.
+
+**The attack**: Oracle submits a manipulated price (stale data, price spike, compromise) in one slot. Single-epoch FutureSign activation immediately liquidates solvent borrowers.
+
+**Decision**: `consecutive_breach_count` field in `LoanAccount` PDA. Oracle updates increment this counter when health factor is in breach; clear it on oracle updates that show recovery. FutureSign only activates when `consecutive_breach_count >= breach_confirmation_epochs` (default: 2).
+
+**Additional circuit breaker**: If oracle price moves more than `max_oracle_deviation_bps` (default: 20%) between consecutive updates, new liquidation requests are paused for one epoch. This handles sudden large price movements that could be oracle manipulation.
+
+**Borrower protection**: Borrowers have at least one full oracle update epoch to respond to the first breach detection before liquidation becomes possible.
+
+---
+
+## MagicBlock PER Liveness Fallback Modes
+
+**Requirement**: Users must be able to recover their funds even if MagicBlock PER becomes unavailable for an extended period.
+
+**Three operational modes** defined with explicit privacy tradeoffs:
+
+**Full Privacy (default)**: All exits via PER batch. Maximum temporal unlinking. Requires PER operational.
+
+**Degraded Privacy** (auto-activates after 5 epochs without PER flush): Direct ZK withdrawal without PER batching. Ring anonymity (K=16) preserved. Temporal unlinking lost — deposit→exit timing is observable. Frontend displays prominent warning. Instruction `shielded_pool::direct_withdraw(ring_proof, stealth_address)` enabled.
+
+**Emergency** (governance vote, time-locked): Direct SOL release bypassing relay and stealth. Last resort for stuck funds. Ring anonymity may still be preserved if user submits proof directly.
+
+The `per_fallback_epoch_threshold` governance parameter controls automatic Degraded mode activation.
+
+---
+
 ## Fixed Pool Denominations (design requirement, not a choice)
 
 **Requirement from ZK circuit structure**: The ZK circuit computes `commitment = Poseidon(secret, nullifier, denomination)`. `denomination_out` is a public output of the withdraw proof — the on-chain contract reads it to know how much SOL to release.

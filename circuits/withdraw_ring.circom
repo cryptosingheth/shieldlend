@@ -1,5 +1,19 @@
 pragma circom 2.1.6;
 
+// IMPLEMENTATION NOTE — CIRCUIT UPDATE REQUIRED BEFORE COMPILATION
+// When implementation starts, update this circuit:
+//   1. Add `leaf_index` as a private input signal (u64, the leaf's position in the Merkle tree)
+//   2. Replace the nullifier hash formula:
+//        OLD (current): nullifierHash = Poseidon(nullifier)
+//        NEW (required): nullifierHash = Poseidon(nullifier, leaf_index, SHIELDED_POOL_PROGRAM_ID)
+//      SHIELDED_POOL_PROGRAM_ID is a compile-time constant domain separator (program address as field element)
+//   3. Update the Poseidon component from Poseidon(1) to Poseidon(3) with the three inputs above
+//   4. Recompile: circom withdraw_ring.circom --r1cs --wasm --sym
+//   5. Run new trusted setup: snarkjs groth16 setup → .zkey → export _vkey.json
+//   6. Replace frontend/public/circuits/withdraw_ring.wasm + withdraw_ring.zkey
+// Reason: position-dependent nullifier prevents re-insertion double-spend (Penumbra pattern);
+//         app-siloed domain separator prevents cross-contract nullifier correlation (Aztec pattern).
+
 include "../node_modules/circomlib/circuits/poseidon.circom";
 include "../node_modules/circomlib/circuits/mux1.circom";
 include "../node_modules/circomlib/circuits/bitify.circom";

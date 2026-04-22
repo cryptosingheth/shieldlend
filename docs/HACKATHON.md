@@ -38,20 +38,34 @@ At borrow time, the borrower pre-signs a conditional liquidation authorization: 
 
 The design property: liquidation is trustless consent, not operator permission.
 
-### Encrypt integration points (3)
+### Encrypt integration points (4)
 
 **1. FHE oracle input (price feeds)**
 Liquidation requires knowing the market price of SOL relative to the loan's collateral denomination. Price feeds are submitted as Encrypt FHE ciphertext inputs. The health_factor computation runs homomorphically on encrypted oracle data — MEV bots cannot compute the health factor breach condition from encrypted mempool data.
 
 ZK proofs can verify a fact about a known value, but cannot receive a continuously updating oracle stream and compute over it homomorphically. FHE is the only approach that allows real-time encrypted price feeds to feed directly into liquidation logic without plaintext exposure.
 
-**2. Aggregate solvency check (homomorphic sum)**
+**2. Encrypted loan balances and health factor computation**
+Each `LoanAccount` PDA stores `is_liquidatable: EncryptedBool` — the result of the FHE health factor comparison `(collateral_denomination × 100) < (outstanding_balance × collateral_ratio_bps)`. All arithmetic runs as Encrypt FHE homomorphic operations. The health factor result is a ciphertext until threshold decryption is explicitly requested. This prevents anyone — including MEV bots and the relay operator — from reading individual loan health factors from the chain.
+
+The `is_liquidatable` ciphertext is the trigger for the three-step async liquidation flow (see below).
+
+**3. Three-step async liquidation with handle pinning**
+FHE decryption is asynchronous — the `is_liquidatable` ciphertext must be sent to the Encrypt threshold network for decryption before liquidation can proceed. ShieldLend implements a three-step flow adapted from Laolex/shieldlend's EVM implementation, mapped to Anchor's PDA model:
+
+- **Step 1** (`request_liquidation_reveal`): Permissionless. Snapshots the FHE ciphertext handle. Emits event for Encrypt oracle. Sets `pending_liquidation_reveal = true`.
+- **Step 2** (`verify_liquidation_reveal`): Called by Encrypt oracle keeper after threshold decryption completes. Verifies the re-encryption proof is signed over this loan's PDA address (handle pinning — prevents replay attacks). Sets `confirmed_liquidatable`.
+- **Step 3** (`liquidate`): Permissionless, only if confirmed. Executes IKA FutureSign.
+
+**Handle pinning security**: The Encrypt oracle decryption proof is verified against the specific `LoanAccount` PDA address. Since PDAs are derived from `seeds = [b"loan", collateral_nullifier_hash]`, the proof for Loan A cannot be submitted against Loan B. This prevents a class of replay attacks identified in our competitive analysis of FHE lending protocols.
+
+**4. Aggregate solvency check (homomorphic sum)**
 Total protocol outstanding debt is computed as: `Σ(encrypted_balance[i])` via FHE homomorphic addition. A single threshold decrypt reveals only the aggregate total. Individual positions remain hidden throughout.
 
 This enables protocol solvency verification — confirming total outstanding debt is within the collateral reserve — without exposing any individual borrower's position.
 
-**3. Targeted threshold decryption (auditor disclosure)**
-For compliance disclosure of a specific loan, a 2/3 IKA MPC threshold decryption reveals the outstanding balance for that loanId to the designated auditor. Individual borrower identity is not revealed — only the amount. This satisfies selective disclosure requirements without a backdoor key.
+**Bonus: Targeted threshold decryption (auditor disclosure)**
+For compliance disclosure of a specific loan, a 2/3 Encrypt threshold decryption reveals the outstanding balance for that loanId to the designated auditor. Individual borrower identity is not revealed — only the amount. This satisfies selective disclosure requirements without a backdoor key.
 
 ### Why IKA and Encrypt are not competing
 

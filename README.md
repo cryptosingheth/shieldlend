@@ -400,29 +400,39 @@ flowchart TD
 Complete property-by-property breakdown of what is and is not hidden:
 
 ```
-PROPERTY                             STATUS      MECHANISM
-────────────────────────────────────────────────────────────────
-Depositor wallet hidden              ✓           IKA relay (relay is TX2 signer)
-Deposit timing correlation broken    ✓           PER temporal batching
-Anonymity set ≥ 16                   ✓           ZK ring proof K=16
-VRF dummies in all ring proofs       ✓           Inserted at deposit; persist in tree
-Withdrawal submitter wallet hidden   ✓           Withdrawal routed through relay
-Which commitment was spent           ✓           Ring proof hides ring_index
-Withdrawal destination hidden        ✓           Umbra stealth (ECDH, fresh per op)
-Borrow vs withdrawal exit            ✓           Unified relay → PER → stealth path
-Which collateral note is locked      ✓           Collateral ring proof hides index
-Borrower wallet hidden               ✓           ZK private input + relay signer
-Disbursement destination hidden      ✓           Umbra stealth address
-Borrow amount                        public      ZK public input — circuit requirement
-That a borrow occurred               public      LoanAccount PDA — accepted
-Repayment amount hidden              ✓           ZK private input, circuit check
-Repayer wallet hidden                ✓           ZK private input + relay routing
-Oracle price (liquidation MEV)       ✓           Encrypt FHE encrypted oracle
-Who was liquidated                   ✓           Wallet never linked to loanId
-Single operator key risk             ✓           IKA 2PC-MPC — user + MPC network both required
-Liquidation trust                    ✓           IKA FutureSign — pre-signed consent, condition-gated
-Double-spend                         ✓           NullifierRegistry PDA + ZK nullifierHash (Poseidon)
-────────────────────────────────────────────────────────────────
+PROPERTY                                STATUS      MECHANISM
+────────────────────────────────────────────────────────────────────────────────
+Depositor wallet hidden                 ✓           IKA relay (relay is TX2 signer)
+Deposit timing correlation broken       ✓           PER temporal batching (Intel TDX enclave)
+Anonymity set ≥ 8 real (min batch)      ✓           min_real_deposits_before_flush = 8
+VRF dummies indistinguishable           ✓           Poseidon(vrf_output, denomination) — same structure
+                                                    as real commitments; VRF output not publicly derivable
+Root tolerance (offline users)          ✓           30 historical roots retained; no lockout
+Which commitment was spent              ✓           Ring proof hides ring_index (K=16 + VRF dummies)
+Cross-contract nullifier unlinkability  ✓           nullifierHash includes SHIELDED_POOL_PROGRAM_ID
+Re-insertion double-spend prevention    ✓           nullifierHash includes leaf_index
+Withdrawal submitter wallet hidden      ✓           Withdrawal routed through relay
+Withdrawal destination hidden           ✓           Umbra stealth (ECDH, fresh per op)
+Borrow vs withdrawal exit               ✓           Unified relay → PER → stealth path
+Which collateral note is locked         ✓           Collateral ring proof hides index
+Borrower wallet hidden                  ✓           ZK private input + relay signer
+Disbursement destination hidden         ✓           Umbra stealth address
+Repayment amount hidden                 ✓           ZK private input, in-circuit check
+Repayer wallet hidden                   ✓           ZK private input + relay routing
+Oracle price (liquidation MEV)          ✓           Encrypt FHE encrypted oracle
+FHE liquidation handle replay           ✓           Handle pinning — PDA seed binding [C-01]
+Stale liquidation on healthy position   ✓           Consecutive breach confirmation (≥ 2 epochs)
+Individual loan balances                ✓           Encrypt FHE encrypted storage
+Who was liquidated                      ✓           Wallet never linked to loanId
+Single operator key risk                ✓           IKA 2PC-MPC — user + MPC both required
+Liquidation trust                       ✓           IKA FutureSign — pre-signed consent, condition-gated
+Double-spend                            ✓           NullifierRegistry PDA + nullifierHash (position-bound)
+────────────────────────────────────────────────────────────────────────────────
+Borrow amount                           public      ZK public input — circuit requirement for on-chain LTV
+That a borrow occurred                  public      LoanAccount PDA creation visible
+Aggregate outstanding debt              disclosed   Threshold decryption result — total only, not individual
+IP address visible to relay             not covered Tor/VPN required at application layer (user responsibility)
+────────────────────────────────────────────────────────────────────────────────
 ```
 
 ---
@@ -443,9 +453,16 @@ All circuits produce Groth16 proofs verified on-chain by `groth16-solana`.
 
 | Circuit | Proves | Public inputs/outputs |
 |---|---|---|
-| `withdraw_ring.circom` | Ring membership (K=16) + Merkle inclusion (depth 24) | `ring[16]`, `nullifierHash`, `root`, `denomination_out` |
+| `withdraw_ring.circom` | Ring membership (K=16) + Merkle inclusion at `leaf_index` (depth 24) | `ring[16]`, `nullifierHash`, `root`, `denomination_out` |
 | `collateral_ring.circom` | Ring membership + `denomination × minRatioBps ≥ borrowed × 10000` | `ring[16]`, `nullifierHash`, `root`, `borrowed`, `minRatioBps` |
 | `repay_ring.circom` | Nullifier knowledge + `repaymentAmount ≥ outstanding_balance` (in-circuit, amount private) | `nullifierHash`, `loanId`, `outstanding_balance` |
+
+**Nullifier formula** (all circuits): `nullifierHash = Poseidon(nullifier, leaf_index, SHIELDED_POOL_PROGRAM_ID)`
+
+- `leaf_index`: private input proving position in the Merkle tree — prevents re-insertion attacks
+- `SHIELDED_POOL_PROGRAM_ID`: domain separator — prevents cross-contract nullifier correlation
+
+**Root validation**: proofs are valid against any of the 30 most recent Merkle roots (not just the current root) — users can be offline for up to ~2.5 hours without losing access to their notes.
 
 ---
 
@@ -595,14 +612,38 @@ Several protocols used in ShieldLend are in pre-alpha on devnet. Hackathon integ
 
 ---
 
+## Architecture Inspirations
+
+ShieldLend builds on and extends proven patterns from production privacy protocols. Each borrowed pattern is adapted to Solana's account model and explicitly cited in our architecture documentation. We are building on existing work, not reinventing it — and going further where no existing protocol has gone.
+
+| Pattern | Inspired by | What we adapted | Where it appears |
+|---|---|---|---|
+| Historical root ring buffer | Railgun, Tornado Cash | Retain 30 historical roots; `historical_roots.contains(proof.root)` | `ShieldedPoolState` |
+| Position-dependent nullifiers | Penumbra | `Poseidon(nullifier, leaf_index, PROGRAM_ID)` prevents re-insertion attacks | All three circuits |
+| App-siloed nullifier domain | Aztec | `SHIELDED_POOL_PROGRAM_ID` in nullifierHash prevents cross-contract correlation | All three circuits |
+| Three-step async liquidation | Laolex/shieldlend (FHE) | Handle pinning + breach confirmation adapted from Solidity mapping to Anchor PDA | `lending_pool::liquidate` |
+| Handle pinning [C-01] | Laolex/shieldlend (FHE) | PDA seed binding replaces storage-slot binding | `LoanAccount` fields |
+| Keeper-based interest accrual | Laolex/shieldlend (FHE) | Slot-based timing, off-chain utilization estimation | `lending_pool::accrue_interest` |
+| Threshold decryption for aggregate solvency | Penumbra (flow encryption) | Homomorphic sum of FHE balances, threshold decrypt reveals total only | Encrypt FHE integration |
+| Atomic borrow + exit | Nocturne (Operation model) | Verify ring proof and queue exit in same instruction | `lending_pool::borrow` |
+| VRF dummy indistinguishability | Original design (no prior art) | `Poseidon(vrf_output, denomination)` — same structure as real commitments | `shielded_pool::flush_epoch` |
+| Unified exit path | Original design | Withdrawal + borrow disbursement through same PER exit batch | `shielded_pool::flush_exits` |
+
+The full competitive analysis that produced this table is in [`docs/RESEARCH_REPORT.md`](docs/RESEARCH_REPORT.md).
+
+---
+
 ## Documentation
 
 | Document | Contents |
 |---|---|
 | [`docs/architecture.md`](docs/architecture.md) | Program design, CPI flows, account model, data structures |
-| [`docs/PRIVACY_MODEL.md`](docs/PRIVACY_MODEL.md) | Threat model, attack classes, unlinkability proofs per flow |
-| [`docs/DESIGN_DECISIONS.md`](docs/DESIGN_DECISIONS.md) | Protocol selection rationale — privacy requirement → protocol choice |
+| [`docs/PRIVACY_MODEL.md`](docs/PRIVACY_MODEL.md) | Unlinkability analysis per flow, residual risks, accepted disclosures |
+| [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) | Adversary classes, attack scenarios, full privacy property table, trust assumptions |
+| [`docs/DESIGN_DECISIONS.md`](docs/DESIGN_DECISIONS.md) | ADR-style rationale for every protocol and architecture choice |
+| [`docs/NOTE_LIFECYCLE.md`](docs/NOTE_LIFECYCLE.md) | Note state machine, LoanAccount lifecycle, protocol parameters, operational modes |
 | [`docs/HACKATHON.md`](docs/HACKATHON.md) | Track-by-track eligibility, submission narratives, required integrations |
+| [`docs/RESEARCH_REPORT.md`](docs/RESEARCH_REPORT.md) | Full competitive analysis: competitor profiles, production protocol research, vulnerability findings |
 
 ---
 
