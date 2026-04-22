@@ -55,114 +55,42 @@ The component-to-protocol mapping tables below show this gap → choice relation
 
 ShieldLend is three Anchor programs. All SOL stays in one place. The other two programs only keep state.
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│  shielded_pool                                               │
-│  Holds ALL SOL. Poseidon Merkle tree (depth 24, ~16M leaves) │
-│  Verifies Groth16 withdrawal proofs. Releases SOL on exit.   │
-└──────────────────────┬───────────────────────────────────────┘
-                       │ CPI
-┌──────────────────────▼───────────────────────────────────────┐
-│  lending_pool                                                │
-│  Zero SOL custody — accounting only.                         │
-│  Kamino klend fork (poly-linear 11-point interest model).    │
-│  Verifies collateral + repay proofs. Manages LoanAccount PDAs│
-└──────────────────────┬───────────────────────────────────────┘
-                       │ CPI
-┌──────────────────────▼───────────────────────────────────────┐
-│  nullifier_registry                                          │
-│  Shared state between both programs.                         │
-│  PDA per nullifier: Active → Locked (borrow) → Spent (exit)  │
-└──────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    classDef prog fill:#1e293b,stroke:#475569,color:#e2e8f0
+
+    SP["shielded_pool\nHolds ALL SOL · Poseidon Merkle tree depth 24\nGroth16 withdrawal verification · releases SOL on exit"]:::prog
+    LP["lending_pool\nZero SOL custody — accounting only\nKamino 11-point interest model\nCollateral + repay proof verification · LoanAccount PDAs"]:::prog
+    NR["nullifier_registry\nShared state: Active → Locked → Spent\nAuthorized writers: shielded_pool + lending_pool"]:::prog
+
+    SP -->|CPI| LP
+    LP -->|CPI| NR
+    SP -->|CPI| NR
 ```
 
----
-
-### Transaction Lifecycle
-
-Every user journey starts with a deposit. A deposited note can then be withdrawn or used as collateral to borrow. After borrowing, the note is locked until the loan is repaid or liquidated.
-
-```
-                    ┌─────────────────────────────────┐
-                    │  User has SOL                   │
-                    └────────────────┬────────────────┘
-                                     │
-                                  DEPOSIT
-                         IKA relay → PER enclave
-                         → Commitment in Merkle tree
-                         → Encrypted note saved locally
-                                     │
-                    ┌────────────────▼────────────────┐
-                    │  Note (secret + nullifier)      │
-                    │  Status: Active                 │
-                    └──────────┬──────────────────────┘
-                               │
-               ┌───────────────┴───────────────┐
-               │                               │
-           WITHDRAW                          BORROW
-     ZK ring proof                    ZK collateral proof
-     Nullifier: Active→Spent          Nullifier: Active→Locked
-     SOL → PER exit → stealth         SOL → PER exit → stealth
-                                               │
-                                  ┌────────────▼───────────────┐
-                                  │  Active Loan               │
-                                  │  LoanAccount PDA created   │
-                                  │  IKA FutureSign stored     │
-                                  └──────────┬─────────────────┘
-                                             │
-                              ┌──────────────┴──────────────┐
-                              │                             │
-                            REPAY                      LIQUIDATE
-                    ZK repay proof               IKA FutureSign triggers
-                    Nullifier: Locked→Active      Nullifier: Locked→Spent
-                    LoanAccount closed            LoanAccount closed
-                              │
-                    ┌─────────▼─────────────┐
-                    │  Note back to Active  │
-                    │  → can now WITHDRAW   │
-                    └───────────────────────┘
-```
+For the full transaction lifecycle — how deposit connects to withdraw, borrow, repay, and liquidate — see [Flow Diagrams](#flow-diagrams) below.
 
 ---
 
 ### Privacy Stack
 
-Each protocol layer closes a specific privacy gap that no other component addresses:
+Each layer closes a specific privacy gap. The gap each layer closes cannot be addressed by any other layer in the stack.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  ENTRY — Who deposited, when, which commitment              │
-│  MagicBlock PER (Intel TDX) + VRF                           │
-│  Deposits batch inside enclave before hitting Merkle tree.  │
-│  VRF dummies make real and fake commitments indistinguishable│
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────┐
-│  RELAY — Which wallet submitted any protocol transaction     │
-│  IKA dWallet (2PC-MPC)                                      │
-│  All on-chain signers are the relay wallet, never the user.  │
-│  No single key exists. User + IKA MPC both required.        │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────┐
-│  SPEND — Which commitment was withdrawn or used as collateral│
-│  Groth16 ring proofs (K=16 + VRF dummies)                   │
-│  Proves ownership without revealing index. 1-of-16 minimum. │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────┐
-│  EXIT — Where funds went, which type of exit occurred       │
-│  MagicBlock PER exit batch + Umbra SDK stealth addresses     │
-│  Withdrawals and borrow disbursements batch together.        │
-│  Each destination is a fresh ECDH-derived one-time address.  │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────┐
-│  ORACLE — Liquidation price data readable in mempool         │
-│  Encrypt FHE                                                │
-│  Price feeds as ciphertexts. Health factor computed          │
-│  homomorphically. MEV bots cannot front-run liquidations.   │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    classDef layer fill:#1e293b,stroke:#475569,color:#e2e8f0
+
+    E["ENTRY · MagicBlock PER + VRF"]:::layer
+    R["RELAY · IKA dWallet 2PC-MPC"]:::layer
+    S["SPEND · Groth16 Ring Proofs K=16"]:::layer
+    X["EXIT · PER exit batch + Umbra SDK"]:::layer
+    O["ORACLE · Encrypt FHE"]:::layer
+
+    E -->|"who deposited, timing, which commitment"| R
+    R -->|"which wallet signed any transaction"| S
+    S -->|"which commitment was used or locked"| X
+    X -->|"where funds went, withdrawal vs borrow exit"| O
+    O -->|"liquidation price data readable in mempool"| End([All gaps closed])
 ```
 
 ---
@@ -491,20 +419,15 @@ Repayment amount hidden              ✓           ZK private input, circuit che
 Repayer wallet hidden                ✓           ZK private input + relay routing
 Oracle price (liquidation MEV)       ✓           Encrypt FHE encrypted oracle
 Who was liquidated                   ✓           Wallet never linked to loanId
+Single operator key risk             ✓           IKA 2PC-MPC — user + MPC network both required
+Liquidation trust                    ✓           IKA FutureSign — pre-signed consent, condition-gated
+Double-spend                         ✓           NullifierRegistry PDA + ZK nullifierHash (Poseidon)
 ────────────────────────────────────────────────────────────────
 ```
 
 ---
 
 ## Funds and Accounting
-
-```
-ShieldedPool program         — holds ALL SOL; Poseidon Merkle tree (depth 24)
-        ↕ CPI
-LendingPool program          — accounting only; NO SOL; Kamino klend fork
-        ↕ CPI
-NullifierRegistry program    — PDA-based spent nullifier set; shared
-```
 
 SOL flows:
 - **Deposit**: IKA relay → ShieldedPool (via PER batch)
@@ -576,26 +499,6 @@ Threshold decryption reveals ONLY `total_collateral_value`. Individual collatera
 | Aggregate solvency | Encrypt FHE | Homomorphic sum of loan balances; only total revealed, individual positions stay encrypted |
 | Compliance disclosure | Encrypt threshold decryption | Individual loan balance disclosed to auditor via 2/3 MPC threshold decrypt; no global exposure |
 | Liquidation pre-authorization | IKA FutureSign | Borrower consents at borrow time; neither borrower (cannot block) nor operator (cannot trigger without condition) has unilateral control |
-
----
-
-## Privacy Guarantee Summary
-
-| Threat | Mitigation | Protocol |
-|---|---|---|
-| Depositor wallet visible in pool tx | IKA relay + PER batching | IKA + MagicBlock PER |
-| Timing correlation (deposit→pool) | PER batches multiple users; TX1 and TX2 are not one-to-one | MagicBlock PER |
-| Anonymity set too small | VRF dummy insertions — persistent in Merkle tree, appear in all future ring proofs | MagicBlock VRF |
-| Withdrawal submitter wallet on-chain | Withdrawal routed through IKA relay; relay wallet is signer | IKA relay |
-| Withdrawal linked to deposit | Ring proof (K=16 + VRF dummies): cannot identify which commitment was spent | Circom + VRF |
-| Withdrawal destination known | Umbra stealth address: one-time, no prior history | Umbra SDK |
-| Borrow vs withdrawal distinguishable | Unified relay → PER → stealth exit path for both | IKA relay + PER |
-| Borrower wallet linked to loan | Ring proof hides index; relay wallet is signer; Umbra stealth disbursement | Circom + IKA + Umbra |
-| Repayer identity revealed | repay_ring ZK proof hides wallet; relayed via IKA | Circom + IKA |
-| Oracle front-running (liquidation MEV) | Encrypted oracle; health_factor computed on ciphertext | Encrypt FHE |
-| Single operator key risk | IKA 2PC-MPC (user + MPC network both required) | IKA |
-| Liquidation trust | IKA FutureSign (pre-signed consent; condition-gated) | IKA |
-| Double-spend | NullifierRegistry PDA + ZK nullifierHash | ZK + Anchor |
 
 ---
 
