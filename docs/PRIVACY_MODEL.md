@@ -11,9 +11,24 @@ ShieldLend is a lending protocol where the following facts must be unobservable 
 | Which wallet deposited | Prevents building profiles of depositors |
 | Which commitment corresponds to which depositor | Prevents tracing withdrawal back to deposit |
 | Who is the borrower behind a loan | Prevents identity-linked credit profiling |
-| Loan amount and interest balance | Prevents on-chain net worth inference |
 | Who repaid a loan | Prevents confirmation of identity |
 | Where funds went after withdrawal or disbursement | Prevents tracking funds post-exit |
+| Whether an exit was a withdrawal or a borrow disbursement | Prevents inferring loan activity from exit patterns |
+
+Borrow amount and denomination class are visible on-chain as ZK public inputs — required for the on-chain program to verify LTV constraints. These are accepted disclosures.
+
+---
+
+## Four Sequential Privacy Protections
+
+ShieldLend applies four layered protections across the full transaction lifecycle:
+
+| Layer | Protection | Mechanism |
+|---|---|---|
+| Entry | Depositor wallet hidden from commitment | IKA relay + MagicBlock PER batch |
+| Relay | Timing correlation eliminated | PER temporal batching (Intel TDX enclave) |
+| Anonymity | Ring membership unlinkability | ZK ring proof K=16 + VRF dummies |
+| Exit | Destination and exit type hidden | Relay → PER exit batch → Umbra stealth address |
 
 ---
 
@@ -28,7 +43,7 @@ Reads all transactions, account states, event logs. Cannot decrypt encrypted acc
 Controls one or more wallets. Can submit transactions, watch mempool. Cannot break cryptographic commitments or forge ZK proofs.
 
 **Class C — Malicious relay operator**
-Controls the IKA relay wallet used for deposit and repay routing. Can observe the user→relay transaction (TX1). Cannot forge ZK proofs or access PER enclave internals.
+Controls the IKA relay wallet used for deposit, withdrawal, and repay routing. Can observe the user→relay transaction (TX1). Cannot forge ZK proofs or access PER enclave internals.
 
 **Class D — Compromised single validator**
 Controls one node on the IKA MPC network or the Encrypt threshold network. Cannot complete a threshold operation alone — both require 2/3 consensus.
@@ -62,17 +77,20 @@ ShieldLend's threat model assumes adversaries up to and including Class C. Class
 
 ### Withdrawal Unlinkability
 
-**Goal**: No observer can determine (a) which commitment was spent, or (b) who received the funds.
+**Goal**: No observer can determine (a) which commitment was spent, (b) who submitted the ring proof transaction, or (c) who received the funds.
 
 **Attack surface**:
 1. Ring membership is public (ring[16] in public outputs).
 2. nullifierHash is public — prevents double-spend but does not reveal which commitment.
-3. Withdrawal destination (stealth address) is public.
+3. The ring proof transaction signer is permanently on-chain.
+4. Withdrawal destination (stealth address) is public.
 
 **Mitigations**:
+- Relay routing: the user sends the ring proof off-chain to the IKA relay. The relay submits the on-chain transaction — the relay wallet is the permanent on-chain signer, not the user's wallet. This prevents linking a user's wallet to any set of 16 ring candidates.
 - Ring proof (K=16): the spent commitment is one of 16. An observer knows only which ring was used — not which element was spent. For a pool with N commitments, the probability of correctly guessing the spender is 1/16 per ring.
-- The ring is selected from across the entire Merkle tree, including dummy commitments. Dummies are indistinguishable from real commitments in the ring — they expand the effective anonymity set beyond K=16.
-- Umbra stealth address: the withdrawal destination is a fresh address with zero prior history. It is generated via ECDH from a published stealth meta-address — only the recipient can derive the private key. After the Umbra SDK sweeps funds to the user's wallet, the stealth address is abandoned and never reused.
+- The ring is selected from across the entire Merkle tree, including VRF dummy commitments. Dummies are indistinguishable from real commitments in the ring — they expand the effective anonymity set beyond K=16.
+- Unified exit path: withdrawal exits are queued in the same PER batch as borrow disbursement exits. An observer sees "relay sent SOL to stealth addresses" — and cannot classify whether each exit is a withdrawal or a borrow disbursement.
+- Umbra stealth address: the withdrawal destination is a fresh address with zero prior history, generated via ECDH from the recipient's stealth meta-address. Only the recipient can derive the private key.
 
 **Residual risk**: If an adversary can observe the recipient sweep from the stealth address to a known wallet, they learn the final destination. Mitigation: recipient sweeps via a separate mixer or delayed transfer (user responsibility post-exit).
 
@@ -86,15 +104,16 @@ ShieldLend's threat model assumes adversaries up to and including Class C. Class
 1. Collateral ring[16] is public — same analysis as withdrawal.
 2. Loan disbursement recipient is a public field in the borrow transaction.
 3. LoanAccount PDA is public — its existence signals a loan is active.
+4. Borrow amount is a ZK public input — visible on-chain.
 
 **Mitigations**:
-- Ring proof hides which commitment is collateral (same K=16 analysis).
+- Ring proof hides which commitment is collateral (same K=16 + VRF dummy analysis as withdrawal).
 - Collateral nullifier is locked (not spent) — the commitment remains in the Merkle tree and can appear in other users' rings. This prevents the "process of elimination" attack where an observer flags an absent commitment.
+- Relay routing for borrow submission: the relay wallet is the on-chain signer, not the borrower's wallet. The borrower's address is a private input to the collateral_ring circuit — never published on-chain.
+- Unified exit path: borrow disbursements exit via the same relay → PER → Umbra stealth path as withdrawals. Both exit types are indistinguishable on-chain.
 - Umbra stealth address for disbursement: the borrower's receiving address has no prior history.
-- IKA dWallet: the disbursement transaction is signed by the IKA relay program, not the borrower's wallet. The borrower's address is a private input to the collateral_ring circuit — never published on-chain.
-- Encrypt FHE: the loan amount in LoanAccount is a ciphertext. An observer sees a PDA was created but cannot read the amount.
 
-**Residual risk**: The LoanAccount PDA is created when a borrow occurs. An observer can count active loans and infer protocol utilization — but not who borrowed or how much.
+**Residual risk**: The LoanAccount PDA is created when a borrow occurs. An observer can count active loans and infer protocol utilization — but not who borrowed or which commitment is collateral.
 
 ---
 
@@ -107,7 +126,8 @@ ShieldLend's threat model assumes adversaries up to and including Class C. Class
 2. Repayment SOL must reach ShieldedPool.
 
 **Mitigations**:
-- repay_ring proof: proves knowledge of the collateral nullifier (only the borrower knows it) + repaymentAmount ≥ totalOwed, without revealing the borrower's wallet. The wallet is a private input.
+- repay_ring proof: proves knowledge of the collateral nullifier (only the borrower knows it) without revealing the borrower's wallet. The wallet and repayment amount are both private inputs. The circuit verifies `repaymentAmount ≥ outstanding_balance` entirely in-circuit — the repayment amount is never published on-chain.
+- Outstanding balance is computed on-chain from the public Kamino rate history and passed as a ZK public input. Only the sufficiency check result (pass/fail) is enforced — the repayment amount itself remains private.
 - Repayment SOL flows via the IKA relay — same path as deposit traffic. An observer sees "relay received SOL and cleared a loan PDA" — identical to a deposit in terms of relay traffic analysis.
 - loanId is the only public link — it identifies which PDA to close. It does not identify the borrower.
 - After repay, the LoanAccount PDA is closed. The collateral nullifier is unlocked and the note is withdrawable. No on-chain trace connects the repayment event to the original depositor's wallet.
@@ -119,10 +139,10 @@ ShieldLend's threat model assumes adversaries up to and including Class C. Class
 The NullifierRegistry PDA is the single source of truth for whether a note has been used:
 
 ```
-withdraw: Active → Spent    (note consumed; cannot withdraw again)
-borrow:   Active → Locked   (note locked; cannot withdraw while loan active)
-repay:    Locked → Active   (note released; can now withdraw)
-liquidate: Locked → Spent   (note consumed by liquidation)
+withdraw:  Active → Spent    (note consumed; cannot withdraw again)
+borrow:    Active → Locked   (note locked; cannot withdraw while loan active)
+repay:     Locked → Active   (note released; can now withdraw)
+liquidate: Locked → Spent    (note consumed by liquidation)
 ```
 
 The ZK circuit computes `nullifierHash = Poseidon(nullifier)` where `nullifier` is a private input only the depositor knows. The on-chain program checks `NullifierAccount(nullifierHash).status`. A forged proof that uses a valid nullifierHash but wrong nullifier is computationally infeasible — Poseidon is collision-resistant in the BN254 field.
@@ -135,7 +155,7 @@ Standard oracle attacks on lending protocols:
 1. Observer sees a large price drop incoming
 2. Observer front-runs the health_factor breach to avoid liquidation or force liquidation on others
 
-ShieldLend's mitigation: price feeds are submitted as FHE ciphertext inputs. The `health_factor` computation runs homomorphically on encrypted values. No observer — including MEV bots — can see the price feed before the `flush_epoch` or `liquidate` transaction confirms. The health_factor result is also a ciphertext until the ER liquidation bot requests threshold decryption for a specific loan.
+ShieldLend's mitigation: price feeds are submitted as Encrypt FHE ciphertext inputs. The `health_factor` computation runs homomorphically on encrypted values. No observer — including MEV bots — can see the price feed before the `liquidate` transaction confirms. The health_factor result is also a ciphertext until threshold decryption is requested for a specific loan.
 
 ---
 
@@ -149,7 +169,7 @@ total_outstanding = Σ(encrypted_balance[i])   // FHE homomorphic addition
 
 FHE homomorphic addition preserves the encryption — the sum is still a ciphertext. A single threshold decryption of the sum reveals only `total_outstanding`. Individual `encrypted_balance[i]` values remain ciphertext throughout.
 
-The ER liquidation bot monitors: `total_outstanding ≤ shielded_pool.lamports × LTV_FLOOR`. If this invariant is breached (e.g., a market crash causes widespread undercollateralization), the bot triggers emergency pause.
+The solvency invariant monitored: `total_outstanding ≤ shielded_pool.lamports × LTV_FLOOR`.
 
 ---
 
@@ -159,7 +179,7 @@ The ER liquidation bot monitors: `total_outstanding ≤ shielded_pool.lamports �
 |---|---|---|
 | MagicBlock PER Intel TDX | Enclave not compromised | Deposit→commitment mapping exposed |
 | IKA MPC network (2/3) | Not all validators collude | Unauthorized disbursement possible |
-| Encrypt threshold network (2/3) | Not all validators collude | Loan balances exposed |
+| Encrypt threshold network (2/3) | Not all validators collude | Aggregate balance sum exposed to a single party |
 | Umbra SDK key derivation | ECDH not broken | Stealth address ownership linked |
 | groth16-solana BN254 | Discrete log hard on BN254 | ZK proofs forgeable |
 | Poseidon hash | Collision resistance | Commitment collision, nullifier forgery |

@@ -13,7 +13,7 @@ ShieldLend is three Anchor programs that communicate exclusively via CPI (Cross-
 │  - Poseidon Merkle tree (depth 24, ~16M leaves) │
 │  - commitment insertion + epoch flush           │
 │  - Groth16 withdrawal verification              │
-│  - MagicBlock PER deposit accounts delegated    │
+│  - MagicBlock PER deposit + exit accounts       │
 └──────────────────┬──────────────────────────────┘
                    │ CPI
 ┌──────────────────▼──────────────────────────────┐
@@ -22,7 +22,6 @@ ShieldLend is three Anchor programs that communicate exclusively via CPI (Cross-
 │  - Kamino klend fork (poly-linear interest)     │
 │  - Groth16 collateral + repay verification      │
 │  - IKA dWallet CPI for disbursement co-signing  │
-│  - Encrypt FHE ciphertext loan accounts         │
 └──────────────────┬──────────────────────────────┘
                    │ CPI
 ┌──────────────────▼──────────────────────────────┐
@@ -55,6 +54,11 @@ DepositQueueAccount (ephemeral, delegated to PER)
   - user_commitment: [u8; 32]
   - denomination_lamports: u64
   - relay_nonce: u64
+
+ExitQueueAccount (ephemeral, delegated to PER)
+  - stealth_address: Pubkey
+  - amount_lamports: u64
+  - relay_nonce: u64
 ```
 
 ### Instructions
@@ -63,7 +67,9 @@ DepositQueueAccount (ephemeral, delegated to PER)
 |---|---|---|
 | `deposit` | IKA relay (via PER) | Add commitment to epoch queue |
 | `flush_epoch` | IKA relay | VRF-shuffle queue + insert dummies + update Merkle root |
-| `withdraw` | Any (proof-gated) | Verify Groth16 ring proof, mark nullifier, release SOL to Umbra stealth address |
+| `withdraw` | IKA relay (proof-gated) | Verify Groth16 ring proof, mark nullifier, queue SOL to PER exit batch |
+| `disburse` | lending_pool (CPI) | Queue loan disbursement amount to PER exit batch |
+| `flush_exits` | IKA relay (via PER) | Flush exit queue — send each amount to its Umbra stealth address |
 
 ### Merkle Tree
 
@@ -89,23 +95,31 @@ fn flush_epoch(ctx, vrf_proof) {
 }
 ```
 
-VRF proof is included in the `flush_epoch` transaction. On-chain verification confirms the randomness was not manipulated. Dummy commitments are Poseidon hashes of known zero values — publicly known but indistinguishable from real commitments in a ring proof.
+VRF proof is included in the `flush_epoch` transaction. On-chain verification confirms the randomness was not manipulated. Dummy commitments are Poseidon hashes of known zero values — publicly known but indistinguishable from real commitments in a ring proof. Once inserted, they remain in the tree permanently and appear as ring candidates for all future withdrawal and borrow proofs.
 
 ### Withdrawal Flow
 
 ```
 Client:
   1. Load note (secret, nullifier) from AES-256-GCM vault
-  2. Fetch current Merkle root + ring of 16 commitments (includes own)
+  2. Fetch current Merkle root + ring of 16 commitments (includes own + VRF dummies)
   3. snarkjs.groth16.fullProve(withdraw_ring, inputs) → proof + publicSignals
-  4. Submit withdraw instruction with proof + stealth_address
+  4. Send proof + stealth_meta_address to IKA relay (off-chain)
+     [relay wallet will be the on-chain signer — user wallet not published]
 
-On-chain (shielded_pool::withdraw):
+IKA relay submits on-chain (shielded_pool::withdraw):
   5. groth16_solana::verify(proof, publicSignals, VK_HASH)
   6. Check nullifier_registry::is_spent(nullifierHash) == false
   7. CPI → nullifier_registry::mark_spent(nullifierHash)
-  8. transfer(denomination_lamports, stealth_address)
+  8. Generate fresh Umbra stealth address from stealth_meta_address
+  9. Enqueue ExitQueueAccount { stealth_address, denomination_lamports } in PER
+
+PER exit flush (flush_exits):
+  10. Transfer denomination_lamports → stealth_address for each exit in queue
+      [withdrawal exits and borrow disbursement exits flush together — indistinguishable]
 ```
+
+`onAccountChange()` on `ShieldedPoolState.merkle_root` signals deposit confirmation to the frontend when the root updates after `flush_epoch`.
 
 ---
 
@@ -119,13 +133,12 @@ LoanAccount (PDA per loan_id)
   - collateral_denomination_class: u8     // index into DENOMINATION_TABLE
   - loan_id: u64
   - disbursed_at: i64
+  - borrow_amount: u64                    // public — visible on-chain (ZK public input)
   - status: LoanStatus { Active, Repaid, Liquidated }
-  - encrypted_balance: EncryptCiphertext  // FHE-encrypted borrowed amount
-  - encrypted_interest: EncryptCiphertext // FHE-encrypted accrued interest
 
 InterestRateModel (singleton PDA)
   - utilization_kinks: [u16; 11]          // basis points — 11-point Kamino model
-  - rate_at_kink: [u16; 11]               // annual rate at each kink
+  - rate_at_kink: [u16; 11]              // annual rate at each kink
   - last_updated: i64
 ```
 
@@ -133,8 +146,8 @@ InterestRateModel (singleton PDA)
 
 | Instruction | Signer | Purpose |
 |---|---|---|
-| `borrow` | Any (proof-gated) | Verify collateral proof, create LoanAccount, CPI → IKA disburse to stealth address |
-| `repay` | Any (proof-gated) | Verify repay_ring proof, clear LoanAccount, unlock nullifier |
+| `borrow` | IKA relay (proof-gated) | Verify collateral proof, create LoanAccount, CPI → IKA disburse to stealth address |
+| `repay` | IKA relay (proof-gated) | Verify repay_ring proof, clear LoanAccount, unlock nullifier |
 | `liquidate` | IKA FutureSign trigger | Execute pre-authorized liquidation when health_factor breached |
 | `update_rate` | Governance | Update interest rate kink table |
 
@@ -145,17 +158,26 @@ Client:
   1. Select collateral note (secret, nullifier, denomination)
   2. Choose borrow amount (must satisfy: denomination × LTV_BPS ≥ borrowed × 10000)
   3. snarkjs.groth16.fullProve(collateral_ring, inputs) → proof
+     [borrowed and minRatioBps are ZK public outputs — visible on-chain]
   4. Generate fresh Umbra stealth address for loan disbursement
-  5. Submit borrow instruction with proof + stealth_address + loan_amount
+  5. Send proof + stealth_address to IKA relay (off-chain)
+     [relay wallet will be the on-chain signer — borrower wallet not published]
 
-On-chain (lending_pool::borrow):
+IKA relay submits on-chain (lending_pool::borrow):
   6. groth16_solana::verify(proof, publicSignals, COLLATERAL_VK_HASH)
   7. Verify nullifier not spent (collateral locked, not consumed)
   8. CPI → nullifier_registry::lock_nullifier(nullifierHash)
-  9. Create LoanAccount (FHE-encrypt balance + interest = 0)
+  9. Create LoanAccount
   10. CPI → IKA::approve_message(disbursement_params)
-       → IKA MPC network validates + co-signs
+        → IKA MPC network validates + co-signs
+        [both on-chain LTV verification AND IKA approval required]
   11. CPI → shielded_pool::disburse(loan_amount, stealth_address)
+        → queued as ExitQueueAccount in PER alongside withdrawal exits
+
+IKA FutureSign stored at borrow time:
+  "Liquidate loanId X if health_factor < Y"
+  Borrower pre-authorizes. Condition checked on-chain at liquidation time.
+  Neither borrower nor operator can execute unilaterally.
 ```
 
 ### Repay Flow
@@ -163,16 +185,20 @@ On-chain (lending_pool::borrow):
 ```
 Client:
   1. Load collateral note to regenerate nullifier
-  2. Submit repaymentAmount claim + generate repay_ring proof
-  3. Send repaymentAmount SOL via IKA relay
-  4. Submit repay instruction with proof
+  2. Query on-chain: outstanding_balance = borrow_amount × compound(rate_history, elapsed)
+     [Kamino rate history is public on-chain — program computes this at repay time]
+  3. Generate Groth16 repay_ring proof:
+     PRIVATE: nullifier, repaymentAmount
+     PUBLIC:  nullifierHash, loanId, outstanding_balance
+     CIRCUIT: repaymentAmount ≥ outstanding_balance  [verified in-circuit; repaymentAmount never on-chain]
+  4. Send repaymentAmount SOL + proof to IKA relay
+     [relay routes repayment SOL — traffic indistinguishable from deposits]
 
-On-chain (lending_pool::repay):
+IKA relay submits on-chain (lending_pool::repay):
   5. groth16_solana::verify(proof, publicSignals, REPAY_VK_HASH)
-  6. Encrypt FHE verifies repaymentAmount >= totalOwed (on encrypted values)
-  7. CPI → nullifier_registry::unlock_nullifier(nullifierHash)
-  8. Close LoanAccount
-  9. CPI → IKA::approve_message(collateral_unlock)
+     [circuit already proved repaymentAmount ≥ outstanding_balance in step 3]
+  6. CPI → nullifier_registry::unlock_nullifier(nullifierHash)
+  7. Close LoanAccount
 ```
 
 ### Interest Rate Model (Kamino klend fork)
@@ -193,7 +219,7 @@ rate
 
 At each kink: `rate = lerp(rate[i], rate[i+1], (utilization - kink[i]) / (kink[i+1] - kink[i]))`
 
-Interest accrues to FHE ciphertext accounts — validators see no amounts.
+The outstanding balance at repay time is computed from the public rate history stored in `InterestRateModel` — no encrypted state needed for the sufficiency check.
 
 ---
 
@@ -276,37 +302,36 @@ Constraints:
 ```
 Private inputs:
   nullifier                           // proves knowledge of collateral secret
-  repaymentAmount
-  borrowerWallet                      // never revealed on-chain
+  repaymentAmount                     // never published on-chain
 
 Public outputs:
   nullifierHash = Poseidon(nullifier) // matches locked nullifier in registry
   loanId                              // identifies which loan PDA to clear
+  outstanding_balance                 // computed on-chain from Kamino rate history
 
 Constraints:
   nullifierHash = Poseidon(nullifier)
-  // repaymentAmount >= totalOwed enforced by Encrypt FHE on ciphertext
+  repaymentAmount >= outstanding_balance   // sufficiency check in-circuit
 ```
 
 ---
 
-## MagicBlock PER + ER — Parallel Operation
+## MagicBlock PER — Deposit and Exit Batching
 
 ```
 MagicBlock PER (Private Ephemeral Rollup)
-  Delegates: shielded_pool deposit queue accounts
+  Delegates: shielded_pool deposit queue accounts + exit queue accounts
   Intel TDX enclave: deposit→commitment mapping hidden inside enclave
   Settlement: fraud-provable state commit to base Solana
   Privacy: REQUIRED
 
-MagicBlock ER (Standard Ephemeral Rollup, 1ms blocks)
-  Delegates: lending_pool health monitor state
-  Liquidation bot: continuous health_factor polling
-  Settlement: standard ephemeral rollup commit
-  Privacy: NOT REQUIRED
+  Deposit path: user TX1 → PER enclave → batched TX2 → Merkle insertion
+  Exit path:    withdrawal + disbursement exits queued together
+                → single flush_exits → SOL to respective Umbra stealth addresses
+                → exit type (withdrawal vs borrow) is indistinguishable in the batch
 ```
 
-Different PDAs are delegated to different rollup environments. Both run simultaneously without conflict. Anchor programs support multiple PDA sets delegated independently.
+The PER handles both sides of the privacy-critical path: deposit inputs and SOL outputs. A single ephemeral environment covers both, so the same enclave isolation and batch-privacy properties apply to all fund flows.
 
 ---
 
@@ -332,20 +357,29 @@ lending_pool::borrow {
 
 ---
 
-## Encrypt FHE Account Pattern
+## Encrypt FHE — Oracle and Solvency Pattern
 
 ```rust
+// Oracle price submitted as FHE ciphertext — MEV bots cannot compute
+// health_factor from an encrypted price feed in the mempool
 #[encrypt_fn]
-fn accrue_interest(
-    balance: EncryptCiphertext,
-    rate: EncryptCiphertext,
-    elapsed: u64,
+fn compute_health_factor(
+    collateral_value: EncryptCiphertext,  // price feed × denomination — encrypted
+    outstanding: EncryptCiphertext,       // total owed — encrypted
 ) -> EncryptCiphertext {
-    // Homomorphic multiplication — no plaintext ever materialized
-    balance + (balance * rate * elapsed / SECONDS_PER_YEAR)
+    collateral_value / outstanding        // homomorphic division — no plaintext
+}
+
+// Aggregate solvency: homomorphic sum over all loan balances
+// reveals only total outstanding, not individual positions
+#[encrypt_fn]
+fn aggregate_outstanding(
+    balances: &[EncryptCiphertext],
+) -> EncryptCiphertext {
+    balances.iter().fold(EncryptCiphertext::zero(), |acc, b| acc + b)
 }
 ```
 
 Threshold decryption (2/3 IKA MPC) used for:
-1. **Aggregate solvency**: `Σ(balance[i])` → single decrypt → total outstanding, no individual exposure
+1. **Aggregate solvency**: `Σ(outstanding[i])` → single decrypt → total outstanding, no individual exposure
 2. **Targeted audit**: single `loanId` balance decrypted for compliance disclosure
