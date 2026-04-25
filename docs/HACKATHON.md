@@ -16,6 +16,10 @@ ShieldLend targets three tracks simultaneously. Each track covers an orthogonal 
 
 ---
 
+> **Pre-Alpha Status**: IKA dWallet and Encrypt FHE are pre-alpha protocols. For this hackathon submission, IKA uses a mock signer (all integration points, CPI call signatures, and method names are implemented exactly as they will be in production) and Encrypt uses a plaintext fallback with FHE interface stubs. The production path for each is documented in the README Pre-Alpha Status table. This disclosure is included here so judges reviewing this file independently have the full picture.
+
+---
+
 ## Track 1 — IKA + Encrypt Frontier
 
 ### Track theme

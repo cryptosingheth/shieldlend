@@ -41,6 +41,28 @@ ShieldLend applies four sequential protections across the transaction lifecycle.
 
 ---
 
+## Current Build Status
+
+The project is in the architecture-finalisation phase. All design documentation is complete. On-chain programs and the full frontend have not yet been built.
+
+| Component | Status | Notes |
+|---|---|---|
+| `circuits/withdraw_ring.circom` | Done (update required) | Nullifier formula must be updated before recompile — see ZK Circuits section |
+| `circuits/collateral_ring.circom` | Done (update required) | Same nullifier update required |
+| `circuits/repay_ring.circom` | TODO | Not yet written (Phase 2) |
+| `frontend/public/circuits/*.wasm` | Stale | Recompile after circuit update |
+| `frontend/src/lib/circuits.ts` | Done | snarkjs Groth16 proof generation (chain-agnostic) |
+| `frontend/src/lib/noteStorage.ts` | Done | AES-256-GCM note vault (chain-agnostic) |
+| `docs/` (all 7 files) | Done | Full architecture documentation |
+| Anchor workspace (`Anchor.toml`, `Cargo.toml`) | TODO | Phase 1 — not yet initialized |
+| `programs/shielded_pool/` | TODO | Phase 1 |
+| `programs/lending_pool/` | TODO | Phase 1 |
+| `programs/nullifier_registry/` | TODO | Phase 1 |
+| Solana frontend (wallet adapter, forms, API routes) | TODO | Phase 4 |
+| Tests | TODO | Phase 5 |
+
+---
+
 ## Protocol Selection
 
 Every protocol in ShieldLend's stack was chosen to close a specific privacy gap that no other tool addressed. The design started from privacy requirements and worked backwards to protocols — not the other way around.
@@ -451,24 +473,32 @@ SOL flows:
 
 All circuits produce Groth16 proofs verified on-chain by `groth16-solana`.
 
-| Circuit | Proves | Public inputs/outputs |
-|---|---|---|
-| `withdraw_ring.circom` | Ring membership (K=16) + Merkle inclusion at `leaf_index` (depth 24) | `ring[16]`, `nullifierHash`, `root`, `denomination_out` |
-| `collateral_ring.circom` | Ring membership + `denomination × minRatioBps ≥ borrowed × 10000` | `ring[16]`, `nullifierHash`, `root`, `borrowed`, `minRatioBps` |
-| `repay_ring.circom` | Nullifier knowledge + `repaymentAmount ≥ outstanding_balance` (in-circuit, amount private) | `nullifierHash`, `loanId`, `outstanding_balance` |
+| Circuit | Status | Proves | Public inputs/outputs |
+|---|---|---|---|
+| `withdraw_ring.circom` | Done (update required)* | Ring membership (K=16) + Merkle inclusion at `leaf_index` (depth 24) | `ring[16]`, `nullifierHash`, `root`, `denomination_out` |
+| `collateral_ring.circom` | Done (update required)* | Ring membership + `denomination × minRatioBps ≥ borrowed × 10000` | `ring[16]`, `nullifierHash`, `root`, `borrowed`, `minRatioBps` |
+| `repay_ring.circom` | **TODO** | Nullifier knowledge + `repaymentAmount ≥ outstanding_balance` (in-circuit, amount private) | `nullifierHash`, `loanId`, `outstanding_balance` |
+
+*`withdraw_ring` and `collateral_ring` require a nullifier formula update (add `leaf_index` private input) before they can be recompiled. The compiled `.wasm` files in `frontend/public/circuits/` are currently stale and must not be used until the circuits are updated and recompiled.
 
 **Nullifier formula** (all circuits): `nullifierHash = Poseidon(nullifier, leaf_index, SHIELDED_POOL_PROGRAM_ID)`
 
 - `leaf_index`: private input proving position in the Merkle tree — prevents re-insertion attacks
 - `SHIELDED_POOL_PROGRAM_ID`: domain separator — prevents cross-contract nullifier correlation
 
-**Root validation**: proofs are valid against any of the 30 most recent Merkle roots (not just the current root) — users can be offline for up to ~2.5 hours without losing access to their notes.
+**Root validation**: proofs are valid against any of the 30 most recent Merkle roots (not just the current root). Users can be offline for approximately 2.5 hours (30 epochs × ~5 minutes per epoch) without losing access to their notes.
 
 ---
 
 ## Fixed Denominations
 
 Deposits use fixed denominations (0.1 SOL, 1 SOL, 10 SOL). This is a requirement of the ZK circuit design: denomination is embedded in the commitment hash and is a public output of the withdrawal proof. Standardized denominations prevent amount-based correlation — every participant in a denomination pool looks identical on-chain.
+
+| Denomination | Lamports |
+|---|---|
+| 0.1 SOL | 100,000,000 |
+| 1 SOL | 1,000,000,000 |
+| 10 SOL | 10,000,000,000 |
 
 Loan amounts are variable. The borrow amount appears as a public input to the collateral ring circuit — required for on-chain LTV verification binding.
 
@@ -519,16 +549,34 @@ Threshold decryption reveals ONLY `total_collateral_value`. Individual collatera
 
 ---
 
+## Operational Modes
+
+ShieldLend has three operational modes that degrade gracefully when external dependencies are unavailable. Full documentation is in [`docs/NOTE_LIFECYCLE.md`](docs/NOTE_LIFECYCLE.md).
+
+| Mode | Activates when | Privacy level |
+|---|---|---|
+| **Full Privacy** (default) | All dependencies operational | Maximum — all four layers active |
+| **Degraded Privacy** | MagicBlock PER offline for `per_fallback_epoch_threshold` epochs | Reduced — temporal unlinking lost; ZK ring + Umbra stealth still active |
+| **Emergency** | PER and IKA both offline (governance vote required) | Minimal — user wallet appears on-chain as signer; fund recovery prioritized |
+
+**Full Privacy**: Deposit path runs through IKA relay → MagicBlock PER enclave → ShieldedPool batch. Exit path routes through PER → Umbra stealth. All four privacy layers active.
+
+**Degraded Privacy**: PER is bypassed. Deposits and exits go directly relay → ShieldedPool without batching. Timing correlation between deposit and exit becomes possible. ZK ring proofs (which commitment was spent) and Umbra stealth addresses (where funds go) remain fully active. Frontend displays a prominent banner when this mode is active.
+
+**Emergency**: Both PER and IKA are unavailable. `emergency_withdraw(ring_proof)` releases SOL directly to the user's own wallet — no relay, no stealth address. The user's wallet appears on-chain as the transaction signer. This mode exists solely to guarantee fund recovery; it is a last resort and requires a multi-sig governance vote with time-lock to activate.
+
+---
+
 ## Tech Stack
 
 **On-Chain**
 - Anchor (Rust smart contracts)
 - Kamino klend fork (lending logic)
 - groth16-solana (ZK proof verification, BN254 native syscalls, Light Protocol Labs)
-- MagicBlock PER macros (`#[ephemeral]`, `#[delegate]`, `#[commit]`)
-- MagicBlock VRF SDK
-- IKA dWallet Anchor CPI (`ika-dwallet-anchor`)
-- Encrypt FHE Anchor integration (`encrypt-anchor`)
+- MagicBlock PER macros — `#[ephemeral]`, `#[delegate]`, `#[commit]` (planned)
+- MagicBlock VRF SDK (planned)
+- IKA dWallet Anchor CPI — `ika-dwallet-anchor` (planned — mock signer for hackathon)
+- Encrypt FHE Anchor integration — `encrypt-anchor` (planned — plaintext fallback for hackathon)
 - Poseidon hash (matching circuits)
 
 **Off-Chain / Client**
@@ -543,6 +591,35 @@ Threshold decryption reveals ONLY `total_collateral_value`. Individual collatera
 
 ## Repository Structure
 
+### Current (as of April 2026)
+
+```
+shieldlend-solana/
+├── circuits/
+│   ├── withdraw_ring.circom    # K=16 ring + depth-24 Merkle (update required before recompile)
+│   └── collateral_ring.circom  # K=16 ring + LTV in-circuit (update required before recompile)
+├── docs/
+│   ├── architecture.md
+│   ├── DESIGN_DECISIONS.md
+│   ├── HACKATHON.md
+│   ├── NOTE_LIFECYCLE.md
+│   ├── PRIVACY_MODEL.md
+│   ├── RESEARCH_REPORT.md
+│   └── THREAT_MODEL.md
+├── frontend/
+│   ├── public/circuits/
+│   │   ├── withdraw_ring.wasm  # stale — recompile after circuit update
+│   │   └── collateral_ring.wasm
+│   └── src/lib/
+│       ├── circuits.ts         # snarkjs proof generation
+│       └── noteStorage.ts      # AES-256-GCM note vault
+├── .gitignore
+├── CLAUDE.md
+└── README.md
+```
+
+### Planned (target state after Phase 1–4)
+
 ```
 shieldlend-solana/
 ├── programs/
@@ -550,9 +627,9 @@ shieldlend-solana/
 │   ├── lending_pool/           # Kamino klend fork + IKA + Encrypt FHE wiring
 │   └── nullifier_registry/     # PDA nullifier set
 ├── circuits/
-│   ├── withdraw_ring.circom    # K=16 ring + depth-24 Merkle
-│   ├── collateral_ring.circom  # K=16 ring + LTV in-circuit
-│   ├── repay_ring.circom       # nullifier knowledge + repaymentAmount >= outstanding_balance
+│   ├── withdraw_ring.circom    # updated with leaf_index nullifier formula
+│   ├── collateral_ring.circom  # updated with leaf_index nullifier formula
+│   ├── repay_ring.circom       # new: nullifier knowledge + repaymentAmount >= outstanding
 │   └── keys/                   # .zkey + .vkey.json for all three circuits
 ├── tests/
 │   ├── shielded_pool.ts
@@ -564,25 +641,36 @@ shieldlend-solana/
 │   │       ├── ika/route.ts    # IKA dWallet approve_message endpoint
 │   │       └── per/route.ts    # MagicBlock PER deposit + exit endpoint
 │   ├── lib/
-│   │   ├── circuits.ts         # snarkjs proof generation
-│   │   ├── umbra.ts            # Umbra SDK integration (ALL stealth addresses)
+│   │   ├── circuits.ts
+│   │   ├── umbra.ts            # Umbra SDK integration
 │   │   ├── encrypt.ts          # Encrypt FHE ciphertext interaction
-│   │   └── noteStorage.ts      # AES-256-GCM localStorage vault
+│   │   └── noteStorage.ts
 │   └── components/
 │       ├── DepositForm.tsx
 │       ├── WithdrawForm.tsx
 │       ├── BorrowForm.tsx
 │       └── RepayForm.tsx
 ├── docs/
-│   ├── architecture.md         # Deep technical architecture and program design
-│   ├── PRIVACY_MODEL.md        # Threat model and unlinkability analysis
-│   ├── DESIGN_DECISIONS.md     # Protocol selection rationale for every component
-│   └── HACKATHON.md            # Track eligibility and submission narratives
+│   └── (same 7 files)
 ├── Anchor.toml
 ├── Cargo.toml
 ├── package.json
 └── README.md
 ```
+
+---
+
+## Pre-Alpha Status
+
+Several protocols used in ShieldLend are in pre-alpha on devnet. Hackathon integration uses mock signers / unencrypted fallbacks. Production deployments require mainnet availability.
+
+| Protocol | Devnet status | Hackathon approach | Production path |
+|---|---|---|---|
+| IKA dWallet | Pre-alpha | Mock signer — all integration points, CPI patterns, and method signatures implemented as production | IKA Solana mainnet |
+| Encrypt FHE | Pre-alpha | Plaintext fallback with FHE interface stubs | Encrypt mainnet |
+| MagicBlock PER | Devnet (Discord access required) | Full devnet integration | MagicBlock PER mainnet |
+| groth16-solana | Mainnet-beta ready | Full production integration | BN254 syscalls live since Solana 1.18.x |
+| Umbra SDK | Mainnet alpha (Solana, Feb 2026) | Full production integration | Production-ready |
 
 ---
 
@@ -594,42 +682,15 @@ shieldlend-solana/
 | Colosseum Privacy Track | MagicBlock | PER deposit batching + PER exit batching + VRF dummy insertion |
 | Umbra Side Track | Frontier | Umbra SDK for all output addresses (withdrawals + loan disbursements) |
 
-Each track covers a distinct privacy layer — entry execution, transaction routing, on-chain state, and exit address — with no overlap between them.
-
----
-
-## Pre-Alpha Status
-
-Several protocols used in ShieldLend are in pre-alpha on devnet. Hackathon integration uses mock signers / unencrypted fallbacks. Production deployments require mainnet availability.
-
-| Protocol | Devnet status | Production path |
-|---|---|---|
-| IKA dWallet | Pre-alpha (mock signer) | IKA Solana mainnet |
-| Encrypt FHE | Pre-alpha (plaintext fallback) | Encrypt mainnet |
-| MagicBlock PER | Devnet (Discord access required) | MagicBlock PER mainnet |
-| groth16-solana | Mainnet-beta ready | BN254 syscalls live since Solana 1.18.x |
-| Umbra SDK | Mainnet alpha (Solana, Feb 2026) | Production-ready |
+Each track covers a distinct privacy layer — entry execution, transaction routing, on-chain state, and exit address — with no overlap between them. For full track-by-track integration details and non-overlap justification, see [`docs/HACKATHON.md`](docs/HACKATHON.md).
 
 ---
 
 ## Architecture Inspirations
 
-ShieldLend builds on and extends proven patterns from production privacy protocols. Each borrowed pattern is adapted to Solana's account model and explicitly cited in our architecture documentation. We are building on existing work, not reinventing it — and going further where no existing protocol has gone.
+ShieldLend builds on proven patterns from production privacy protocols — historical root ring buffers (Railgun, Tornado Cash), position-dependent nullifiers (Penumbra), app-siloed nullifier domains (Aztec), and three-step async liquidation adapted from Laolex/shieldlend's EVM implementation. Two patterns are original to this design: VRF dummy indistinguishability and the unified exit path that makes withdrawal and borrow disbursement structurally identical on-chain.
 
-| Pattern | Inspired by | What we adapted | Where it appears |
-|---|---|---|---|
-| Historical root ring buffer | Railgun, Tornado Cash | Retain 30 historical roots; `historical_roots.contains(proof.root)` | `ShieldedPoolState` |
-| Position-dependent nullifiers | Penumbra | `Poseidon(nullifier, leaf_index, PROGRAM_ID)` prevents re-insertion attacks | All three circuits |
-| App-siloed nullifier domain | Aztec | `SHIELDED_POOL_PROGRAM_ID` in nullifierHash prevents cross-contract correlation | All three circuits |
-| Three-step async liquidation | Laolex/shieldlend (FHE) | Handle pinning + breach confirmation adapted from Solidity mapping to Anchor PDA | `lending_pool::liquidate` |
-| Handle pinning [C-01] | Laolex/shieldlend (FHE) | PDA seed binding replaces storage-slot binding | `LoanAccount` fields |
-| Keeper-based interest accrual | Laolex/shieldlend (FHE) | Slot-based timing, off-chain utilization estimation | `lending_pool::accrue_interest` |
-| Threshold decryption for aggregate solvency | Penumbra (flow encryption) | Homomorphic sum of FHE balances, threshold decrypt reveals total only | Encrypt FHE integration |
-| Atomic borrow + exit | Nocturne (Operation model) | Verify ring proof and queue exit in same instruction | `lending_pool::borrow` |
-| VRF dummy indistinguishability | Original design (no prior art) | `Poseidon(vrf_output, denomination)` — same structure as real commitments | `shielded_pool::flush_epoch` |
-| Unified exit path | Original design | Withdrawal + borrow disbursement through same PER exit batch | `shielded_pool::flush_exits` |
-
-The full competitive analysis that produced this table is in [`docs/RESEARCH_REPORT.md`](docs/RESEARCH_REPORT.md).
+Full competitive analysis, attribution table, and protocol comparisons: [`docs/RESEARCH_REPORT.md`](docs/RESEARCH_REPORT.md).
 
 ---
 
@@ -648,6 +709,8 @@ The full competitive analysis that produced this table is in [`docs/RESEARCH_REP
 ---
 
 ## Getting Started
+
+> **Note**: Setup instructions below describe what the workflow will look like once the Anchor workspace is initialized (Phase 1). No programs exist yet — the commands are a preview of the target setup, not currently runnable.
 
 ```bash
 # Solana CLI + Anchor prerequisites
