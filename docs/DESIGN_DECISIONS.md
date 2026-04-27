@@ -94,16 +94,19 @@ The PER also handles the exit batch (see ADR: Unified Exit Path below) — the s
 
 ---
 
-## Repayment Sufficiency: ZK Circuit (not FHE verification)
+## Private Repayment Settlement: MagicBlock Private Payments + ZK Receipt Binding
 
-**Requirement**: Verify at repayment time that `repaymentAmount ≥ outstanding_balance` without publishing `repaymentAmount` on-chain.
+**Requirement**: Repayment must unlock collateral only after sufficient value has settled, while preserving borrower identity privacy and, in Full Privacy mode, avoiding a public repayment transfer graph.
 
 **Options considered**:
-- **Publish repaymentAmount on-chain and check directly**: Simplest. Reveals repayment amount — observer can infer loan details.
-- **FHE verification on encrypted values**: Would require storing the loan balance as a ciphertext and verifying the sufficiency condition homomorphically. Complex, expensive, and unnecessary given that outstanding balance is fully derivable from on-chain state.
-- **ZK circuit with repaymentAmount as private input**: `outstanding_balance` is computed on-chain from the public Kamino rate history and passed as a ZK public input. `repaymentAmount` is a private circuit input. The circuit verifies `repaymentAmount ≥ outstanding_balance` in-circuit. The on-chain program only sees the proof — the repayment amount is never revealed.
+- **Publish repaymentAmount on-chain and check directly**: Simplest and safest for accounting, but reveals repayment amount and creates a visible repayment transfer.
+- **ZK circuit with repaymentAmount as private input only**: Proves an amount exists inside a circuit, but does not hide a normal on-chain SOL/SPL transfer. This would overclaim amount privacy unless the settlement rail is also private.
+- **FHE verification on encrypted values**: Possible in theory, but adds complexity to a deterministic lending operation and does not by itself move value privately.
+- **MagicBlock Private Payments + ZK receipt binding**: Private payments hide the repayment movement. The ZK circuit proves collateral-nullifier authority and binds `loanId`, `nullifierHash`, `outstanding_balance`, and the private payment receipt hash. LendingPool verifies the receipt before unlocking collateral.
 
-**Decision**: ZK circuit. The Kamino `InterestRateModel` stores the complete rate history on-chain — the program can compute `outstanding_balance` deterministically at repayment time from public state. Passing this as a ZK public input and making `repaymentAmount` private achieves the privacy goal with a clean proof structure and no FHE overhead.
+**Decision**: MagicBlock Private Payments for repayment settlement, with a new `repay_ring` circuit that binds the locked collateral nullifier to a private payment receipt. This is the correct division of responsibility: MagicBlock hides value movement; ZK proves authorization and binding; the lending program keeps deterministic accounting from public rate history.
+
+**Fallback**: If private payments are unavailable, repayment can still route through the IKA relay for identity privacy. In that degraded path, repayment amount privacy is not claimed.
 
 ---
 
@@ -117,6 +120,21 @@ The PER also handles the exit batch (see ADR: Unified Exit Path below) — the s
 - **MagicBlock VRF**: On-chain verifiable randomness with cryptographic proof per result. Callback-based — the requester cannot manipulate the output after requesting it. Free within ER, 0.0005 SOL on base chain. Proof included in the flush_epoch transaction — verifiable by anyone.
 
 **Decision**: MagicBlock VRF. Block hash entropy is gameable by validators; VRF is not. The per-result cryptographic proof is a stronger security property than "assume validators are honest." VRF runs once at deposit epoch flush time — the resulting dummy commitments persist in the Merkle tree permanently and carry into all future ring proofs.
+
+**Dummy commitment formula**: Dummies must be indistinguishable and unspendable. The implementation must not use `Poseidon(0, 0, denomination)` or any public-only formula. The selected design is:
+
+```
+dummy = Poseidon(
+  "SHIELDLEND_DUMMY",
+  pool_id,
+  epoch_id,
+  dummy_index,
+  magicblock_vrf_output,
+  enclave_private_entropy
+)
+```
+
+The PER/TEE discards the preimage after insertion. Observers can verify that the epoch used MagicBlock VRF randomness, but cannot recompute the dummy set or distinguish dummy leaves from real commitments.
 
 ---
 
@@ -142,15 +160,15 @@ The PER also handles the exit batch (see ADR: Unified Exit Path below) — the s
 
 ## Encrypt FHE: Oracle MEV Prevention and Aggregate Solvency
 
-**Requirement**: (1) Liquidation oracle price updates must not be front-runnable by MEV bots. (2) Protocol solvency must be verifiable without exposing individual loan balances.
+**Requirement**: (1) Liquidation oracle price updates must not be front-runnable by MEV bots. (2) Protocol solvency must be verifiable without exposing individual collateral health values.
 
 **Oracle MEV — the problem**: In standard lending protocols, price feeds appear in the mempool before block inclusion. MEV bots read an incoming price, compute the resulting health factors, and submit liquidation or protection transactions before the price update confirms. This creates a profitable MEV extraction window.
 
 **Why FHE is specifically required here**: ZK proofs can prove a fact about a value but cannot stream live oracle inputs homomorphically. Price feeds change continuously — a ZK proof approach would require a new proof per price update, which is not practical for real-time liquidation monitoring. FHE allows the health_factor computation to run directly on an encrypted price input without materializing the plaintext. MEV bots cannot compute health factors from ciphertexts in the mempool.
 
-**Aggregate solvency**: Total outstanding protocol debt can be computed as a homomorphic sum over all loan balance ciphertexts. A single threshold decryption (2/3 IKA MPC) reveals only the aggregate total — individual positions remain hidden throughout.
+**Aggregate solvency**: Aggregate collateral coverage can be computed as a homomorphic sum over encrypted collateral-value ciphertexts. Public or bucketed borrow amounts provide deterministic debt accounting. A single threshold decryption reveals only aggregate collateral coverage — individual collateral positions remain hidden throughout.
 
-**Decision**: Encrypt FHE for oracle price encryption and aggregate solvency computation. Threshold decryption for compliance disclosure of individual loan balances when required.
+**Decision**: Encrypt FHE for oracle price encryption, health-factor computation, and aggregate collateral coverage. Targeted compliance disclosure is user-scoped and can combine local history records, proof signals, receipt hashes, and optional threshold evidence without a protocol-wide viewing key.
 
 ---
 
@@ -212,7 +230,7 @@ Including `SHIELDED_POOL_PROGRAM_ID` as a compile-time constant in the circuit e
 
 ## Three-Step Async Liquidation (FHE-Compatible)
 
-**Requirement**: Liquidation requires knowing whether a loan's health factor has breached the threshold. With Encrypt FHE storing loan balances and oracle prices as ciphertexts, the health factor cannot be read directly — it must be threshold-decrypted.
+**Requirement**: Liquidation requires knowing whether a loan's health factor has breached the threshold. With Encrypt FHE protecting oracle/collateral health computation, the health factor cannot be read directly — it must be threshold-decrypted.
 
 **The problem with single-step liquidation in FHE**: Threshold decryption is asynchronous (requires 2/3 of Encrypt network validators to process). A single-instruction liquidation would either: (a) block synchronously waiting for decryption (impossible in Solana's execution model), or (b) trust the submitter's claim about health factor (no verification — breaks security).
 
@@ -230,13 +248,13 @@ Including `SHIELDED_POOL_PROGRAM_ID` as a compile-time constant in the circuit e
 
 ## Keeper-Based Interest Accrual (Not In-FHE)
 
-**Requirement**: Interest must accrue on encrypted loan balances without leaking individual balance information.
+**Requirement**: Interest must accrue without breaking privacy claims or making lending accounting unsafe.
 
-**Why automatic in-FHE accrual fails**: To compute an interest rate from utilization (`rate = base + utilization × multiplier`), you need to know total outstanding debt relative to total deposits. Total outstanding debt is the sum of all encrypted loan balances. Computing this sum homomorphically requires decryption — which reveals the aggregate and is an expensive MPC operation on every transaction. Triggering this on every deposit or repay would make transactions expensive and leak accrual timing.
+**Why automatic in-FHE accrual is not MVP scope**: To compute an interest rate from utilization (`rate = base + utilization × multiplier`), the protocol needs deterministic total debt and reserve accounting. Hiding borrow amounts inside FHE would make repayment, liquidation, reserves, and bad-debt handling substantially more complex. For MVP, borrow amounts are public or bucketed and interest accrues with public arithmetic; Encrypt FHE protects oracle/health computation and aggregate collateral coverage.
 
 **Pattern adopted from**: Laolex/shieldlend — an admin keeper bot calls `accrueInterest(borrower)` for each active loan on a daily schedule. Utilization is estimated from publicly observable deposit counts (not encrypted balances) and the rate is updated via governance. This is a conscious tradeoff: the rate may lag true utilization by one admin update cycle.
 
-**Our implementation**: A keeper calls `lending_pool::accrue_interest(loan_account)` once per `keeper_min_accrual_slots` (default: ~1 day). The instruction computes `new_balance = balance × (1 + rate)` entirely as Encrypt FHE operations. The `last_accrual_slot` is a public plaintext field (only timing is revealed, not the amount).
+**Our implementation**: A keeper calls `lending_pool::accrue_interest(loan_account)` once per `keeper_min_accrual_slots` (default: ~1 day). The instruction computes `new_balance = balance × (1 + rate)` in public/bucketed lending accounting. The `last_accrual_slot` is a public plaintext field.
 
 **Slot-based timing**: Solana uses slot numbers, not Unix timestamps. `keeper_min_accrual_slots = 216_000` ≈ 1 day at 400ms/slot.
 
@@ -284,3 +302,27 @@ If denominations were variable:
 Fixed denominations (0.1 SOL, 1 SOL, 10 SOL) ensure all deposits in a denomination class are cryptographically indistinguishable. An observer sees "a 1 SOL denomination was withdrawn" — not which deposit it came from.
 
 Borrow amounts are variable and visible on-chain as ZK public inputs — required for on-chain LTV verification. Denomination class (fixed) and borrow amount (variable, public) are independent values in separate circuits.
+
+For MVP, borrow amounts should be offered as supported buckets where possible. Bucketing reduces amount fingerprinting while keeping LTV, reserve accounting, interest accrual, and liquidation deterministic. A public or bucketed borrow amount is metadata leakage, but it does not by itself link a borrower to the original depositor: collateral identity is hidden by the ring proof, the borrower wallet is hidden by the relay, and the disbursement destination is hidden by PER + Umbra.
+
+---
+
+## Conservative Liquidation MVP
+
+**Requirement**: Liquidations must prevent bad debt without creating a complex first-version liquidation surface that can be exploited through precision, stale oracle, or partial-liquidation accounting bugs.
+
+**Options considered**:
+- **Partial liquidation in MVP**: Better capital efficiency, but substantially more accounting complexity around remaining collateral, partial debt, privacy state transitions, and repeated liquidation attempts.
+- **Full liquidation only**: More conservative and less capital efficient, but easier to reason about, test, and explain. It minimizes bad-debt risk for the hackathon implementation.
+
+**Decision**: MVP uses full liquidation only, minimum borrow size, overcollateralized LTV, liquidation bonus caps, stale-oracle circuit breakers, and reserve accounting. Partial liquidation is a post-MVP extension after invariant tests and accounting audits.
+
+---
+
+## Transaction History and Viewing Keys
+
+**Requirement**: Users need a usable transaction history and optional compliance disclosure, without giving the protocol or third parties a global deanonymization path.
+
+**Decision**: History is client-controlled. The frontend stores an encrypted local journal keyed from the user's wallet signature and optionally backed up by the user. Each record can include operation type, local note id, tx signature, Merkle root, nullifier hash, proof public signals, receipt hash, and display metadata. The protocol does not maintain a user-indexed history table.
+
+For disclosure, the client can generate scoped packets: selected records plus tx signatures, proof public signals, private payment receipt references, and optional auditor viewing key material. A disclosure packet proves that specific events happened without revealing unrelated notes or creating a protocol-wide viewing key.

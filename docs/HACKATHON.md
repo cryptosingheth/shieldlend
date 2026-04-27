@@ -10,13 +10,13 @@ ShieldLend targets three tracks simultaneously. Each track covers an orthogonal 
 
 | Track | Sponsor | ShieldLend implements |
 |---|---|---|
-| IKA + Encrypt Frontier | Superteam | dWallet relay (deposit + withdrawal + repay) + dWallet disbursement co-signing + FutureSign liquidation + FHE oracle encryption + FHE aggregate solvency + threshold compliance disclosure |
-| Colosseum Privacy Track | MagicBlock | PER deposit batching + PER exit batching + VRF dummy insertion |
-| Umbra Side Track | Frontier | Umbra SDK for all output addresses (withdrawals + loan disbursements) |
+| IKA + Encrypt Frontier | Superteam | dWallet relay authorization + dWallet disbursement co-signing + FutureSign liquidation + FHE oracle/health computation + FHE aggregate solvency |
+| Colosseum Privacy Track | MagicBlock | PER deposit batching + PER exit batching + VRF dummy insertion + private repayment settlement |
+| Umbra Side Track | Frontier | Umbra SDK for output addresses, exit hygiene, and user-scoped disclosure patterns |
 
 ---
 
-> **Pre-Alpha Status**: IKA dWallet and Encrypt FHE are pre-alpha protocols. For this hackathon submission, IKA uses a mock signer (all integration points, CPI call signatures, and method names are implemented exactly as they will be in production) and Encrypt uses a plaintext fallback with FHE interface stubs. The production path for each is documented in the README Pre-Alpha Status table. This disclosure is included here so judges reviewing this file independently have the full picture.
+> **Pre-Alpha Status**: IKA dWallet, Encrypt FHE, and MagicBlock private payment surfaces may require gated devnet access during the hackathon. The implementation target is real protocol adapters first. If a devnet dependency is unavailable, a clearly labeled fallback adapter can be used only to preserve the integration surface for judging; privacy claims are reduced in that mode. This disclosure is included here so judges reviewing this file independently have the full picture.
 
 ---
 
@@ -27,8 +27,8 @@ ShieldLend targets three tracks simultaneously. Each track covers an orthogonal 
 
 ### IKA integration points (3)
 
-**1. dWallet relay (deposit + withdrawal + repay)**
-The protocol relay wallet is a 2PC-MPC dWallet. Every deposit, withdrawal, and repayment submitted on-chain goes through this relay. Each operation requires both:
+**1. dWallet relay authorization (deposit + withdrawal + borrow + repay submission)**
+The protocol relay wallet is a 2PC-MPC dWallet. Every ShieldedPool/LendingPool instruction submitted on-chain goes through this relay. Repayment value itself can settle through MagicBlock Private Payments, but the repay instruction is still relay-submitted. Each operation requires both:
 - User partial signature (consent gate)
 - IKA MPC network co-signature (policy gate)
 
@@ -49,8 +49,8 @@ Liquidation requires knowing the market price of SOL relative to the loan's coll
 
 ZK proofs can verify a fact about a known value, but cannot receive a continuously updating oracle stream and compute over it homomorphically. FHE is the only approach that allows real-time encrypted price feeds to feed directly into liquidation logic without plaintext exposure.
 
-**2. Encrypted loan balances and health factor computation**
-Each `LoanAccount` PDA stores `is_liquidatable: EncryptedBool` — the result of the FHE health factor comparison `(collateral_denomination × 100) < (outstanding_balance × collateral_ratio_bps)`. All arithmetic runs as Encrypt FHE homomorphic operations. The health factor result is a ciphertext until threshold decryption is explicitly requested. This prevents anyone — including MEV bots and the relay operator — from reading individual loan health factors from the chain.
+**2. Encrypted collateral health factor computation**
+Each `LoanAccount` PDA stores `is_liquidatable: EncryptedBool` — the result of the FHE health factor comparison over encrypted oracle/collateral values and public or bucketed outstanding debt. The health factor result is a ciphertext until threshold decryption is explicitly requested. This prevents anyone — including MEV bots and the relay operator — from reading individual loan health factors from the chain.
 
 The `is_liquidatable` ciphertext is the trigger for the three-step async liquidation flow (see below).
 
@@ -63,13 +63,13 @@ FHE decryption is asynchronous — the `is_liquidatable` ciphertext must be sent
 
 **Handle pinning security**: The Encrypt oracle decryption proof is verified against the specific `LoanAccount` PDA address. Since PDAs are derived from `seeds = [b"loan", collateral_nullifier_hash]`, the proof for Loan A cannot be submitted against Loan B. This prevents a class of replay attacks identified in our competitive analysis of FHE lending protocols.
 
-**4. Aggregate solvency check (homomorphic sum)**
-Total protocol outstanding debt is computed as: `Σ(encrypted_balance[i])` via FHE homomorphic addition. A single threshold decrypt reveals only the aggregate total. Individual positions remain hidden throughout.
+**4. Aggregate solvency check (homomorphic collateral sum)**
+Aggregate collateral coverage is computed as: `Σ(encrypted_collateral_value[i])` via FHE homomorphic addition. Public/bucketed borrow amounts provide deterministic debt accounting. A single threshold decrypt reveals only aggregate collateral coverage. Individual collateral positions remain hidden throughout.
 
-This enables protocol solvency verification — confirming total outstanding debt is within the collateral reserve — without exposing any individual borrower's position.
+This enables protocol solvency verification — confirming total outstanding debt is within aggregate collateral coverage — without exposing any individual borrower's collateral position.
 
 **Bonus: Targeted threshold decryption (auditor disclosure)**
-For compliance disclosure of a specific loan, a 2/3 Encrypt threshold decryption reveals the outstanding balance for that loanId to the designated auditor. Individual borrower identity is not revealed — only the amount. This satisfies selective disclosure requirements without a backdoor key.
+For compliance disclosure of a specific loan, a user can combine selected local history records, proof public signals, receipt hashes, and optional Encrypt threshold disclosure of collateral/health evidence for a designated auditor. Individual borrower identity is not revealed unless the user chooses to disclose it. This satisfies selective disclosure requirements without a protocol-wide backdoor key.
 
 ### Why IKA and Encrypt are not competing
 
@@ -82,7 +82,7 @@ IKA provides signing authorization infrastructure. Encrypt provides FHE computat
 ### Track theme
 "Privacy infrastructure for DeFi — execution environment and randomness"
 
-### MagicBlock integration points (3)
+### MagicBlock integration points (4)
 
 **1. Private Ephemeral Rollup (PER) — deposit batching**
 ShieldedPool deposit queue accounts are delegated to the MagicBlock PER. The PER runs inside an Intel TDX enclave — deposit batching occurs inside the enclave, and no observer (including the PER operator) can link an individual user's funding transaction (TX1) to their commitment in the batch (TX2).
@@ -105,6 +105,13 @@ VRF runs once per deposit epoch. The resulting dummy commitments persist in the 
 
 Integration: VRF SDK callback wired to `flush_epoch`.
 
+**4. Private Payments — repayment amount privacy**
+Repayment is the one flow where a private proof alone is not enough: if a user pays a public SOL/SPL vault directly, the repayment transfer and amount are visible even if the ZK proof hides borrower identity. ShieldLend therefore uses MagicBlock Private Payments / private SPL semantics as the Full Privacy repayment settlement rail.
+
+The LendingPool verifies a receipt bound to `loanId`, `nullifierHash`, `outstanding_balance`, `repayment_vault`, and epoch before unlocking collateral. This gives the lending program deterministic solvency/accounting while hiding the repayment transfer graph and amount.
+
+Integration: private payment settlement + receipt binding in `lending_pool::repay`; degraded fallback uses relay repayment and does not claim amount privacy.
+
 ---
 
 ## Track 3 — Umbra Side Track
@@ -112,7 +119,7 @@ Integration: VRF SDK callback wired to `flush_epoch`.
 ### Track theme
 "Stealth addresses as the unified output privacy layer for DeFi"
 
-### Umbra integration points (2)
+### Umbra integration points (3)
 
 **1. Withdrawal destinations**
 Every ShieldedPool withdrawal routes to a fresh Umbra stealth address. The address is generated via Umbra SDK from the recipient's published stealth meta-address. Only the recipient can derive the private key via ECDH. The stealth address has zero prior chain history — no observer can link it to the recipient's primary wallet.
@@ -121,6 +128,9 @@ Every ShieldedPool withdrawal routes to a fresh Umbra stealth address. The addre
 Every borrow disbursement routes to a fresh Umbra stealth address. The borrower's wallet address is a private input to the collateral_ring ZK circuit — never published on-chain. The only on-chain disbursement target is a freshly generated Umbra stealth address. This breaks the on-chain chain: collateral commitment → loan disbursement → borrower identity.
 
 Both exits — withdrawal and disbursement — use the same Umbra scheme and route through the same PER exit batch. The unified stealth address format is a prerequisite for exit batching to be effective: both exit types must look identical on-chain to be indistinguishable.
+
+**3. Scoped disclosure and exit hygiene**
+Umbra remains the address-layer privacy tool, not the repayment settlement rail. It is also useful for user-controlled disclosure patterns: the client can prove selected withdrawal/disbursement destinations belong to the user without revealing unrelated stealth addresses. This complements the encrypted local history journal and avoids any protocol-operated viewing key.
 
 ---
 
@@ -135,7 +145,9 @@ Each track is awarded for a distinct privacy dimension:
 | Where deposit→commitment mapping can be observed | Execution environment | Colosseum / MagicBlock |
 | Whether dummy insertions are biasable | Randomness | Colosseum / MagicBlock |
 | What exit type (withdrawal vs disbursement) can be inferred | Exit classification | Colosseum / MagicBlock |
+| Whether repayment transfer amount/graph is public | Private payment settlement | Colosseum / MagicBlock |
 | Where funds go after withdrawal or disbursement | Address privacy | Umbra Side Track |
+| How users disclose selected exit evidence | Scoped disclosure | Umbra Side Track |
 
 No single feature is claimed for multiple tracks. The IKA/Encrypt track is about signing trust and encrypted computation. The MagicBlock track is about execution privacy, temporal batching, and randomness. The Umbra track is about address-layer output privacy. These are three layers of the same protocol stack.
 
@@ -145,8 +157,8 @@ No single feature is claimed for multiple tracks. The IKA/Encrypt track is about
 
 | Integration | Action required before coding |
 |---|---|
-| MagicBlock PER | Join Discord (discord.com/invite/MBkdC3gxcv), request devnet PER endpoint in developer channel |
-| IKA dWallet | Access IKA devnet; `ika-dwallet-anchor` Rust crate; pre-alpha — mock signer for hackathon |
-| Encrypt FHE | Access Encrypt devnet; `encrypt-anchor` crate; pre-alpha — plaintext fallback for hackathon |
+| MagicBlock PER + Private Payments | Join Discord (discord.com/invite/MBkdC3gxcv), request devnet PER and private payment endpoint access |
+| IKA dWallet | Access IKA devnet; `ika-dwallet-anchor` Rust crate; fallback adapter only if devnet access is unavailable |
+| Encrypt FHE | Access Encrypt devnet; `encrypt-anchor` crate; fallback adapter only if devnet access is unavailable |
 | Umbra SDK | Solana mainnet alpha via Arcium (Feb 2026); stealthaddress.dev SDK docs |
 | groth16-solana | `groth16-solana` crate from Light Protocol; Solana 1.18.x+ |

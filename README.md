@@ -1,6 +1,6 @@
 # ShieldLend — Privacy-First Lending Protocol on Solana
 
-A zero-knowledge, privacy-preserving lending protocol on Solana. Deposits are unlinkable to wallets, withdrawal destinations are one-time addresses, oracle data is encrypted against MEV, and the signing infrastructure has no single operator key.
+A zero-knowledge, privacy-preserving lending protocol on Solana. Deposits are unlinkable to wallets, withdrawal destinations are one-time addresses, repayment settlement can use private payments, oracle data is encrypted against MEV, and the signing infrastructure has no single operator key.
 
 Built for the **Colosseum Frontier Hackathon 2026**.
 
@@ -29,13 +29,15 @@ Existing privacy tools address one layer at a time: mixers hide amounts but not 
 
 Privacy in DeFi is not a feature — it is a stack.
 
-ShieldLend applies four sequential protections across the transaction lifecycle. Each protection closes a specific gap that no other component addresses:
+ShieldLend applies sequential protections across the transaction lifecycle. Each protection closes a specific gap that no other component addresses:
 
 - **Entry protection** (MagicBlock PER + VRF): Deposits execute inside an Intel TDX enclave. Multiple users' deposits batch before any commitment reaches the Merkle tree — no observer can link a wallet to a specific commitment. VRF generates dummy commitments that are indistinguishable from real ones, permanently expanding the anonymity set for all future ring proofs.
 
 - **Relay protection** (IKA dWallet): Every on-chain operation — deposit, withdrawal, borrow, repay — is submitted by the IKA relay wallet, not the user's wallet. The relay is a 2PC-MPC dWallet: no single key exists. Both the user and the IKA MPC network must participate to authorize any relay operation. All exits (withdrawals and borrow disbursements) route through the same relay → PER batch → stealth path, making their type indistinguishable on-chain.
 
-- **State protection** (Encrypt FHE): Oracle price feeds for health factor computation are submitted as FHE ciphertexts. MEV bots cannot compute liquidation trigger conditions from encrypted mempool data. Aggregate solvency is tracked via homomorphic sum — total outstanding debt is verifiable without revealing individual positions.
+- **State protection** (Encrypt FHE): Oracle price feeds for health factor computation are submitted as FHE ciphertexts. MEV bots cannot compute liquidation trigger conditions from encrypted mempool data. Aggregate solvency is tracked through encrypted collateral coverage and public/bucketed debt accounting without revealing individual collateral positions.
+
+- **Payment protection** (MagicBlock Private Payments): Repayments settle through a private SPL/WSOL payment path. The LendingPool verifies a receipt bound to `loanId`, `nullifierHash`, and `outstanding_balance`, so collateral can unlock without publishing the repayment transfer graph.
 
 - **Exit protection** (Umbra SDK): Every output — withdrawal destinations and loan disbursements — routes to a one-time Umbra stealth address. Each address is derived via ECDH from the recipient's published meta-address, has zero prior chain history, and is abandoned after use.
 
@@ -53,7 +55,7 @@ The project is in the architecture-finalisation phase. All design documentation 
 | `frontend/public/circuits/*.wasm` | Stale | Recompile after circuit update |
 | `frontend/src/lib/circuits.ts` | Done | snarkjs Groth16 proof generation (chain-agnostic) |
 | `frontend/src/lib/noteStorage.ts` | Done | AES-256-GCM note vault (chain-agnostic) |
-| `docs/` (all 7 files) | Done | Full architecture documentation |
+| `docs/` | Updating | Architecture, implementation plan, visual flows, and pitch narrative |
 | Anchor workspace (`Anchor.toml`, `Cargo.toml`) | TODO | Phase 1 — not yet initialized |
 | `programs/shielded_pool/` | TODO | Phase 1 |
 | `programs/lending_pool/` | TODO | Phase 1 |
@@ -105,12 +107,14 @@ flowchart TD
     E["ENTRY · MagicBlock PER + VRF"]:::layer
     R["RELAY · IKA dWallet 2PC-MPC"]:::layer
     S["SPEND · Groth16 Ring Proofs K=16"]:::layer
+    P["PAYMENT · MagicBlock Private Payments"]:::layer
     X["EXIT · PER exit batch + Umbra SDK"]:::layer
     O["ORACLE · Encrypt FHE"]:::layer
 
     E -->|"who deposited, timing, which commitment"| R
     R -->|"which wallet signed any transaction"| S
-    S -->|"which commitment was used or locked"| X
+    S -->|"which commitment was used or locked"| P
+    P -->|"repayment transfer graph and amount in full privacy mode"| X
     X -->|"where funds went, withdrawal vs borrow exit"| O
     O -->|"liquidation price data readable in mempool"| End([All gaps closed])
 ```
@@ -161,12 +165,15 @@ No observer links "this commitment is locked as collateral" to "this wallet rece
 
 ### Repay
 
-Repayment does not reveal the borrower's identity or the repayment amount.
+Repayment does not reveal the borrower's identity. In Full Privacy mode, repayment settlement also avoids publishing a normal repayment transfer graph.
 
-1. User generates a **repay_ring proof**: proves knowledge of the collateral nullifier. The repayment amount satisfies `repaymentAmount ≥ outstanding_balance` — verified in-circuit with repaymentAmount as a private input. The borrower's wallet is never revealed.
-2. SOL goes via the **IKA relay** — indistinguishable from deposit relay traffic.
-3. `groth16-solana` verifies the repay proof on-chain.
-4. Loan PDA cleared, nullifier unlocked. Collateral note is ready for withdrawal.
+1. User generates a **repay_ring proof**: proves knowledge of the collateral nullifier and binds the repayment to `loanId` and the current `outstanding_balance`. The borrower's wallet is never revealed.
+2. User settles repayment through **MagicBlock Private Payments** using private WSOL/SPL payment semantics. The private payment receipt is bound to `loanId`, `nullifierHash`, `outstanding_balance`, and `repayment_vault`.
+3. The **IKA relay** submits the repay instruction on-chain — relay wallet is the signer, not the borrower.
+4. `groth16-solana` verifies the repay proof, and LendingPool verifies the private payment receipt binding.
+5. Loan PDA cleared, nullifier unlocked. Collateral note is ready for withdrawal.
+
+If private payments are unavailable, the protocol can fall back to identity-private repayment through the IKA relay, but repayment amount privacy must not be claimed in that degraded path.
 
 ---
 
@@ -382,36 +389,44 @@ flowchart TD
         B2[Query on-chain outstanding balance]
         B3[Compute: borrow × compound rate history]
         B4[Groth16 repay proof]
-        B1 --> B2 --> B3 --> B4
+        B5[Prepare private payment receipt binding]
+        B1 --> B2 --> B3 --> B4 --> B5
+    end
+
+    subgraph PaySG[MagicBlock Private Payments]
+        P1[Private WSOL/SPL settlement]:::privacy
+        P2[Receipt: loanId + nullifierHash + outstanding + vault]:::privacy
+        P1 --> P2
     end
 
     subgraph RelaySG[IKA Relay]
-        R1[Receive SOL + proof]
+        R1[Receive proof + receipt]
         R2[Submit repay tx — relay is signer]:::privacy
         R1 --> R2
     end
 
     subgraph Chain[On-Chain]
         C1[groth16-solana verify repay proof]
-        C2{repaymentAmount >= outstanding?}
+        C2{receipt settlement >= outstanding?}
         C3[Nullifier: Locked → Active]:::privacy
         C4[LoanAccount PDA closed]
         C1 --> C2
-        C2 -->|yes — checked in-circuit| C3 --> C4
+        C2 -->|yes — proof and receipt bound| C3 --> C4
         C2 -->|no| Rej([Rejected])
     end
 
     U([User]):::actor
     U --> B1
-    B4 --> R1
+    B5 --> P1
+    P2 --> R1
     R2 --> C1
     C4 --> Free[Note status: Active]
     Free --> Next([Withdraw via standard flow])
 
-    AmtPr[Repayment amount stays private — never on-chain]:::privacy
-    B4 -.-> AmtPr
+    AmtPr[Repayment amount private in Full Privacy mode]:::privacy
+    P2 -.-> AmtPr
 
-    TxPr[Repayment traffic = deposit traffic on relay]:::privacy
+    TxPr[Repay signer is relay; borrower wallet not linked]:::privacy
     R1 -.-> TxPr
 ```
 
@@ -427,8 +442,8 @@ PROPERTY                                STATUS      MECHANISM
 Depositor wallet hidden                 ✓           IKA relay (relay is TX2 signer)
 Deposit timing correlation broken       ✓           PER temporal batching (Intel TDX enclave)
 Anonymity set ≥ 8 real (min batch)      ✓           min_real_deposits_before_flush = 8
-VRF dummies indistinguishable           ✓           Poseidon(vrf_output, denomination) — same structure
-                                                    as real commitments; VRF output not publicly derivable
+VRF dummies indistinguishable           ✓           PER CSPRNG seeded by MagicBlock VRF + enclave-private
+                                                    entropy; dummy preimages never stored or revealed
 Root tolerance (offline users)          ✓           30 historical roots retained; no lockout
 Which commitment was spent              ✓           Ring proof hides ring_index (K=16 + VRF dummies)
 Cross-contract nullifier unlinkability  ✓           nullifierHash includes SHIELDED_POOL_PROGRAM_ID
@@ -439,20 +454,22 @@ Borrow vs withdrawal exit               ✓           Unified relay → PER → 
 Which collateral note is locked         ✓           Collateral ring proof hides index
 Borrower wallet hidden                  ✓           ZK private input + relay signer
 Disbursement destination hidden         ✓           Umbra stealth address
-Repayment amount hidden                 ✓           ZK private input, in-circuit check
+Repayment amount hidden                 ✓/mode      Full Privacy: MagicBlock Private Payments receipt;
+                                                    degraded relay repayment reveals transfer amount
 Repayer wallet hidden                   ✓           ZK private input + relay routing
 Oracle price (liquidation MEV)          ✓           Encrypt FHE encrypted oracle
 FHE liquidation handle replay           ✓           Handle pinning — PDA seed binding [C-01]
 Stale liquidation on healthy position   ✓           Consecutive breach confirmation (≥ 2 epochs)
-Individual loan balances                ✓           Encrypt FHE encrypted storage
+Individual collateral values            ✓           Encrypt FHE encrypted oracle/health computation
 Who was liquidated                      ✓           Wallet never linked to loanId
 Single operator key risk                ✓           IKA 2PC-MPC — user + MPC both required
 Liquidation trust                       ✓           IKA FutureSign — pre-signed consent, condition-gated
 Double-spend                            ✓           NullifierRegistry PDA + nullifierHash (position-bound)
 ────────────────────────────────────────────────────────────────────────────────
-Borrow amount                           public      ZK public input — circuit requirement for on-chain LTV
+Borrow amount                           public/bucketed ZK public input — required for deterministic LTV;
+                                                    does not link borrower to depositor by itself
 That a borrow occurred                  public      LoanAccount PDA creation visible
-Aggregate outstanding debt              disclosed   Threshold decryption result — total only, not individual
+Aggregate collateral coverage           disclosed   Threshold decryption result — total only, not individual
 IP address visible to relay             not covered Tor/VPN required at application layer (user responsibility)
 ────────────────────────────────────────────────────────────────────────────────
 ```
@@ -465,7 +482,7 @@ SOL flows:
 - **Deposit**: IKA relay → ShieldedPool (via PER batch)
 - **Withdraw**: ShieldedPool → IKA relay → PER exit batch → Umbra stealth address
 - **Borrow**: ShieldedPool → IKA relay → PER exit batch → Umbra stealth address (same path as withdraw)
-- **Repay**: IKA relay → ShieldedPool; LendingPool clears loan PDA
+- **Repay**: MagicBlock Private Payments → repayment vault/private balance; IKA relay submits proof + receipt; LendingPool clears loan PDA
 
 ---
 
@@ -477,7 +494,7 @@ All circuits produce Groth16 proofs verified on-chain by `groth16-solana`.
 |---|---|---|---|
 | `withdraw_ring.circom` | Done (update required)* | Ring membership (K=16) + Merkle inclusion at `leaf_index` (depth 24) | `ring[16]`, `nullifierHash`, `root`, `denomination_out` |
 | `collateral_ring.circom` | Done (update required)* | Ring membership + `denomination × minRatioBps ≥ borrowed × 10000` | `ring[16]`, `nullifierHash`, `root`, `borrowed`, `minRatioBps` |
-| `repay_ring.circom` | **TODO** | Nullifier knowledge + `repaymentAmount ≥ outstanding_balance` (in-circuit, amount private) | `nullifierHash`, `loanId`, `outstanding_balance` |
+| `repay_ring.circom` | **TODO** | Nullifier knowledge + binding to private payment receipt and `outstanding_balance` | `nullifierHash`, `loanId`, `outstanding_balance`, `settlementReceiptHash` |
 
 *`withdraw_ring` and `collateral_ring` require a nullifier formula update (add `leaf_index` private input) before they can be recompiled. The compiled `.wasm` files in `frontend/public/circuits/` are currently stale and must not be used until the circuits are updated and recompiled.
 
@@ -500,7 +517,7 @@ Deposits use fixed denominations (0.1 SOL, 1 SOL, 10 SOL). This is a requirement
 | 1 SOL | 1,000,000,000 |
 | 10 SOL | 10,000,000,000 |
 
-Loan amounts are variable. The borrow amount appears as a public input to the collateral ring circuit — required for on-chain LTV verification binding.
+Loan amounts are public or bucketed. The borrow amount appears as a public input to the collateral ring circuit because the protocol must deterministically verify LTV, interest accrual, reserve accounting, and liquidation thresholds on-chain. This is amount metadata leakage, not identity linkage: the borrower wallet, collateral note, and disbursement destination remain unlinked when the relay, ring proof, PER exit batch, and Umbra path are used correctly.
 
 ---
 
@@ -515,7 +532,7 @@ total_outstanding      = Σ(borrow_amount[i])               // plaintext sum —
 ```
 Threshold decryption reveals ONLY `total_collateral_value`. Individual collateral positions and the oracle price used for computation stay hidden. MEV bots monitoring the mempool cannot compute breach conditions from encrypted price inputs.
 
-**Targeted audit (on-demand):** For compliance disclosure of a specific loan, threshold decryption reveals that loan's outstanding balance to the auditor. Borrower identity is not revealed — only the amount.
+**Targeted audit (on-demand):** For compliance disclosure of a specific loan, the user can export selected local history records, proof public signals, transaction signatures, receipt hashes, and optional Encrypt threshold evidence for collateral/health. Borrower identity is not revealed unless the user chooses to disclose it.
 
 ---
 
@@ -538,12 +555,13 @@ Threshold decryption reveals ONLY `total_collateral_value`. Individual collatera
 |---|---|---|
 | Interest rate model | Kamino klend fork | Poly-linear 11-point model from a $3.2B TVL production protocol; audited; Anchor-native |
 | Collateral proof verification | groth16-solana | LTV check is a circuit constraint — must verify on-chain before disbursement |
-| Repayment proof verification | groth16-solana | Repay proof hides repayment amount (private input) and borrower wallet; on-chain verification required to clear loan PDA |
+| Private repayment settlement | MagicBlock Private Payments | Repayment value can settle privately while LendingPool receives a receipt bound to the loan, vault, and outstanding balance |
+| Repayment proof verification | groth16-solana | Repay proof hides borrower identity and binds the collateral nullifier to a valid private payment receipt before clearing the LoanAccount |
 | Disbursement routing | IKA relay + PER | Disbursement exits same relay → PER → stealth path as withdrawals; indistinguishable on-chain |
 | Disbursement signing | IKA dWallet | Co-signing requires program LTV validation AND IKA MPC network; no single operator key |
 | Disbursement recipient | Umbra SDK | Same reason as withdrawals — fresh stealth address, borrower wallet never on-chain |
 | Oracle MEV prevention | Encrypt FHE | Price feeds as FHE ciphertexts; health_factor computed homomorphically; MEV bots cannot read pending price updates |
-| Aggregate solvency | Encrypt FHE | Homomorphic sum of loan balances; only total revealed, individual positions stay encrypted |
+| Aggregate solvency | Encrypt FHE | Homomorphic sum of encrypted collateral values; only aggregate coverage is revealed |
 | Compliance disclosure | Encrypt threshold decryption | Individual loan balance disclosed to auditor via 2/3 MPC threshold decrypt; no global exposure |
 | Liquidation pre-authorization | IKA FutureSign | Borrower consents at borrow time; neither borrower (cannot block) nor operator (cannot trigger without condition) has unilateral control |
 
@@ -555,13 +573,13 @@ ShieldLend has three operational modes that degrade gracefully when external dep
 
 | Mode | Activates when | Privacy level |
 |---|---|---|
-| **Full Privacy** (default) | All dependencies operational | Maximum — all four layers active |
+| **Full Privacy** (default) | All dependencies operational | Maximum — relay, ZK, PER, private payments, FHE, and Umbra active |
 | **Degraded Privacy** | MagicBlock PER offline for `per_fallback_epoch_threshold` epochs | Reduced — temporal unlinking lost; ZK ring + Umbra stealth still active |
 | **Emergency** | PER and IKA both offline (governance vote required) | Minimal — user wallet appears on-chain as signer; fund recovery prioritized |
 
-**Full Privacy**: Deposit path runs through IKA relay → MagicBlock PER enclave → ShieldedPool batch. Exit path routes through PER → Umbra stealth. All four privacy layers active.
+**Full Privacy**: Deposit path runs through IKA relay → MagicBlock PER enclave → ShieldedPool batch. Borrow and withdrawal exits route through PER → Umbra stealth. Repayments settle through MagicBlock Private Payments with receipt binding. All privacy layers are active.
 
-**Degraded Privacy**: PER is bypassed. Deposits and exits go directly relay → ShieldedPool without batching. Timing correlation between deposit and exit becomes possible. ZK ring proofs (which commitment was spent) and Umbra stealth addresses (where funds go) remain fully active. Frontend displays a prominent banner when this mode is active.
+**Degraded Privacy**: PER or private payment support is bypassed. Deposits and exits go directly relay → ShieldedPool without batching, or repayment uses a normal relay transfer. Timing correlation and repayment amount leakage become possible. ZK ring proofs (which commitment was spent), relay signer privacy, and Umbra stealth addresses (where funds go) remain active. Frontend displays a prominent banner when this mode is active.
 
 **Emergency**: Both PER and IKA are unavailable. `emergency_withdraw(ring_proof)` releases SOL directly to the user's own wallet — no relay, no stealth address. The user's wallet appears on-chain as the transaction signer. This mode exists solely to guarantee fund recovery; it is a last resort and requires a multi-sig governance vote with time-lock to activate.
 
@@ -575,8 +593,9 @@ ShieldLend has three operational modes that degrade gracefully when external dep
 - groth16-solana (ZK proof verification, BN254 native syscalls, Light Protocol Labs)
 - MagicBlock PER macros — `#[ephemeral]`, `#[delegate]`, `#[commit]` (planned)
 - MagicBlock VRF SDK (planned)
-- IKA dWallet Anchor CPI — `ika-dwallet-anchor` (planned — mock signer for hackathon)
-- Encrypt FHE Anchor integration — `encrypt-anchor` (planned — plaintext fallback for hackathon)
+- MagicBlock Private Payments / Private SPL token API (planned)
+- IKA dWallet Anchor CPI — `ika-dwallet-anchor` (planned; real adapter first, labeled fallback only if unavailable)
+- Encrypt FHE Anchor integration — `encrypt-anchor` (planned; real adapter first, labeled fallback only if unavailable)
 - Poseidon hash (matching circuits)
 
 **Off-Chain / Client**
@@ -602,10 +621,13 @@ shieldlend-solana/
 │   ├── architecture.md
 │   ├── DESIGN_DECISIONS.md
 │   ├── HACKATHON.md
+│   ├── IMPLEMENTATION_PLAN.md
 │   ├── NOTE_LIFECYCLE.md
+│   ├── PITCH_DECK.md
 │   ├── PRIVACY_MODEL.md
 │   ├── RESEARCH_REPORT.md
-│   └── THREAT_MODEL.md
+│   ├── THREAT_MODEL.md
+│   └── VISUAL_FLOWS.md
 ├── frontend/
 │   ├── public/circuits/
 │   │   ├── withdraw_ring.wasm  # stale — recompile after circuit update
@@ -629,7 +651,7 @@ shieldlend-solana/
 ├── circuits/
 │   ├── withdraw_ring.circom    # updated with leaf_index nullifier formula
 │   ├── collateral_ring.circom  # updated with leaf_index nullifier formula
-│   ├── repay_ring.circom       # new: nullifier knowledge + repaymentAmount >= outstanding
+│   ├── repay_ring.circom       # new: nullifier knowledge + private payment receipt binding
 │   └── keys/                   # .zkey + .vkey.json for all three circuits
 ├── tests/
 │   ├── shielded_pool.ts
@@ -651,7 +673,7 @@ shieldlend-solana/
 │       ├── BorrowForm.tsx
 │       └── RepayForm.tsx
 ├── docs/
-│   └── (same 7 files)
+│   └── (architecture, threat model, implementation plan, visual flows, pitch deck)
 ├── Anchor.toml
 ├── Cargo.toml
 ├── package.json
@@ -662,13 +684,13 @@ shieldlend-solana/
 
 ## Pre-Alpha Status
 
-Several protocols used in ShieldLend are in pre-alpha on devnet. Hackathon integration uses mock signers / unencrypted fallbacks. Production deployments require mainnet availability.
+Several protocols used in ShieldLend are in pre-alpha or gated devnet. Hackathon implementation targets real protocol adapters first. If a dependency is unavailable, fallback adapters must be clearly labeled and the UI/docs must reduce the relevant privacy claim for that mode. Production deployments require mainnet availability.
 
 | Protocol | Devnet status | Hackathon approach | Production path |
 |---|---|---|---|
-| IKA dWallet | Pre-alpha | Mock signer — all integration points, CPI patterns, and method signatures implemented as production | IKA Solana mainnet |
-| Encrypt FHE | Pre-alpha | Plaintext fallback with FHE interface stubs | Encrypt mainnet |
-| MagicBlock PER | Devnet (Discord access required) | Full devnet integration | MagicBlock PER mainnet |
+| IKA dWallet | Pre-alpha / gated devnet | Real adapter first; fallback signer only if unavailable and explicitly labeled | IKA Solana mainnet |
+| Encrypt FHE | Pre-alpha / gated devnet | Real adapter first; fallback health/oracle adapter only if unavailable and explicitly labeled | Encrypt mainnet |
+| MagicBlock PER + Private Payments | Devnet (Discord access required) | Real PER, VRF, and private repayment integration where available | MagicBlock PER/private payments mainnet |
 | groth16-solana | Mainnet-beta ready | Full production integration | BN254 syscalls live since Solana 1.18.x |
 | Umbra SDK | Mainnet alpha (Solana, Feb 2026) | Full production integration | Production-ready |
 
@@ -678,11 +700,11 @@ Several protocols used in ShieldLend are in pre-alpha on devnet. Hackathon integ
 
 | Track | Sponsor | ShieldLend implements |
 |---|---|---|
-| IKA + Encrypt Frontier | Superteam | dWallet relay (all flows) + FutureSign + encrypted oracle + aggregate solvency |
-| Colosseum Privacy Track | MagicBlock | PER deposit batching + PER exit batching + VRF dummy insertion |
-| Umbra Side Track | Frontier | Umbra SDK for all output addresses (withdrawals + loan disbursements) |
+| IKA + Encrypt Frontier | Superteam | dWallet relay authorization, FutureSign liquidation consent, encrypted oracle/health computation, aggregate solvency |
+| Colosseum Privacy Track | MagicBlock | PER deposit batching, PER exit batching, VRF dummy insertion, private repayment settlement |
+| Umbra Side Track | Frontier | Umbra SDK for output stealth addresses, exit hygiene, and optional disclosure patterns |
 
-Each track covers a distinct privacy layer — entry execution, transaction routing, on-chain state, and exit address — with no overlap between them. For full track-by-track integration details and non-overlap justification, see [`docs/HACKATHON.md`](docs/HACKATHON.md).
+Each track covers a distinct privacy layer — entry execution, transaction authorization, private repayment settlement, encrypted state, and exit address hygiene — with no overlap between them. For full track-by-track integration details and non-overlap justification, see [`docs/HACKATHON.md`](docs/HACKATHON.md).
 
 ---
 
@@ -703,6 +725,9 @@ Full competitive analysis, attribution table, and protocol comparisons: [`docs/R
 | [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) | Adversary classes, attack scenarios, full privacy property table, trust assumptions |
 | [`docs/DESIGN_DECISIONS.md`](docs/DESIGN_DECISIONS.md) | ADR-style rationale for every protocol and architecture choice |
 | [`docs/NOTE_LIFECYCLE.md`](docs/NOTE_LIFECYCLE.md) | Note state machine, LoanAccount lifecycle, protocol parameters, operational modes |
+| [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) | Approved build plan, phase order, contracts, circuits, imports, tests, visuals |
+| [`docs/VISUAL_FLOWS.md`](docs/VISUAL_FLOWS.md) | Clear investor/judge-facing architecture and privacy-flow diagrams |
+| [`docs/PITCH_DECK.md`](docs/PITCH_DECK.md) | Slide-by-slide pitch narrative and product storytelling outline |
 | [`docs/HACKATHON.md`](docs/HACKATHON.md) | Track-by-track eligibility, submission narratives, required integrations |
 | [`docs/RESEARCH_REPORT.md`](docs/RESEARCH_REPORT.md) | Full competitive analysis: competitor profiles, production protocol research, vulnerability findings |
 

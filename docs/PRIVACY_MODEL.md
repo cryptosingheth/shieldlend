@@ -12,22 +12,24 @@ ShieldLend is a lending protocol where the following facts must be unobservable 
 | Which commitment corresponds to which depositor | Prevents tracing withdrawal back to deposit |
 | Who is the borrower behind a loan | Prevents identity-linked credit profiling |
 | Who repaid a loan | Prevents confirmation of identity |
+| Repayment transfer graph and amount in Full Privacy mode | Prevents linking a payment source to a loan closure |
 | Where funds went after withdrawal or disbursement | Prevents tracking funds post-exit |
 | Whether an exit was a withdrawal or a borrow disbursement | Prevents inferring loan activity from exit patterns |
 
-Borrow amount and denomination class are visible on-chain as ZK public inputs — required for the on-chain program to verify LTV constraints. These are accepted disclosures.
+Borrow amount and denomination class are visible or bucketed on-chain as ZK public inputs — required for the on-chain program to verify LTV, interest accrual, reserves, and liquidation constraints. These are accepted disclosures. They create amount-fingerprinting risk, but do not by themselves link a borrower to the original depositor.
 
 ---
 
 ## Four Sequential Privacy Protections
 
-ShieldLend applies four layered protections across the full transaction lifecycle:
+ShieldLend applies layered protections across the full transaction lifecycle:
 
 | Layer | Protection | Mechanism |
 |---|---|---|
 | Entry | Depositor wallet hidden from commitment | IKA relay + MagicBlock PER batch |
 | Relay | Timing correlation eliminated | PER temporal batching (Intel TDX enclave) |
 | Anonymity | Ring membership unlinkability | ZK ring proof K=16 + VRF dummies |
+| Payment | Repayment amount/transfer graph privacy | MagicBlock Private Payments + receipt binding |
 | Exit | Destination and exit type hidden | Relay → PER exit batch → Umbra stealth address |
 
 ---
@@ -123,12 +125,14 @@ ShieldLend's threat model assumes adversaries up to and including Class C. Class
 
 **Attack surface**:
 1. Repay transaction must reference a loanId to clear the correct PDA.
-2. Repayment SOL must reach ShieldedPool.
+2. Repayment value must reach the repayment vault or private balance.
+3. A normal public repayment transfer would reveal amount and transfer graph.
 
 **Mitigations**:
-- repay_ring proof: proves knowledge of the collateral nullifier (only the borrower knows it) without revealing the borrower's wallet. The wallet and repayment amount are both private inputs. The circuit verifies `repaymentAmount ≥ outstanding_balance` entirely in-circuit — the repayment amount is never published on-chain.
-- Outstanding balance is computed on-chain from the public Kamino rate history and passed as a ZK public input. Only the sufficiency check result (pass/fail) is enforced — the repayment amount itself remains private.
-- Repayment SOL flows via the IKA relay — same path as deposit traffic. An observer sees "relay received SOL and cleared a loan PDA" — identical to a deposit in terms of relay traffic analysis.
+- repay_ring proof: proves knowledge of the collateral nullifier without revealing the borrower's wallet and binds the repay attempt to `loanId`, `nullifierHash`, `outstanding_balance`, and a private payment receipt hash.
+- Outstanding balance is computed on-chain from the public Kamino rate history and passed as a ZK public input. Lending accounting remains deterministic.
+- In Full Privacy mode, repayment value settles through MagicBlock Private Payments. The LendingPool verifies the private payment receipt before unlocking collateral, avoiding a plain public transfer to ShieldedPool.
+- In degraded mode, repayment can still route through the IKA relay for identity privacy. In that path, repayment amount privacy is not claimed.
 - loanId is the only public link — it identifies which PDA to close. It does not identify the borrower.
 - After repay, the LoanAccount PDA is closed. The collateral nullifier is unlocked and the note is withdrawable. No on-chain trace connects the repayment event to the original depositor's wallet.
 
@@ -140,9 +144,9 @@ VRF dummy commitments must be computationally indistinguishable from real commit
 
 **Real commitment**: `Poseidon(secret, nullifier, denomination)` where `secret` and `nullifier` are 256-bit randoms generated client-side and never published.
 
-**VRF dummy commitment**: `Poseidon(vrf_output_i, denomination)` where `vrf_output_i = hash(VRF_PROOF.output || epoch_index || dummy_index)`. The VRF output is held by MagicBlock's VRF contract — external observers cannot extract it from the on-chain VRF proof.
+**VRF dummy commitment**: `Poseidon("SHIELDLEND_DUMMY", pool_id, epoch_id, dummy_index, magicblock_vrf_output, enclave_private_entropy)`.
 
-**Property**: A polynomial-time adversary who sees the on-chain VRF proof cannot distinguish a dummy commitment from a real commitment without the VRF contract's internal state. Both are 256-bit BN254 field elements; both are Poseidon hashes over 256-bit inputs.
+**Property**: A polynomial-time adversary who sees the on-chain VRF proof cannot distinguish a dummy commitment from a real commitment because the dummy preimage includes enclave-private entropy and is discarded after insertion. MagicBlock VRF supplies unbiasable epoch randomness; the PER/TEE prevents observers from recomputing dummy leaves.
 
 **Guarantee this provides**: When VRF dummies appear in a ring alongside real commitments, the adversary cannot label which ring members are dummies. The effective anonymity set is truly K=16 (not K = number of real commitments).
 
@@ -159,7 +163,7 @@ repay:     Locked → Active   (note released; can now withdraw)
 liquidate: Locked → Spent    (note consumed by liquidation)
 ```
 
-The ZK circuit computes `nullifierHash = Poseidon(nullifier)` where `nullifier` is a private input only the depositor knows. The on-chain program checks `NullifierAccount(nullifierHash).status`. A forged proof that uses a valid nullifierHash but wrong nullifier is computationally infeasible — Poseidon is collision-resistant in the BN254 field.
+The ZK circuit computes `nullifierHash = Poseidon(nullifier, leaf_index, SHIELDED_POOL_PROGRAM_ID)` where `nullifier` and `leaf_index` are private inputs and the program id is a circuit constant. The on-chain program checks `NullifierAccount(nullifierHash).status`. A forged proof that uses a valid nullifierHash but wrong nullifier is computationally infeasible — Poseidon is collision-resistant in the BN254 field.
 
 ---
 
@@ -175,15 +179,16 @@ ShieldLend's mitigation: price feeds are submitted as Encrypt FHE ciphertext inp
 
 ## Aggregate Solvency Without Individual Exposure
 
-Protocol solvency requires knowing total outstanding debt without revealing individual loan amounts:
+Protocol solvency requires knowing aggregate collateral coverage without revealing individual collateral positions:
 
 ```
-total_outstanding = Σ(encrypted_balance[i])   // FHE homomorphic addition
+total_collateral_value = Σ(encrypted_collateral_value[i])   // FHE homomorphic addition
+total_outstanding = Σ(public_or_bucketed_borrow_amount[i])  // public accounting
 ```
 
-FHE homomorphic addition preserves the encryption — the sum is still a ciphertext. A single threshold decryption of the sum reveals only `total_outstanding`. Individual `encrypted_balance[i]` values remain ciphertext throughout.
+FHE homomorphic addition preserves the encryption — the sum is still a ciphertext. A single threshold decryption of the sum reveals only aggregate collateral coverage. Individual encrypted collateral values remain ciphertext throughout. Borrow amounts are public or bucketed in the MVP so LTV, interest, reserves, and liquidation remain mechanically verifiable.
 
-The solvency invariant monitored: `total_outstanding ≤ shielded_pool.lamports × LTV_FLOOR`.
+The solvency invariant monitored: `total_outstanding ≤ aggregate_collateral_value × max_ltv`.
 
 ---
 
@@ -210,10 +215,11 @@ These properties are intentionally public — required by the ZK circuit design 
 
 | Disclosure | Why public | Inference possible |
 |---|---|---|
-| Borrow amount | ZK public input — required for on-chain LTV verification | Denomination inferable: `denom ≈ borrowed / minRatioBps × 10000` |
+| Borrow amount or bucket | ZK public input — required for on-chain LTV, interest, reserve, and liquidation mechanics | Denomination range inferable; amount fingerprinting reduced by buckets |
 | That a borrow occurred | LoanAccount PDA creation visible | Loan count is enumerable |
 | Denomination class on withdrawal | ZK public output — required for correct SOL release | None — denomination is fixed, not identity-linking |
-| Aggregate outstanding debt | Threshold decryption product — one value revealed | Protocol solvency status only |
+| Aggregate collateral coverage | Threshold decryption product — one value revealed | Protocol solvency status only |
+| Repayment amount in degraded mode | Normal relay transfer fallback if private payments unavailable | Amount visible; borrower identity still protected by relay + proof |
 
 ### Residual Risks (mitigated but not eliminated)
 
@@ -224,6 +230,8 @@ These properties are intentionally public — required by the ZK circuit design 
 | IP address exposure to IKA relay | None (user responsibility — use Tor/VPN) | Relay operator sees IP of proof submitter |
 | Single oracle epoch manipulation | `consecutive_breach_count >= 2`, `max_oracle_deviation_bps = 20%` | Two consecutive manipulated epochs could trigger liquidation |
 | PER operator timing visibility | Intel TDX hardware attestation | Operator knows batch timing, not individual user→commitment links |
+| Amount fingerprinting | Fixed denominations + borrow buckets | Repeated unique amounts may still weaken anonymity |
+| Private payment receipt replay | Receipt binds loanId, nullifierHash, outstanding_balance, vault, epoch | Incorrect binding would allow collateral unlock without valid settlement |
 
 ### Out-of-Scope Privacy Properties
 The following are explicitly not protected by the protocol:
@@ -239,6 +247,7 @@ The following are explicitly not protected by the protocol:
 | Component | Trust assumption | Consequence if broken |
 |---|---|---|
 | MagicBlock PER Intel TDX | Enclave not compromised | Deposit→commitment mapping exposed |
+| MagicBlock Private Payments | Private payment settlement and receipt verification are sound | Repayment amount/transfer graph privacy or collateral unlock safety can fail |
 | IKA MPC network (2/3) | Not all validators collude | Unauthorized disbursement possible |
 | Encrypt threshold network (2/3) | Not all validators collude | Aggregate balance sum exposed to a single party |
 | Umbra SDK key derivation | ECDH not broken | Stealth address ownership linked |

@@ -81,7 +81,7 @@ Depositor wallet hidden from ShieldedPool   ✓          IKA relay is TX2 signer
 Deposit→commitment linking prevented        ✓          MagicBlock PER Intel TDX batch         Class A, B, E
 Deposit timing correlation broken           ✓          PER temporal batching                  Class A, B
 Anonymity set ≥ 8 real (min batch)          ✓          min_real_deposits_before_flush = 8     Class A, B
-VRF dummies indistinguishable from real     ✓          Poseidon(vrf_output, denomination)     Class A, B
+VRF dummies indistinguishable from real     ✓          VRF + PER private entropy              Class A, B
 Anonymity set grows over time               ✓          VRF dummies persist in Merkle tree     Class A, B
 Historical root access (30 epochs)          ✓          Root ring buffer in ShieldedPoolState  Class A, B
 Withdrawal submitter wallet hidden          ✓          IKA relay is TX signer                 Class A, B
@@ -93,12 +93,12 @@ Exit type (withdrawal vs borrow)            ✓          Unified PER exit batch 
 Collateral identity (which note)            ✓          Collateral ring proof K=16             Class A, B
 Borrower wallet hidden                      ✓          ZK private input + relay signer        Class A, B
 Disbursement destination hidden             ✓          Umbra stealth address                  Class A, B
-Repayment amount                            ✓          ZK private input, in-circuit check     Class A, B
+Repayment amount                            ✓/mode     MagicBlock private payment receipt     Class A, B
 Repayer wallet hidden                       ✓          ZK private input + relay routing       Class A, B
 Oracle price (liquidation data)             ✓          Encrypt FHE ciphertext oracle          Class A, B
 Health factor (during liq computation)      ✓          Encrypt FHE homomorphic computation    Class A, B
-Individual loan balances                    ✓          Encrypt FHE encrypted storage          Class A, B, D, F
-Aggregate outstanding debt                  disclosed  Threshold decrypt — only total shown   Class A, B (not D, F)
+Individual collateral health values         ✓          Encrypt FHE encrypted oracle/health    Class A, B, D, F
+Aggregate collateral coverage               disclosed  Threshold decrypt — only total shown   Class A, B (not D, F)
 Liquidation trust                           ✓          IKA FutureSign — consent pre-signed    Class A, B, C
 Single operator key risk                    ✓          IKA 2PC-MPC — no single key            Class C
 FHE liquidation handle replay               ✓          Handle pinning — PDA binding           Class A, B
@@ -107,10 +107,11 @@ Stale liquidation on healthy position       ✓          Breach confirmation epo
 
 ACCEPTED DISCLOSURES (visible on-chain, by design):
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-Borrow amount                               public     ZK public input — required for LTV     —
+Borrow amount                               public/bucketed ZK public input — required for LTV —
 That a borrow occurred (LoanAccount PDA)    public     PDA creation visible                   —
 Loan count (active loans)                   public     PDA count enumerable                   —
 Denomination class withdrawn                public     ZK public output — required for SOL    —
+Repayment amount in degraded mode           public     Normal relay fallback if private payments unavailable —
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
 EXPLICITLY OUT OF SCOPE (user responsibility):
@@ -191,13 +192,38 @@ OFAC compliance proofs                      roadmap    Railgun Proof of Innocenc
 
 ---
 
+### Scenario 7: Public Borrow Amount Fingerprinting
+**Attack**: Observer uses public borrow amounts and fixed collateral denominations to infer possible collateral class or correlate unusual amounts across events.
+
+**Defense**:
+1. Supported borrow buckets reduce uniqueness of borrow amounts.
+2. Collateral ring proof hides which commitment is locked.
+3. Relay signing hides the borrower wallet.
+4. PER + Umbra hides the disbursement destination and exit type.
+
+**Residual risk**: Amount metadata remains visible or bucketed in MVP. This is accepted because deterministic LTV, interest, reserves, and liquidation are higher-priority safety properties.
+
+---
+
+### Scenario 8: Private Payment Receipt Replay
+**Attack**: Attacker reuses a private payment receipt from one loan to unlock collateral on another loan, or submits a receipt for a stale lower outstanding balance.
+
+**Defense**:
+1. Receipt hash binds `loanId`, `nullifierHash`, `outstanding_balance`, `repayment_vault`, and epoch/nonce.
+2. LendingPool recomputes current outstanding balance before verifying the receipt.
+3. `repay_ring` binds the caller's collateral nullifier to the same receipt hash.
+4. Receipt nonce is consumed after a successful repayment.
+
+---
+
 ## 4. Trust Assumptions Summary
 
 | Component | Trust model | Threshold | Consequence if fully compromised |
 |---|---|---|---|
 | MagicBlock PER Intel TDX | Hardware attestation | N/A (hardware) | Deposit→commitment mapping exposed |
+| MagicBlock Private Payments | Private settlement and receipt soundness | N/A / protocol-specific | Repayment amount privacy or collateral unlock safety compromised |
 | IKA MPC network | Threshold cryptography | 2/3 | Unauthorized relay signing possible |
-| Encrypt FHE oracle network | Threshold cryptography | 2/3 | Oracle price feeds decryptable; individual loan balances exposable |
+| Encrypt FHE oracle network | Threshold cryptography | 2/3 | Oracle price feeds decryptable; individual collateral health values exposable |
 | Umbra SDK key derivation | ECDH on Ed25519 | N/A (math) | Stealth address ownership linked |
 | groth16-solana verifier | BN254 discrete log | N/A (math) | ZK proofs forgeable |
 | Poseidon hash function | Collision resistance on BN254 | N/A (math) | Commitment collision, nullifier forgery |
@@ -210,7 +236,7 @@ OFAC compliance proofs                      roadmap    Railgun Proof of Innocenc
 
 The following risks are accepted and documented as the honest engineering tradeoff:
 
-1. **Borrow amount is public** — required for on-chain LTV verification. From borrow amount + LTV ratio, collateral denomination is inferable.
+1. **Borrow amount is public or bucketed** — required for on-chain LTV, interest, reserves, and liquidation. From borrow amount + LTV ratio, collateral denomination range may be inferable. This does not by itself link borrower to depositor.
 
 2. **Loan count is public** — LoanAccount PDA creation is visible. Observers can count active loans.
 
@@ -218,6 +244,6 @@ The following risks are accepted and documented as the honest engineering tradeo
 
 4. **Trusted setup for Groth16 circuits** — the three circuits (withdraw_ring, collateral_ring, repay_ring) each require a per-circuit trusted setup. Compromising the toxic waste from the ceremony allows generating valid fake proofs. Mitigation: multi-party computation ceremony (Powers of Tau) before production.
 
-5. **Pre-alpha dependencies** — IKA dWallet and Encrypt FHE are pre-alpha. Hackathon uses mock signer / plaintext fallback. Production requires mainnet availability of both.
+5. **Pre-alpha dependencies** — IKA dWallet, Encrypt FHE, and MagicBlock private payment surfaces may require gated devnet access. Implementation targets real protocol adapters first; any fallback adapter must be labeled and must reduce privacy claims accordingly.
 
 6. **Stealth address sweep** — forwarding from a stealth address to a known wallet permanently links them. The protocol cannot prevent users from doing this.

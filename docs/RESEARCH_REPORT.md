@@ -168,7 +168,7 @@ Including the leaf position prevents: if a commitment is somehow re-inserted at 
 
 **Key architectural pattern adopted: Threshold Decryption for Aggregate Solvency**
 
-Penumbra uses homomorphic ElGamal to compute validator-aggregated sums. We apply this pattern with Encrypt FHE: each encrypted loan balance contributes to a homomorphic sum, and the Encrypt threshold network decrypts only the total. Individual balances stay encrypted. The solvency check: `total_outstanding ≤ shielded_pool.lamports × LTV_FLOOR` runs on the decrypted aggregate.
+Penumbra uses homomorphic ElGamal to compute validator-aggregated sums. We apply this pattern with Encrypt FHE to aggregate encrypted collateral values and health signals while keeping borrow amounts public or bucketed for deterministic lending accounting. The solvency check compares public total outstanding debt against threshold-decrypted aggregate collateral coverage. Individual collateral health values stay encrypted.
 
 ---
 
@@ -231,7 +231,7 @@ The three-step liquidation flow uses the PDA seed constraint as the binding: sin
 
 **Fixes implemented**:
 1. `min_real_deposits_before_flush: u8 = 8` governance parameter — epoch cannot close until ≥8 real deposits. Guarantees ≥50% real ring members even at epoch boundary.
-2. VRF dummy commitments must be computed as `Poseidon(vrf_output_i, denomination)` — same structure as real commitments, with VRF output serving as the "secret." The VRF output is private (only the VRF contract knows the full preimage) so dummies are cryptographically indistinguishable from real commitments on inspection.
+2. VRF dummy commitments must be computed inside PER/TEE as `Poseidon("SHIELDLEND_DUMMY", pool_id, epoch_id, dummy_index, magicblock_vrf_output, enclave_private_entropy)`. MagicBlock VRF supplies unbiasable epoch randomness, while enclave-private entropy prevents observers from recomputing dummy leaves from public VRF data. Dummy preimages are discarded after insertion.
 3. Progressive ring size documented: K=8 when pool has <50 total deposits; K=16 once ≥50; K=32 once ≥200. Implemented as a circuit parameter controlled by governance.
 
 ---
@@ -265,6 +265,20 @@ The `per_fallback_epoch_threshold: u8 = 5` governance parameter controls mode tr
 
 **Mitigation**: Borrow amount bucketing (round to 0.1 SOL increments) reduces inference precision. Documented as a governance parameter: `min_borrow_increment_lamports`.
 
+This leak does not create depositor→borrower linkability by itself. The collateral note remains hidden in the ring, the borrower wallet is hidden by the relay, and the disbursement destination is hidden by PER + Umbra.
+
+---
+
+### V-7B: Repayment Amount Privacy Overclaim [HIGH — FIXED IN ARCHITECTURE]
+
+**Problem**: A ZK circuit with `repaymentAmount` as a private input can prove an arithmetic fact, but it does not hide a normal on-chain repayment transfer. If repayment SOL/SPL moves publicly into a vault, observers still see the amount and transfer graph.
+
+**Decision**: Use MagicBlock Private Payments / private SPL payment semantics as the Full Privacy repayment settlement rail. The `repay_ring` circuit proves collateral-nullifier knowledge and binds the operation to `loanId`, `nullifierHash`, `outstanding_balance`, and `settlementReceiptHash`. LendingPool verifies the private payment receipt before unlocking collateral.
+
+**Fallback**: If private payments are unavailable, repayment can still route through the IKA relay for identity privacy. In that degraded path, repayment amount privacy is not claimed.
+
+**Why MagicBlock over Umbra here**: Umbra is the right address-layer exit tool, but ShieldLend's repay instruction needs verifiable private settlement to a repayment vault/private balance. MagicBlock Private Payments fits that settlement role; Umbra remains for stealth exits and user-controlled disclosure patterns.
+
 ---
 
 ### V-8: LoanAccount PDA Creation is Observable [ACCEPTED TRADEOFF]
@@ -273,7 +287,7 @@ The `per_fallback_epoch_threshold: u8 = 5` governance parameter controls mode tr
 
 **Decision**: Accept as known limitation. Does not reveal borrower identity or loan amounts. Future roadmap: dummy PDAs to obscure loan count.
 
-**In threat model**: documented as "loan count is observable; individual loan balances and borrower identities are not."
+**In threat model**: documented as "loan count is observable; borrower identities and collateral note identities are not."
 
 ---
 
