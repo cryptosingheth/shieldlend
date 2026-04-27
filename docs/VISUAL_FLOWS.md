@@ -56,7 +56,31 @@ What this proves visually: the public funding transaction is not one-to-one with
 
 ---
 
-## 3. Borrow Privacy and Lending Safety Flow
+## 3. Withdrawal Privacy Flow
+
+```mermaid
+flowchart TD
+    classDef privacy fill:#0d9488,stroke:#134e4a,color:#fff
+    classDef safety fill:#b45309,stroke:#92400e,color:#fff
+    classDef public fill:#334155,stroke:#64748b,color:#fff
+
+    A["User loads encrypted note"]:::privacy
+    B["Build ring proof\nK=16 plus dummies"]:::privacy
+    C["IKA relay submits withdrawal"]:::privacy
+    D["groth16-solana verifies proof"]:::safety
+    E["Nullifier: Active to Spent"]:::safety
+    F["PER exit batch\nmixed with borrow disbursements"]:::privacy
+    G["Umbra stealth address receives funds"]:::privacy
+    H["User controls stealth wallet directly"]:::privacy
+
+    A --> B --> C --> D --> E --> F --> G --> H
+```
+
+Key point: the ring proof hides which commitment was spent, the relay hides who submitted the proof, and Umbra hides where funds went.
+
+---
+
+## 4. Borrow Privacy and Lending Safety Flow
 
 ```mermaid
 flowchart TD
@@ -82,7 +106,7 @@ Key point: public borrow amount supports solvency and liquidation, but does not 
 
 ---
 
-## 4. Private Repayment Flow
+## 5. Private Repayment Flow
 
 ```mermaid
 flowchart TD
@@ -107,7 +131,7 @@ If private payments are unavailable, repayment can still hide identity through r
 
 ---
 
-## 5. Liquidation and Bad-Debt Control
+## 6. Liquidation and Bad-Debt Control
 
 ```mermaid
 flowchart TD
@@ -134,7 +158,7 @@ The MVP avoids partial liquidation to reduce bad-debt and accounting risk.
 
 ---
 
-## 6. User History and Scoped Disclosure
+## 7. User History and Scoped Disclosure
 
 ```mermaid
 flowchart LR
@@ -154,7 +178,7 @@ There is no protocol-wide viewing key. Disclosure is user-controlled and scoped.
 
 ---
 
-## 7. Observer View
+## 8. Observer View
 
 ```mermaid
 flowchart TD

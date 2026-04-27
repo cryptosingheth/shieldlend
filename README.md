@@ -101,23 +101,32 @@ For the full transaction lifecycle — how deposit connects to withdraw, borrow,
 Each layer closes a specific privacy gap. The gap each layer closes cannot be addressed by any other layer in the stack.
 
 ```mermaid
-flowchart TD
-    classDef layer fill:#1e293b,stroke:#475569,color:#e2e8f0
+flowchart LR
+    classDef privacy fill:#0d9488,stroke:#134e4a,color:#fff
+    classDef program fill:#1e293b,stroke:#475569,color:#e2e8f0
+    classDef external fill:#312e81,stroke:#6366f1,color:#fff
 
-    E["ENTRY · MagicBlock PER + VRF"]:::layer
-    R["RELAY · IKA dWallet 2PC-MPC"]:::layer
-    S["SPEND · Groth16 Ring Proofs K=16"]:::layer
-    P["PAYMENT · MagicBlock Private Payments"]:::layer
-    X["EXIT · PER exit batch + Umbra SDK"]:::layer
-    O["ORACLE · Encrypt FHE"]:::layer
+    User["User Browser\nnotes, proofs, history"]:::program
+    IKA["IKA dWallet\nrelay + authorization"]:::external
+    PER["MagicBlock PER\nprivate execution batches"]:::privacy
+    Pay["MagicBlock Private Payments\nprivate repay settlement"]:::privacy
+    Umbra["Umbra\nstealth output addresses"]:::privacy
+    Encrypt["Encrypt FHE\nencrypted oracle and health"]:::external
+    SP["shielded_pool\nSOL custody + Merkle tree"]:::program
+    LP["lending_pool\nloan accounting + checks"]:::program
+    NR["nullifier_registry\nActive / Locked / Spent"]:::program
 
-    E -->|"who deposited, timing, which commitment"| R
-    R -->|"which wallet signed any transaction"| S
-    S -->|"which commitment was used or locked"| P
-    P -->|"repayment transfer graph and amount in full privacy mode"| X
-    X -->|"where funds went, withdrawal vs borrow exit"| O
-    O -->|"liquidation price data readable in mempool"| End([All gaps closed])
+    User --> IKA
+    IKA --> PER
+    PER --> SP
+    SP <--> LP
+    LP <--> NR
+    LP --> Pay
+    LP --> Encrypt
+    SP --> Umbra
 ```
+
+Canonical investor/judge-facing flow diagrams are maintained in [`docs/VISUAL_FLOWS.md`](docs/VISUAL_FLOWS.md). The README intentionally avoids duplicating every flow chart so the architecture has one diagram source of truth.
 
 ---
 
@@ -179,256 +188,9 @@ If private payments are unavailable, the protocol can fall back to identity-priv
 
 ## Flow Diagrams
 
-The diagrams below trace each operation step-by-step. Teal nodes indicate where a privacy property is actively being enforced. Rendered by GitHub's native Mermaid support.
+The canonical diagrams live in [`docs/VISUAL_FLOWS.md`](docs/VISUAL_FLOWS.md). That file contains the protocol role map plus the deposit, withdrawal, borrow, private repayment, liquidation, history/disclosure, and observer-view flows.
 
-### Overall Transaction Journey
-
-```mermaid
-flowchart TD
-    classDef privacy fill:#0d9488,stroke:#134e4a,color:#fff
-    classDef actor fill:#1e293b,stroke:#0f172a,color:#fff
-
-    User([User Browser]):::actor
-    Relay([IKA Relay]):::actor
-    PER([MagicBlock PER]):::actor
-    Pool([ShieldedPool]):::actor
-    Lend([LendingPool]):::actor
-    Null([NullifierRegistry]):::actor
-    Umbra([Umbra Stealth Address]):::actor
-
-    User -->|SOL + commitment| Relay
-    Relay --> PER
-    PER -->|batched TX| Pool
-    Pool --> Note[Note saved locally]
-
-    Note --> Choice{Use note}
-    Choice -->|Withdraw| W[Ring proof]
-    Choice -->|Borrow| B[Collateral proof]
-
-    W --> WNull[Nullifier: Active → Spent]:::privacy
-    WNull --> WExit[PER exit batch]:::privacy
-    WExit --> Umbra
-
-    B --> LockA[Nullifier: Active → Locked]:::privacy
-    LockA --> Loan[LoanAccount PDA]
-    Loan --> BExit[PER exit batch]:::privacy
-    BExit --> Umbra
-
-    Loan --> Status{Loan status}
-    Status -->|Repay| Unlock[Nullifier: Locked → Active]:::privacy
-    Unlock --> Note
-    Status -->|Liquidate| Spent[Nullifier: Locked → Spent]:::privacy
-    Spent --> Closed([Loan Closed])
-```
-
----
-
-### Flow 1: Deposit
-
-```mermaid
-flowchart TD
-    classDef privacy fill:#0d9488,stroke:#134e4a,color:#fff
-    classDef actor fill:#1e293b,stroke:#0f172a,color:#fff
-
-    subgraph Browser[User Browser]
-        G1[Generate secret, nullifier, denomination]
-        G2[commitment = Poseidon hash]
-        G3[AES-256-GCM encrypt note]
-        G4[Save to local vault]
-        G1 --> G2 --> G3 --> G4
-    end
-
-    subgraph RelaySG[IKA Relay]
-        R1[TX1: receive SOL]
-        R2[Queue deposit]
-        R1 --> R2
-    end
-
-    subgraph PERSG[MagicBlock PER — Intel TDX Enclave]
-        P1[Accumulate deposits from multiple users]
-        P2[VRF: generate dummy commitments]
-        P3[VRF: shuffle insertion positions]
-        P4[Build single batch]
-        P1 --> P2 --> P3 --> P4
-    end
-
-    subgraph Chain[On-Chain]
-        C1[TX2: ShieldedPool batch insert]
-        C2[Merkle tree updated — new root]
-        C1 --> C2
-    end
-
-    U([User]):::actor
-    U --> G1
-    G4 --> R1
-    R2 --> P1
-    P4 --> C1
-    C2 --> Done([onAccountChange fires — deposit confirmed])
-
-    TxUnlink[TX1 and TX2 not linked]:::privacy
-    R1 -.-> TxUnlink
-    C1 -.-> TxUnlink
-```
-
----
-
-### Flow 2: Withdrawal
-
-```mermaid
-flowchart TD
-    classDef privacy fill:#0d9488,stroke:#134e4a,color:#fff
-    classDef actor fill:#1e293b,stroke:#0f172a,color:#fff
-
-    subgraph Browser[User Browser]
-        B1[Load note from vault]
-        B2[Fetch Merkle root]
-        B3[Build ring K=16 incl. VRF dummies]
-        B4[snarkjs Groth16 proof ~1.2s]
-        B1 --> B2 --> B3 --> B4
-    end
-
-    subgraph RelaySG[IKA Relay — off-chain receipt]
-        R1[Receive proof + stealth meta-address]
-        R2[Submit withdraw tx — relay is signer]:::privacy
-        R1 --> R2
-    end
-
-    subgraph Chain[On-Chain]
-        C1[groth16-solana verify]
-        C2{Proof valid?}
-        C3[Nullifier: Active → Spent]:::privacy
-        C4[SOL released from ShieldedPool]
-        C1 --> C2
-        C2 -->|yes| C3 --> C4
-        C2 -->|no| Rej([Rejected])
-    end
-
-    subgraph PERSG[MagicBlock PER — exit batch]
-        P1[Queue alongside borrow disbursements]:::privacy
-        P2[Flush batch to stealth addresses]
-        P1 --> P2
-    end
-
-    U([User]):::actor
-    Um([Umbra Stealth Address]):::actor
-
-    U --> B1
-    B4 --> R1
-    R2 --> C1
-    C4 --> P1
-    P2 --> Um
-    Um --> End([User imports key into Phantom / Solflare])
-
-    RingPr[Ring proof hides which commitment]:::privacy
-    B4 -.-> RingPr
-```
-
----
-
-### Flow 3: Borrow
-
-```mermaid
-flowchart TD
-    classDef privacy fill:#0d9488,stroke:#134e4a,color:#fff
-    classDef actor fill:#1e293b,stroke:#0f172a,color:#fff
-
-    subgraph Browser[User Browser]
-        B1[Load collateral note]
-        B2[Choose borrow amount]
-        B3{LTV satisfied?}
-        B4[Groth16 collateral proof]
-        B5[Generate Umbra stealth address]
-        B1 --> B2 --> B3
-        B3 -->|yes| B4 --> B5
-        B3 -->|no| Abort([Abort — LTV not met])
-    end
-
-    subgraph RelaySG[IKA Relay]
-        R1[Receive proof + stealth address]
-        R2[Submit borrow tx — relay is signer]:::privacy
-        R1 --> R2
-    end
-
-    subgraph Chain[On-Chain]
-        C1[groth16-solana verify collateral proof]
-        C2[Nullifier: Active → Locked]:::privacy
-        C3[LoanAccount PDA created]
-        C4[IKA dWallet co-sign disbursement]
-        C5[IKA FutureSign liquidation stored]
-        C1 --> C2 --> C3 --> C4 --> C5
-    end
-
-    subgraph PERSG[MagicBlock PER — exit batch]
-        P1[Queue alongside withdrawal exits]:::privacy
-        P2[Flush — exit type indistinguishable]:::privacy
-        P1 --> P2
-    end
-
-    U([User]):::actor
-    Um([Umbra Stealth Address]):::actor
-
-    U --> B1
-    B5 --> R1
-    R2 --> C1
-    C5 --> P1
-    P2 --> Um
-    Um --> End([Loan active — borrower wallet never on-chain])
-```
-
----
-
-### Flow 4: Repay
-
-```mermaid
-flowchart TD
-    classDef privacy fill:#0d9488,stroke:#134e4a,color:#fff
-    classDef actor fill:#1e293b,stroke:#0f172a,color:#fff
-
-    subgraph Browser[User Browser]
-        B1[Load note + loanId from local vault]
-        B2[Query on-chain outstanding balance]
-        B3[Compute: borrow × compound rate history]
-        B4[Groth16 repay proof]
-        B5[Prepare private payment receipt binding]
-        B1 --> B2 --> B3 --> B4 --> B5
-    end
-
-    subgraph PaySG[MagicBlock Private Payments]
-        P1[Private WSOL/SPL settlement]:::privacy
-        P2[Receipt: loanId + nullifierHash + outstanding + vault]:::privacy
-        P1 --> P2
-    end
-
-    subgraph RelaySG[IKA Relay]
-        R1[Receive proof + receipt]
-        R2[Submit repay tx — relay is signer]:::privacy
-        R1 --> R2
-    end
-
-    subgraph Chain[On-Chain]
-        C1[groth16-solana verify repay proof]
-        C2{receipt settlement >= outstanding?}
-        C3[Nullifier: Locked → Active]:::privacy
-        C4[LoanAccount PDA closed]
-        C1 --> C2
-        C2 -->|yes — proof and receipt bound| C3 --> C4
-        C2 -->|no| Rej([Rejected])
-    end
-
-    U([User]):::actor
-    U --> B1
-    B5 --> P1
-    P2 --> R1
-    R2 --> C1
-    C4 --> Free[Note status: Active]
-    Free --> Next([Withdraw via standard flow])
-
-    AmtPr[Repayment amount private in Full Privacy mode]:::privacy
-    P2 -.-> AmtPr
-
-    TxPr[Repay signer is relay; borrower wallet not linked]:::privacy
-    R1 -.-> TxPr
-```
+The README keeps the narrative and privacy-status table only. This avoids maintaining two separate copies of the same flow charts.
 
 ---
 
