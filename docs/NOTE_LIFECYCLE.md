@@ -253,7 +253,7 @@ Oracle path:   Encrypt FHE ciphertexts → homomorphic health factor → thresho
 Relay:         IKA 2PC-MPC dWallet
 ```
 
-**Privacy level**: Maximum. All four layers active.
+**Privacy level**: Maximum. Relay privacy, ZK note privacy, PER batching, private repayment settlement, FHE health computation, and Umbra address privacy are all active.
 
 ---
 

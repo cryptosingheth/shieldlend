@@ -103,7 +103,7 @@ Railgun retains the last N Merkle roots on-chain. Users can prove their note exi
 
 **Key architectural pattern adopted: Proof of Innocence (future roadmap)**
 
-Railgun allows users to generate a ZK proof showing their deposits did not originate from OFAC-sanctioned addresses, without revealing identity. This is critical for regulatory compliance without breaking privacy. Documented as a roadmap item in our threat model — not MVP scope.
+Railgun allows users to generate a ZK proof showing their deposits did not originate from OFAC-sanctioned addresses, without revealing identity. This is critical for regulatory compliance without breaking privacy. Documented as a roadmap item in the privacy and threat model -- not MVP scope.
 
 ---
 
@@ -121,7 +121,7 @@ Railgun allows users to generate a ZK proof showing their deposits did not origi
 
 Aztec's nullifier formula: `nullifier_app = Poseidon(nsk_master, app_contract_address)`. Each contract produces a different nullifier for the same note. Cross-contract nullifier correlation is impossible — if our protocol ever has a second version or complementary program, notes cannot be linked across them.
 
-**Our implementation**: `nullifierHash = Poseidon(nullifier, SHIELDED_POOL_PROGRAM_ID)`. Added `SHIELDED_POOL_PROGRAM_ID` as a domain separator. Zero cost — one additional Poseidon input. Prevents future cross-contract deanonymization.
+**Our implementation**: `nullifierHash = Poseidon(nullifier, leaf_index, SHIELDED_POOL_PROGRAM_ID)`. `SHIELDED_POOL_PROGRAM_ID` is the app/domain separator and `leaf_index` binds the nullifier to the note's Merkle position. Together they prevent future cross-contract deanonymization and re-insertion ambiguity.
 
 **Key architectural pattern (partial): Client-Side Proving**
 
@@ -287,7 +287,7 @@ This leak does not create depositor→borrower linkability by itself. The collat
 
 **Decision**: Accept as known limitation. Does not reveal borrower identity or loan amounts. Future roadmap: dummy PDAs to obscure loan count.
 
-**In threat model**: documented as "loan count is observable; borrower identities and collateral note identities are not."
+**In privacy and threat model**: documented as "loan count is observable; borrower identities and collateral note identities are not."
 
 ---
 

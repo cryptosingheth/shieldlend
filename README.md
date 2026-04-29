@@ -21,7 +21,7 @@ Every interaction with a lending protocol creates a permanent, public record tha
 
 This matters for individuals who want financial privacy, for institutions that cannot reveal their treasury positions on-chain, and for anyone whose on-chain credit history should not be public record.
 
-Existing privacy tools address one layer at a time: mixers hide amounts but not identities; stealth addresses hide destinations but not deposits; ZK proofs hide which commitment was spent but not who submitted the transaction. ShieldLend addresses all four layers across the full transaction lifecycle.
+Existing privacy tools address one layer at a time: mixers hide amounts but not lending state; stealth addresses hide destinations but not deposits; ZK proofs hide which commitment was spent but not who submitted the transaction. ShieldLend combines these layers across the full transaction lifecycle.
 
 ---
 
@@ -92,105 +92,25 @@ flowchart TD
     SP -->|CPI| NR
 ```
 
-For the full transaction lifecycle — how deposit connects to withdraw, borrow, repay, and liquidate — see [Flow Diagrams](#flow-diagrams) below.
+For the full transaction lifecycle -- how deposit connects to withdraw, borrow, repay, and liquidate -- see [`docs/VISUAL_FLOWS.md`](docs/VISUAL_FLOWS.md).
 
 ---
 
-### Privacy Stack
+### Privacy Architecture
 
-Each layer closes a specific privacy gap. The gap each layer closes cannot be addressed by any other layer in the stack.
+Each layer closes a different gap in the lending lifecycle:
 
-```mermaid
-flowchart LR
-    classDef privacy fill:#0d9488,stroke:#134e4a,color:#fff
-    classDef program fill:#1e293b,stroke:#475569,color:#e2e8f0
-    classDef external fill:#312e81,stroke:#6366f1,color:#fff
+| Layer | What it does | Why it is needed |
+|---|---|---|
+| IKA dWallet | Submits protocol actions without exposing the user's main wallet as signer. | Prevents deposit, withdraw, borrow, and repay instructions from becoming wallet-linked credit events. |
+| MagicBlock PER | Batches deposits and exits inside a private execution environment. | Breaks timing correlation and makes withdrawal exits and borrow disbursement exits harder to classify. |
+| Groth16 circuits | Prove note ownership, collateral validity, and repayment authority. | Lets the protocol enforce rules without revealing which note belongs to the user. |
+| MagicBlock Private Payments | Settles repayments through a private payment receipt in Full Privacy mode. | A ZK proof alone cannot hide a normal public repayment transfer. |
+| Encrypt FHE | Keeps oracle and health-factor computation encrypted until authorized reveal. | Protects liquidation-sensitive data from MEV and public health-factor surveillance. |
+| Umbra | Gives each withdrawal or disbursement a fresh stealth receiving address. | Prevents outputs from landing directly in a known wallet. |
+| NullifierRegistry | Tracks Active, Locked, and Spent note states. | Prevents double-spend and prevents collateral withdrawal during active loans. |
 
-    User["User Browser\nnotes, proofs, history"]:::program
-    IKA["IKA dWallet\nrelay + authorization"]:::external
-    PER["MagicBlock PER\nprivate execution batches"]:::privacy
-    Pay["MagicBlock Private Payments\nprivate repay settlement"]:::privacy
-    Umbra["Umbra\nstealth output addresses"]:::privacy
-    Encrypt["Encrypt FHE\nencrypted oracle and health"]:::external
-    SP["shielded_pool\nSOL custody + Merkle tree"]:::program
-    LP["lending_pool\nloan accounting + checks"]:::program
-    NR["nullifier_registry\nActive / Locked / Spent"]:::program
-
-    User --> IKA
-    IKA --> PER
-    PER --> SP
-    SP <--> LP
-    LP <--> NR
-    LP --> Pay
-    LP --> Encrypt
-    SP --> Umbra
-```
-
-Canonical investor/judge-facing flow diagrams are maintained in [`docs/VISUAL_FLOWS.md`](docs/VISUAL_FLOWS.md). The README intentionally avoids duplicating every flow chart so the architecture has one diagram source of truth.
-
----
-
-## How Unlinkability Is Achieved
-
-### Deposit
-
-The user's wallet never appears in the ShieldedPool deposit transaction.
-
-1. User generates a commitment client-side: `commitment = Poseidon(secret, nullifier, denomination)`. Secret and nullifier never leave the browser.
-2. User sends SOL to the IKA relay address (TX1 — visible, but only shows funding of relay).
-3. The IKA relay batches this deposit with others inside a **MagicBlock Private Ephemeral Rollup** (Intel TDX enclave). The batch processes privately.
-4. PER commits a batch to ShieldedPool (TX2 — signer is the IKA relay wallet, not the user). TX1 and TX2 are not one-to-one.
-5. VRF-randomized dummy commitments are inserted alongside real ones, permanently enlarging the anonymity set for all future ring proofs.
-
-Observer sees TX1: "User funded relay." Observer sees TX2: "Relay deposited batch to pool." No linking between them.
-
-### Withdrawal
-
-No observer can connect the depositor's wallet to the withdrawal destination.
-
-1. User loads their note (secret + nullifier) from the local encrypted vault.
-2. `snarkjs` generates a **Groth16 ring proof**: proves ownership of one commitment in a ring of 16, without revealing which one. VRF dummies inserted at deposit time appear in the ring — the effective anonymity set exceeds K=16.
-3. User sends proof to the **IKA relay** (off-chain). Relay submits the withdrawal transaction on-chain — relay wallet is the signer, not the user's wallet.
-4. `groth16-solana` verifies the proof on-chain (< 200k compute units). SOL released from ShieldedPool to relay.
-5. The exit is queued in **MagicBlock PER** alongside other withdrawals and borrow disbursements. PER flushes the batch to respective **Umbra stealth addresses**.
-6. User derives the private key for their stealth address via Umbra SDK and imports it into Phantom or Solflare — the stealth address is a standard Solana wallet. SOL can be spent from it directly, just like any other wallet.
-
-**Why no auto-forward to the main wallet:** forwarding from stealth address → main wallet would create an on-chain link between the two, permanently undoing the exit privacy. The Umbra stealth address IS the user's receiving wallet for this operation — it has a full Solana private key, derived once via ECDH. There is no friction beyond importing that key. Users can continue to use the stealth address for any on-chain activity or re-deposit into ShieldLend for continued privacy.
-
-The ring proof hides *which* commitment was spent. Relay routing hides *who* submitted the proof. The stealth address hides *where* the funds went. No auto-forward preserves all three.
-
-### Borrow
-
-The collateral identity, borrower wallet, and disbursement destination are not linkable.
-
-1. User selects a committed note as collateral.
-2. `snarkjs` generates a **Groth16 collateral proof**: proves ring membership + denomination ≥ borrowed × LTV floor — in-circuit. Ring includes VRF dummies from deposit time.
-3. User sends proof to the **IKA relay**. Relay submits on-chain — relay wallet is the signer.
-4. `groth16-solana` verifies the proof on-chain.
-5. The **IKA dWallet** receives an `approve_message()` CPI. The program validates LTV; the IKA MPC network co-signs the disbursement. Both gates required — no single operator can disburse.
-6. SOL exits ShieldedPool → relay → **MagicBlock PER exit batch** (mixed with withdrawals) → **Umbra stealth address**. The exit is indistinguishable from a withdrawal on-chain.
-
-No observer links "this commitment is locked as collateral" to "this wallet received a loan."
-
-### Repay
-
-Repayment does not reveal the borrower's identity. In Full Privacy mode, repayment settlement also avoids publishing a normal repayment transfer graph.
-
-1. User generates a **repay_ring proof**: proves knowledge of the collateral nullifier and binds the repayment to `loanId` and the current `outstanding_balance`. The borrower's wallet is never revealed.
-2. User settles repayment through **MagicBlock Private Payments** using private WSOL/SPL payment semantics. The private payment receipt is bound to `loanId`, `nullifierHash`, `outstanding_balance`, and `repayment_vault`.
-3. The **IKA relay** submits the repay instruction on-chain — relay wallet is the signer, not the borrower.
-4. `groth16-solana` verifies the repay proof, and LendingPool verifies the private payment receipt binding.
-5. Loan PDA cleared, nullifier unlocked. Collateral note is ready for withdrawal.
-
-If private payments are unavailable, the protocol can fall back to identity-private repayment through the IKA relay, but repayment amount privacy must not be claimed in that degraded path.
-
----
-
-## Flow Diagrams
-
-The canonical diagrams live in [`docs/VISUAL_FLOWS.md`](docs/VISUAL_FLOWS.md). That file contains the protocol role map plus the deposit, withdrawal, borrow, private repayment, liquidation, history/disclosure, and observer-view flows.
-
-The README keeps the narrative and privacy-status table only. This avoids maintaining two separate copies of the same flow charts.
+The canonical explanation of these flows is [`docs/VISUAL_FLOWS.md`](docs/VISUAL_FLOWS.md). The exact privacy guarantees, residual risks, and adversary model are in [`docs/PRIVACY_AND_THREAT_MODEL.md`](docs/PRIVACY_AND_THREAT_MODEL.md).
 
 ---
 
@@ -324,7 +244,7 @@ Threshold decryption reveals ONLY `total_collateral_value`. Individual collatera
 | Disbursement recipient | Umbra SDK | Same reason as withdrawals — fresh stealth address, borrower wallet never on-chain |
 | Oracle MEV prevention | Encrypt FHE | Price feeds as FHE ciphertexts; health_factor computed homomorphically; MEV bots cannot read pending price updates |
 | Aggregate solvency | Encrypt FHE | Homomorphic sum of encrypted collateral values; only aggregate coverage is revealed |
-| Compliance disclosure | Encrypt threshold decryption | Individual loan balance disclosed to auditor via 2/3 MPC threshold decrypt; no global exposure |
+| Compliance disclosure | User-scoped disclosure packet + optional Encrypt threshold evidence | User exports selected records only; no protocol-wide viewing key or global deanonymization path |
 | Liquidation pre-authorization | IKA FutureSign | Borrower consents at borrow time; neither borrower (cannot block) nor operator (cannot trigger without condition) has unilateral control |
 
 ---
@@ -386,9 +306,8 @@ shieldlend-solana/
 │   ├── IMPLEMENTATION_PLAN.md
 │   ├── NOTE_LIFECYCLE.md
 │   ├── PITCH_DECK.md
-│   ├── PRIVACY_MODEL.md
+│   ├── PRIVACY_AND_THREAT_MODEL.md
 │   ├── RESEARCH_REPORT.md
-│   ├── THREAT_MODEL.md
 │   └── VISUAL_FLOWS.md
 ├── frontend/
 │   ├── public/circuits/
@@ -398,7 +317,6 @@ shieldlend-solana/
 │       ├── circuits.ts         # snarkjs proof generation
 │       └── noteStorage.ts      # AES-256-GCM note vault
 ├── .gitignore
-├── CLAUDE.md
 └── README.md
 ```
 
@@ -435,7 +353,7 @@ shieldlend-solana/
 │       ├── BorrowForm.tsx
 │       └── RepayForm.tsx
 ├── docs/
-│   └── (architecture, threat model, implementation plan, visual flows, pitch deck)
+│   └── (architecture, privacy/threat model, lifecycle, decisions, implementation plan, visual flows)
 ├── Anchor.toml
 ├── Cargo.toml
 ├── package.json
@@ -483,8 +401,7 @@ Full competitive analysis, attribution table, and protocol comparisons: [`docs/R
 | Document | Contents |
 |---|---|
 | [`docs/architecture.md`](docs/architecture.md) | Program design, CPI flows, account model, data structures |
-| [`docs/PRIVACY_MODEL.md`](docs/PRIVACY_MODEL.md) | Unlinkability analysis per flow, residual risks, accepted disclosures |
-| [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) | Adversary classes, attack scenarios, full privacy property table, trust assumptions |
+| [`docs/PRIVACY_AND_THREAT_MODEL.md`](docs/PRIVACY_AND_THREAT_MODEL.md) | Privacy guarantees, accepted disclosures, adversaries, attack scenarios, trust assumptions |
 | [`docs/DESIGN_DECISIONS.md`](docs/DESIGN_DECISIONS.md) | ADR-style rationale for every protocol and architecture choice |
 | [`docs/NOTE_LIFECYCLE.md`](docs/NOTE_LIFECYCLE.md) | Note state machine, LoanAccount lifecycle, protocol parameters, operational modes |
 | [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) | Approved build plan, phase order, contracts, circuits, imports, tests, visuals |

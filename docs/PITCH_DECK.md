@@ -1,6 +1,6 @@
 # ShieldLend Solana — Pitch Deck Narrative
 
-This is the source narrative for the investor / mentor / judge deck. The editable PPTX artifact is generated at [`docs/pitch_deck/ShieldLend_Pitch_Deck.pptx`](pitch_deck/ShieldLend_Pitch_Deck.pptx), with previews under [`docs/pitch_deck/previews/`](pitch_deck/previews/).
+This is the draft narrative for the investor, mentor, and judge deck. The PPTX artifact is intentionally not treated as canonical during the documentation finalization pass; it should be rebuilt later after implementation and demo flow are stable.
 
 ---
 

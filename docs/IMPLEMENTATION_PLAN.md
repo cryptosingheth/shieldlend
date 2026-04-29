@@ -6,13 +6,14 @@ This plan is scoped only to the ShieldLend Solana repo. The EVM repo and the `v2
 
 ## 0. Architecture Validation and Documentation Pass
 
-Status: in progress before coding.
+Status: documentation finalization complete before coding.
 
 Goals:
 - Validate that every privacy claim maps to a concrete mechanism.
 - Remove overclaims where a proof does not hide a public transfer.
 - Keep borrow amounts public or bucketed for MVP so LTV, interest, reserves, liquidation, and bad-debt prevention remain deterministic.
 - Add clear diagrams and pitch materials for mentors, judges, and investors.
+- Keep `docs/VISUAL_FLOWS.md` as the plain-English flow source and `docs/PRIVACY_AND_THREAT_MODEL.md` as the combined privacy/security source.
 
 Key decisions:
 - Borrow amount public/bucketed leaks amount metadata but does not link borrower to depositor.

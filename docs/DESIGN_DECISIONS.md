@@ -42,7 +42,7 @@ Every protocol and component choice in ShieldLend answers a specific privacy or 
 
 ---
 
-## ZK Circuits: Circom + Groth16 (unchanged from EVM version)
+## ZK Circuits: Circom + Groth16 (adapted from V2A lineage)
 
 **Requirement**: ZK circuits for ring membership + Merkle inclusion + LTV checks.
 
@@ -55,7 +55,7 @@ Every protocol and component choice in ShieldLend answers a specific privacy or 
 - Circom: mature, large community, snarkjs compatibility, existing circuits tested and correct. No migration benefit.
 - Noir: newer, more ergonomic. Would require rewriting all three circuits without a correctness track record for this specific application.
 
-**Decision**: Circom + Groth16, unchanged. The circuits are chain-agnostic — commitment formula, ring structure, and Merkle depth are independent of the settlement layer.
+**Decision**: Use Circom + Groth16 as the circuit stack and adapt the existing ring/Merkle logic inside the Solana repo. The circuits are mostly chain-agnostic, but the Solana implementation must update the nullifier formula to `Poseidon(nullifier, leaf_index, SHIELDED_POOL_PROGRAM_ID)` before recompilation.
 
 ---
 
@@ -144,7 +144,7 @@ The PER/TEE discards the preimage after insertion. Observers can verify that the
 
 **Options considered**:
 - **Custom ECDH stealth address implementation**: The ERC-5564 scheme can be implemented from first principles using a wallet signature as the shared secret. Requires building key derivation, address generation, and sweep logic.
-- **Umbra SDK (ScopeLift)**: The team that authored ERC-5564. Solana mainnet alpha as of February 2026 via Arcium. Provides complete stealth address generation, key derivation from meta-address, and auto-sweep functionality.
+- **Umbra SDK (ScopeLift)**: The team that authored ERC-5564. Solana mainnet alpha as of February 2026 via Arcium. Provides stealth address generation and key derivation from a meta-address, reducing the risk of custom cryptographic mistakes.
 
 **Decision**: Umbra SDK. Using the reference implementation from the authors of ERC-5564 eliminates the risk of subtle errors in key derivation that could compromise stealth address privacy. Both withdrawal destinations and borrow disbursement destinations use Umbra — single dependency, unified stealth address scheme.
 
