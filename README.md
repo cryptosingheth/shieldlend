@@ -390,7 +390,7 @@ Each track covers a distinct privacy layer — entry execution, transaction auth
 
 ## Architecture Inspirations
 
-ShieldLend builds on proven patterns from production privacy protocols — historical root ring buffers (Railgun, Tornado Cash), position-dependent nullifiers (Penumbra), app-siloed nullifier domains (Aztec), and three-step async liquidation adapted from Laolex/shieldlend's EVM implementation. Two patterns are original to this design: VRF dummy indistinguishability and the unified exit path that makes withdrawal and borrow disbursement structurally identical on-chain.
+ShieldLend builds on proven patterns from production privacy protocols -- historical root ring buffers (Railgun, Tornado Cash), position-dependent nullifiers (Penumbra), app-siloed nullifier domains (Aztec), and async FHE liquidation patterns adapted to Solana's Anchor/PDA model. Two patterns are original to this design: VRF dummy indistinguishability and the unified exit path that makes withdrawal and borrow disbursement structurally identical on-chain.
 
 Full competitive analysis, attribution table, and protocol comparisons: [`docs/RESEARCH_REPORT.md`](docs/RESEARCH_REPORT.md).
 

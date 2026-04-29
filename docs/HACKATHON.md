@@ -55,7 +55,7 @@ Each `LoanAccount` PDA stores `is_liquidatable: EncryptedBool` — the result of
 The `is_liquidatable` ciphertext is the trigger for the three-step async liquidation flow (see below).
 
 **3. Three-step async liquidation with handle pinning**
-FHE decryption is asynchronous — the `is_liquidatable` ciphertext must be sent to the Encrypt threshold network for decryption before liquidation can proceed. ShieldLend implements a three-step flow adapted from Laolex/shieldlend's EVM implementation, mapped to Anchor's PDA model:
+FHE decryption is asynchronous -- the `is_liquidatable` ciphertext must be sent to the Encrypt threshold network for decryption before liquidation can proceed. ShieldLend implements a three-step flow mapped to Anchor's PDA model:
 
 - **Step 1** (`request_liquidation_reveal`): Permissionless. Snapshots the FHE ciphertext handle. Emits event for Encrypt oracle. Sets `pending_liquidation_reveal = true`.
 - **Step 2** (`verify_liquidation_reveal`): Called by Encrypt oracle keeper after threshold decryption completes. Verifies the re-encryption proof is signed over this loan's PDA address (handle pinning — prevents replay attacks). Sets `confirmed_liquidatable`.

@@ -21,7 +21,7 @@ Every protocol and component choice in ShieldLend answers a specific privacy or 
 **Requirement**: A production-quality, audited lending interest rate model that runs on Solana.
 
 **Options considered**:
-- **Aave v3 two-slope model**: Well-known, widely used. Two kink points — base rate below optimal, jump rate above optimal. Solidity implementation not portable directly; requires full rewrite.
+- **Aave v3 two-slope model**: Well-known, widely used. Two kink points -- base rate below optimal, jump rate above optimal. Not portable directly to Anchor/Solana; requires full rewrite.
 - **Custom flat rate**: Simple but inaccurate — cannot price risk differentiation at varying utilization levels.
 - **Kamino klend (Anchor, open source)**: Poly-linear 11-point model directly from a $3.2B TVL production Solana protocol. Already Anchor-compatible. Audited. More granular than two-slope — rate can be tuned at 11 utilization levels to match market conditions precisely.
 
@@ -42,7 +42,7 @@ Every protocol and component choice in ShieldLend answers a specific privacy or 
 
 ---
 
-## ZK Circuits: Circom + Groth16 (adapted from V2A lineage)
+## ZK Circuits: Circom + Groth16
 
 **Requirement**: ZK circuits for ring membership + Merkle inclusion + LTV checks.
 
@@ -116,7 +116,7 @@ The PER also handles the exit batch (see ADR: Unified Exit Path below) — the s
 
 **Options considered**:
 - **Block hash / slot hash**: The block producer knows the next slot hash before it is finalized. A colluding validator could bias which dummy commitments are inserted. Grinding attacks possible.
-- **Chainlink VRF**: Works on EVM chains. Not available natively on Solana for this use case.
+- **Chainlink VRF**: Widely used elsewhere, but not the native Solana path for this use case.
 - **MagicBlock VRF**: On-chain verifiable randomness with cryptographic proof per result. Callback-based — the requester cannot manipulate the output after requesting it. Free within ER, 0.0005 SOL on base chain. Proof included in the flush_epoch transaction — verifiable by anyone.
 
 **Decision**: MagicBlock VRF. Block hash entropy is gameable by validators; VRF is not. The per-result cryptographic proof is a stronger security property than "assume validators are honest." VRF runs once at deposit epoch flush time — the resulting dummy commitments persist in the Merkle tree permanently and carry into all future ring proofs.
@@ -234,13 +234,13 @@ Including `SHIELDED_POOL_PROGRAM_ID` as a compile-time constant in the circuit e
 
 **The problem with single-step liquidation in FHE**: Threshold decryption is asynchronous (requires 2/3 of Encrypt network validators to process). A single-instruction liquidation would either: (a) block synchronously waiting for decryption (impossible in Solana's execution model), or (b) trust the submitter's claim about health factor (no verification — breaks security).
 
-**Pattern adopted from**: Laolex/shieldlend (`ConfidentialLending.sol`) — the most mature FHE lending implementation found in the competitive analysis. Their three-step flow (requestLiquidationReveal → verifyLiquidationReveal → liquidate) handles Zama's async coprocessor decryption. We adapt this to Solana's Anchor/PDA model.
+**Decision**: Use a three-step async liquidation flow mapped to Solana's Anchor/PDA model.
 
-**Step 1** (permissionless): Emit event with FHE handle. Encrypt network initiates decryption.
+**Step 1** (permissionless): Emit event with the FHE handle. Encrypt network initiates decryption.
 **Step 2** (called by Encrypt oracle keeper): Verify decryption proof; set `confirmed_liquidatable`.
 **Step 3** (permissionless if confirmed): Execute liquidation via IKA FutureSign.
 
-**Handle Pinning [C-01]**: Prevents replay of a decryption result from one loan against another. In EVM: `require(handlesList[0] == FHE.toBytes32(positions[borrower].isLiquidatable))`. In Anchor: the PDA `seeds = [b"loan", collateral_nullifier_hash]` is cryptographically unique per loan and serves as the binding — the Encrypt oracle proof is verified against this PDA address.
+**Handle Pinning [C-01]**: Prevents replay of a decryption result from one loan against another. In Anchor, the PDA `seeds = [b"loan", collateral_nullifier_hash]` is cryptographically unique per loan and serves as the binding -- the Encrypt oracle proof is verified against this PDA address.
 
 **Stale flag clearing [CR-2]**: On any repayment or collateral increase, immediately clear `confirmed_liquidatable`, `pending_liquidation_reveal`, and reset `consecutive_breach_count`. Prevents race condition where position improves post-request but old confirmation executes.
 
@@ -252,9 +252,7 @@ Including `SHIELDED_POOL_PROGRAM_ID` as a compile-time constant in the circuit e
 
 **Why automatic in-FHE accrual is not MVP scope**: To compute an interest rate from utilization (`rate = base + utilization × multiplier`), the protocol needs deterministic total debt and reserve accounting. Hiding borrow amounts inside FHE would make repayment, liquidation, reserves, and bad-debt handling substantially more complex. For MVP, borrow amounts are public or bucketed and interest accrues with public arithmetic; Encrypt FHE protects oracle/health computation and aggregate collateral coverage.
 
-**Pattern adopted from**: Laolex/shieldlend — an admin keeper bot calls `accrueInterest(borrower)` for each active loan on a daily schedule. Utilization is estimated from publicly observable deposit counts (not encrypted balances) and the rate is updated via governance. This is a conscious tradeoff: the rate may lag true utilization by one admin update cycle.
-
-**Our implementation**: A keeper calls `lending_pool::accrue_interest(loan_account)` once per `keeper_min_accrual_slots` (default: ~1 day). The instruction computes `new_balance = balance × (1 + rate)` in public/bucketed lending accounting. The `last_accrual_slot` is a public plaintext field.
+**Decision**: A keeper calls `lending_pool::accrue_interest(loan_account)` once per `keeper_min_accrual_slots` (default: ~1 day). The instruction computes `new_balance = balance × (1 + rate)` in public/bucketed lending accounting. The `last_accrual_slot` is a public plaintext field.
 
 **Slot-based timing**: Solana uses slot numbers, not Unix timestamps. `keeper_min_accrual_slots = 216_000` ≈ 1 day at 400ms/slot.
 

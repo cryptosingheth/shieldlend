@@ -109,7 +109,7 @@ This avoids overclaiming and keeps the lending system verifiable.
 |---|---|---|
 | General privacy pools | Tornado Cash, Railgun, Elusiv | no lending state machine |
 | Stealth address tools | Umbra-style systems | hide destination only |
-| FHE lending prototypes | Laolex/shieldlend-style designs | limited Solana-native UX and address privacy |
+| FHE lending prototypes | encrypted-lending experiments | limited Solana-native UX and address privacy |
 | ZK credit projects | AXIS-style tiering | scoring, not full private lending lifecycle |
 
 ShieldLend is positioned as private lending infrastructure, not only a mixer or wallet privacy tool.

@@ -96,7 +96,7 @@ pub struct LoanAccount {
     pub borrow_bucket: u16,                     // optional bucket for amount-fingerprinting reduction
     pub status: LoanStatus,                     // Active, Repaid, Liquidated
 
-    // FHE liquidation — handle pinning [C-01, adapted from Laolex/shieldlend]
+    // FHE liquidation — handle pinning [Anchor PDA binding]
     pub is_liquidatable: EncryptedBool,         // FHE ciphertext — health factor result
     pub liq_ciphertext_handle: [u8; 32],        // hash of is_liquidatable ciphertext at request time
     pub pending_liquidation_reveal: bool,       // Step 1 → Step 2 in progress
@@ -122,7 +122,7 @@ pub struct LoanAccount {
 
 ### Three-Step Liquidation Flow
 
-*Adapted from Laolex/shieldlend's EVM pattern, mapped to Anchor PDA model.*
+*Mapped to Anchor's PDA model for asynchronous FHE liquidation.*
 
 **Step 1 — Request Liquidation Reveal** (permissionless — anyone can call)
 ```
@@ -170,7 +170,7 @@ Actions:
 
 **Stale Flag Clearing (on any position improvement)**
 
-*Adapted from Laolex/shieldlend [CR-2] — prevents stale confirmation from liquidating a now-healthy position.*
+*Stale flag clearing prevents an old liquidation confirmation from liquidating a now-healthy position.*
 
 ```
 On lending_pool::repay():

@@ -1,6 +1,6 @@
 # ShieldLend Solana — Approved Implementation Plan
 
-This plan is scoped only to the ShieldLend Solana repo. The EVM repo and the `v2a-architecture` branch are read-only references and must not be modified by this implementation.
+This plan is scoped only to the ShieldLend Solana repo. It is a standalone Solana implementation plan; no other ShieldLend repository is part of this implementation scope.
 
 ---
 
@@ -58,7 +58,7 @@ DeFi safety invariants:
 
 Language: Circom + Groth16, compiled with snarkjs and verified with `groth16-solana`.
 
-### Imported / Adapted from V2A Architecture
+### Imported / Adapted From Existing Circuit Lineage
 
 These are copied as design lineage only, then updated inside the Solana repo:
 
@@ -67,7 +67,7 @@ These are copied as design lineage only, then updated inside the Solana repo:
 | `withdraw_ring.circom` | Import/adapt existing ring + Merkle logic | Add `leaf_index`; update nullifier formula to `Poseidon(nullifier, leaf_index, SHIELDED_POOL_PROGRAM_ID)`; recompile WASM/VK |
 | `collateral_ring.circom` | Import/adapt existing collateral LTV logic | Same nullifier update; keep `borrowed` public/bucketed for deterministic LTV |
 
-No changes are made to the original EVM/V2A branch.
+No external repository is modified.
 
 ### Written From Scratch
 
@@ -140,7 +140,7 @@ Security review checklist before demo:
 - Search for stale nullifier formula.
 - Search for repayment amount overclaims.
 - Confirm dummy formula is not public-only.
-- Confirm no EVM/V2A branch files were modified.
+- Confirm only ShieldLend Solana repo files were modified.
 - Confirm fallback modes visibly reduce claims.
 
 ---

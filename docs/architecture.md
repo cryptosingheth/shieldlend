@@ -142,7 +142,7 @@ LoanAccount (PDA: seeds = [b"loan", collateral_nullifier_hash])
   - borrow_bucket: u16                    // optional bucket id for MVP amount-fingerprinting reduction
   - status: LoanStatus { Active, Repaid, Liquidated }
 
-  // FHE liquidation — handle pinning [inspired by Laolex/shieldlend C-01, Anchor PDA adaptation]
+  // FHE liquidation — handle pinning [Anchor PDA binding]
   - is_liquidatable: EncryptedBool        // Encrypt FHE ciphertext
   - liq_ciphertext_handle: [u8; 32]       // handle snapshot at liquidation request time
   - pending_liquidation_reveal: bool
@@ -460,8 +460,8 @@ fn aggregate_collateral_value(
 }
 
 // Interest accrual — called by keeper bot (not triggered inside FHE context)
-// Inspired by Laolex/shieldlend keeper pattern: accruing inside FHE would leak
-// encrypted debt aggregates during utilization computation
+// Accruing inside FHE would add unnecessary complexity and could leak
+// encrypted debt aggregates during utilization computation.
 fn accrue_interest(loan: &mut LoanAccount, current_slot: u64, rate_bps: u64) {
     // Slots since last accrual (public computation — rate history is public)
     let slots_elapsed = current_slot - loan.last_accrual_slot;
@@ -480,7 +480,7 @@ fn accrue_interest(loan: &mut LoanAccount, current_slot: u64, rate_bps: u64) {
 
 ### Three-Step Async Liquidation (FHE-Compatible)
 
-*Pattern adapted from Laolex/shieldlend EVM implementation, mapped to Anchor PDA model.*
+*Pattern mapped to Anchor's PDA model for asynchronous FHE liquidation.*
 
 FHE decryption is asynchronous — health factor ciphertexts must be sent to Encrypt threshold network and decrypted before liquidation can proceed. This requires a three-step flow to prevent liquidating solvent positions.
 
@@ -507,7 +507,7 @@ MVP liquidation is intentionally conservative: full liquidation only, minimum bo
 **Handle Pinning Security Property [C-01]**:
 The PDA seed constraint `seeds = [b"loan", collateral_nullifier_hash]` cryptographically derives a unique address for each loan. The Encrypt oracle proof is signed over this PDA address. A decryption proof from Loan A cannot be submitted against Loan B's account — the PDA address mismatch causes verification failure.
 
-*Architecture inspiration: Laolex/shieldlend's handle pinning pattern. Solidity equivalent: `require(handlesList[0] == FHE.toBytes32(positions[borrower].isLiquidatable))`. Anchor equivalent: PDA seed uniqueness as structural binding.*
+*Anchor binding: PDA seed uniqueness provides the structural binding between a liquidation reveal and the exact `LoanAccount`.*
 
 Threshold decryption (2/3 Encrypt network) used for:
 1. **Liquidation confirmation**: `is_liquidatable` → three-step reveal → boolean result
