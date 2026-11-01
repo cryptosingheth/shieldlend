@@ -27,7 +27,11 @@ import path from "path";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
-const DEPLOYER_KEY = "0x409542d1bbb7480819721001ea39ca1f717e0c2653a1f1ab5c9875cfbdcdb76b";
+const DEPLOYER_KEY = process.env.DEPLOYER_PRIVATE_KEY;
+if (!DEPLOYER_KEY) {
+  console.error("Set DEPLOYER_PRIVATE_KEY (Base Sepolia relay wallet) before running the live test.");
+  process.exit(1);
+}
 // V2B addresses (deployed 2026-04-10, cross-shard withdrawal)
 const SHARDS = [
   "0xcF78eaEA131747c67BBD1869130f0710bA646D8D",
