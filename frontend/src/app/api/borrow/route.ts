@@ -6,6 +6,7 @@ import {
   createPublicClient,
   http,
   parseAbi,
+  type PublicClient,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { baseSepolia } from "viem/chains";
@@ -44,7 +45,7 @@ const LENDING_POOL_ABI = parseAbi([
 // Pick a random shard (≠ collateralShard) that has at least `minBalance` ETH.
 // Falls back to collateralShard itself if no other shard has enough liquidity.
 async function pickDisburseShard(
-  publicClient: ReturnType<typeof createPublicClient>,
+  publicClient: Pick<PublicClient, "getBalance">,
   collateralShard: `0x${string}`,
   minBalance: bigint
 ): Promise<`0x${string}`> {
