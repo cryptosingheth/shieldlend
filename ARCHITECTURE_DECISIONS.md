@@ -448,5 +448,27 @@ This is only possible because all shards share the same `vkHash` (ADR-06, ADR-15
 
 ---
 
-*Last updated: Session 9 / V2B bug fix — 2026-04-20*  
+### ADR-32: Commit the Groth16 proving keys and the frontend lockfile
+
+**Status**: Decided  
+**When**: Session 10 / promotion to main  
+**Decision**: Track `frontend/public/circuits/withdraw_ring.zkey`, `frontend/public/circuits/collateral_ring.zkey`, and `frontend/package-lock.json`. Keep every other `*.zkey`, `keys/`, and `*.ptau` ignored.  
+**Alternatives considered**: (a) Keep them ignored and document regeneration. Re-running the setup produces a different verification key, so the result would not match the deployed vkHash on any shard. (b) Host the keys elsewhere (release asset, IPFS). Adds a download step and a second source of truth for about 12 MB of files.  
+**Rationale**: The browser fetches these exact zkeys at proof time. They are public parameters by design; the setup's toxic waste is not in them. Without them a clone cannot withdraw or borrow against the live deployment. The lockfile pins the exact dependency tree that ran, and `frontend/.npmrc` (`legacy-peer-deps=true`) reproduces the peer-dependency resolution the app was built with.  
+**Consequences**: Clones work against the deployed contracts with no extra steps. Any circuit change must update these files together with every shard's vkHash (see the shared vkHash invariant).
+
+---
+
+### ADR-33: Secrets are read from the environment only, never committed
+
+**Status**: Decided  
+**When**: Session 10 / promotion to main  
+**Decision**: Scripts and routes read `DEPLOYER_PRIVATE_KEY` and `ZKVERIFY_SEED_PHRASE` from the environment and fail fast when they are missing. No key literal lives in the repository.  
+**Alternatives considered**: (a) Leave the hardcoded key, since it is testnet-only. That wallet is the LendingPool admin and operator and the ZkVerifyAggregation operator, so exposing it lets anyone forge aggregation roots against the live deployment.  
+**Rationale**: The repository is public. A committed key is compromised the moment it is pushed, whatever the network.  
+**Consequences**: The key that was in branch history (relay `0x6D4b…4Fb2`) must be treated as compromised. Rotate admin and operator roles, or redeploy, before relying on the Base Sepolia deployment.
+
+---
+
+*Last updated: Session 10 / promotion to main — 2026-11-01*  
 *Next update: auto-appended at end of next session with design changes (see CLAUDE.md)*
