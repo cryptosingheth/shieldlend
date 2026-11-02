@@ -154,3 +154,9 @@ DEPLOYER_PRIVATE_KEY=0x... node frontend/live-test.mjs
 | [`AUDIT_REPORT.md`](AUDIT_REPORT.md) | Internal security review findings and fixes |
 | [`SESSION_LOGS/`](SESSION_LOGS/) | Dated build log for every development session |
 | [`ROADMAP.md`](ROADMAP.md) | Build history and upcoming milestones |
+
+---
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
