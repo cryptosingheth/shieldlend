@@ -1,73 +1,78 @@
-# ShieldLend V2A — ZK Circuit Design
+# ShieldLend V2B — ZK Circuit Design
 
-All circuits are written in Circom 2.1.6 and compiled to WebAssembly for browser-side proof generation. The proof system is Groth16 (via snarkjs).
+Both circuits are written in Circom 2.1.6 and compiled to WebAssembly for in-browser proof generation. The proof system is Groth16 (snarkjs) on BN254.
 
-V1 circuits (deposit.circom, withdraw.circom, collateral.circom) have been superseded by V2A ring circuits. They remain in circuits/ for reference only.
+The V1 circuits (`deposit.circom`, `withdraw.circom`, `collateral.circom`) were removed from the tree. They are in git history at `16cbd63`.
 
 ---
 
-## V2A Commitment Formula
-
-All V2A circuits use a single canonical formula:
+## Commitment and Spend Tag
 
 ```
-commitment = Poseidon(secret, nullifier)    // 2 inputs, secret first
+commitment    = Poseidon(secret, nullifier, denomination)   // 3 inputs, this order
+nullifierHash = Poseidon(nullifier)                          // 1 input
 ```
 
-This differs from V1 (Poseidon(nullifier, secret, amount)) in two ways:
-1. Input order reversed — secret comes first
-2. Amount removed — denominations are fixed at contract level
+The commitment binds the note's value, so a prover cannot claim a larger denomination than they deposited.
 
-The same formula is used by:
-- withdraw_ring.circom (commitment validity constraint)
-- collateral_ring.circom (commitment validity constraint)
-- circuits.ts computeCommitment() (frontend, deposit step)
-- ShieldedPool.sol deposit() (stores the commitment leaf)
+The spend tag depends on the nullifier alone. An earlier version used `Poseidon(nullifier, ring_index)`, which let the same note produce a different tag in every ring it appeared in, so it could be spent twice (audit finding H-3). A spend tag must be a fixed function of the note.
 
-If these diverge even by input order, every proof fails at MerkleTreeChecker assertion.
+The same formulas are used by:
+- `withdraw_ring.circom` and `collateral_ring.circom`
+- `frontend/src/lib/circuits.ts` `computeCommitment()` (deposit step)
+- `ShieldedPool.sol` (stores the commitment as a Merkle leaf)
+
+If any of these diverge, even in input order, every proof fails the Merkle inclusion check.
+
+Accepted denominations: 0.001, 0.005, 0.01, 0.05, 0.1 and 0.5 ETH.
 
 ---
 
 ## Circuit 1: withdraw_ring.circom
 
-Purpose: Prove ring membership (prover's note is one of K=16 commitments) AND global Merkle inclusion (real commitment is in the protocol tree) WITHOUT revealing which ring member the prover owns.
+Purpose: prove that the prover's note is one of K=16 public commitments (ring membership) AND is a leaf in the protocol's Merkle tree (global inclusion), without revealing which ring member it is.
 
 ### Why ring proofs?
 
-V1 used standard Merkle membership against the full tree. Problem: with only 3 deposits, the anonymity set is trivially 3 — timing correlation attacks are straightforward.
+V1 used a plain Merkle membership proof. With only a handful of deposits the anonymity set was trivially small and timing correlation was easy.
 
-V2A solution: prover samples K=16 commitments from the last 30 epoch flushes (mix of real deposits and protocol-inserted dummies). The proof shows the prover's note is one of the 16, but ring_index is private — the verifier cannot tell which one. With 10 dummies/epoch across 30 epochs, minimum anonymity set is 300 at protocol launch with zero real users.
+V2 samples K=16 commitments from the last 30 epoch flushes, a mix of real deposits and protocol-inserted dummies. `ring_index` is private, so the verifier cannot tell which one belongs to the prover.
 
 ### Signals
 
 ```
-// Private inputs (never revealed)
+// Private
 signal input secret;
 signal input nullifier;
-signal input ring_index;              // prover's position in ring (0..K-1)
-signal input pathElements[levels];   // Merkle auth path siblings
-signal input pathIndices[levels];    // 0=left, 1=right per level
+signal input denomination;
+signal input pathElements[24];
+signal input pathIndices[24];
+signal input ring_index;              // 0..15, range-checked with LessThan(4)
 
-// Public inputs (visible on-chain)
-signal input ring[K];                 // 16 commitments
-signal input root;                    // current Merkle root
-signal input recipient;               // destination address
-signal input amount;                  // denomination in wei
-signal output nullifierHash;          // Poseidon(nullifier, ring_index)
+// Public
+signal input ring[16];
+signal input nullifierHash;
+signal input root;
+signal output denomination_out;       // becomes `amount` in the attestation leaf
 
-component main = WithdrawRing(24, 16);
+component main {public [ring, nullifierHash, root]} = WithdrawRing(24, 16);
 ```
 
-### What the proof guarantees simultaneously
+snarkjs orders public outputs before public inputs, so the public signal vector is `[denomination_out, ring[0..15], nullifierHash, root]` (19 values).
 
-1. Commitment validity: C_real = Poseidon(secret, nullifier)
-2. Ring membership: ring[ring_index] == C_real  (ring_index is hidden)
-3. Global inclusion: C_real is a leaf in depth-24 Merkle tree with root R
-4. Spend tag: nullifierHash = Poseidon(nullifier, ring_index)
+### What the proof guarantees
 
-### Why recipient is a public input
+1. Commitment validity: `C_real = Poseidon(secret, nullifier, denomination)`
+2. Ring membership: `ring[ring_index] == C_real`, with `ring_index < 16`
+3. Global inclusion: `C_real` is a leaf in the depth-24 Merkle tree with root `root`
+4. Spend tag: `nullifierHash == Poseidon(nullifier)`
+5. Amount: `denomination_out == denomination`
 
-If recipient were not bound to the proof, anyone observing the proof in the mempool could replace the recipient and front-run the withdrawal. Making recipient a circuit constraint means the proof is only valid for the specific address.
+### How the recipient is bound (current limitation)
+
+`recipient` is **not** a circuit signal. After zkVerify accepts the proof, the server's operator posts an aggregation leaf `statementHash(root, nullifierHash, recipient, denomination)`, and `ShieldedPool._verifyAttestation` checks that leaf. The recipient is therefore bound by the operator, not by the proof. A party that copies a proof before the user's withdrawal lands could ask for a leaf with a different recipient.
+
+Planned fix: add `recipient` as a public input with a dummy constraint (`recipientSquare <== recipient * recipient`) so the proof itself fixes the payout address, then rebuild the keys and redeploy.
 
 ### Proof parameters
 
@@ -75,118 +80,102 @@ If recipient were not bound to the proof, anyone observing the proof in the memp
 |---|---|
 | Merkle depth | 24 |
 | Ring size K | 16 |
-| Approximate constraints | ~24,000 |
-| Browser proving time | ~25 seconds |
-| Proof size | 192 bytes (3 Groth16 curve points) |
+| Constraints | 13,588 |
+| Public signals | 19 (18 inputs + 1 output) |
+| Proof size | 3 Groth16 curve points |
 
 ---
 
 ## Circuit 2: collateral_ring.circom
 
-Purpose: Prove ownership of a note whose denomination satisfies the LTV requirement for a given borrow amount, WITHOUT revealing the denomination, specific note, or ring position.
+Purpose: prove ownership of a note large enough to back a given loan, without revealing the note, its ring position or its denomination.
 
 ### Signals
 
 ```
-// Private inputs
+// Private
 signal input secret;
 signal input nullifier;
-signal input denomination;            // note value in wei — PRIVATE
+signal input pathElements[24];
+signal input pathIndices[24];
 signal input ring_index;
-signal input pathElements[levels];
-signal input pathIndices[levels];
+signal input denomination;
 
-// Public inputs
-signal input ring[K];
+// Public
+signal input ring[16];
+signal input nullifierHash;
 signal input root;
-signal input nullifierHash;           // Poseidon(nullifier, ring_index)
-signal input borrowed;                // borrow amount in wei
-signal input minRatioBps;             // e.g. 11000 = 110% LTV floor
+signal input borrowed;                // loan amount in wei
+signal input minRatioBps;             // e.g. 5000 = loan may be at most 50% of collateral
 
-// Commitment formula: Poseidon(secret, nullifier)
-// denomination is a SEPARATE private LTV witness, not in the hash
-
-component main = CollateralRing(24, 16);
+component main {public [ring, nullifierHash, root, borrowed, minRatioBps]} = CollateralRing(24, 16);
 ```
 
 ### What the proof guarantees
 
-1. Commitment validity: C_real = Poseidon(secret, nullifier)
-2. Ring membership: ring[ring_index] == C_real
-3. Global inclusion: C_real is in Merkle tree (the deposit actually happened)
-4. LTV check: denomination x 10000 >= borrowed x minRatioBps
-5. Spend tag: nullifierHash = Poseidon(nullifier, ring_index)
+1. Commitment validity: `C_real = Poseidon(secret, nullifier, denomination)`
+2. Ring membership: `ring[ring_index] == C_real`
+3. Global inclusion: `C_real` is in the Merkle tree, so the deposit happened
+4. Spend tag: `nullifierHash == Poseidon(nullifier)`, which locks the note while the loan is open
+5. Collateral sufficiency: `denomination * minRatioBps >= borrowed * 10000` (`GreaterEqThan(96)`)
 
 ### Why denomination is private
 
-If denomination were public, an observer could narrow which ring member the prover owns by correlating known denomination values of ring members. Keeping it private hides collateral size while still proving the LTV inequality.
+If it were public, an observer could narrow the ring to members with that denomination. Keeping it private hides the collateral size while still proving the inequality.
 
-### Why denomination is NOT in the commitment hash
+### Proof parameters
 
-Both circuits use Poseidon(secret, nullifier) for commitment. This means the same deposited leaf works for both withdraw and borrow proofs — no separate commitment type needed. Denomination is a private LTV witness only. (Note: this is a production design consideration — a denomination-binding deposit circuit would be more rigorous but requires a different commitment format.)
+| Parameter | Value |
+|---|---|
+| Constraints | 13,691 |
+| Public signals | 20 inputs |
+
+The borrow path does not post an on-chain aggregation leaf. The server verifies the proof on zkVerify, then the operator records the loan in `LendingPool`.
 
 ---
 
-## Trusted Setup (V2A)
+## Trusted Setup
 
-Groth16 requires a per-circuit trusted setup. V2A uses powersOfTau28_hez_final_17.ptau.
+Groth16 needs a per-circuit setup. The current keys come from a local development setup (Powers of Tau `powersOfTau28_hez_final_17.ptau` plus a beacon), not a public multi-party ceremony.
 
 ```bash
-# 1. Download ptau (iden3 GCS — Hermez S3 bucket is decommissioned)
+# 1. Download ptau
 curl -sL https://storage.googleapis.com/zkevm/ptau/powersOfTau28_hez_final_17.ptau \
      -o circuits/build/pot17.ptau
 
-# 2. Compile circuits
-circom circuits/withdraw_ring.circom --r1cs --wasm --sym -o circuits/build -l node_modules
+# 2. Compile
+circom circuits/withdraw_ring.circom   --r1cs --wasm --sym -o circuits/build -l node_modules
 circom circuits/collateral_ring.circom --r1cs --wasm --sym -o circuits/build -l node_modules
 
-# 3. Groth16 setup
-npx snarkjs groth16 setup circuits/build/withdraw_ring.r1cs \
-    circuits/build/pot17.ptau circuits/build/withdraw_ring_0000.zkey
-npx snarkjs groth16 setup circuits/build/collateral_ring.r1cs \
-    circuits/build/pot17.ptau circuits/build/collateral_ring_0000.zkey
+# 3. Setup + dev beacon
+npx snarkjs groth16 setup circuits/build/withdraw_ring.r1cs circuits/build/pot17.ptau circuits/build/withdraw_ring_0000.zkey
+npx snarkjs zkey beacon circuits/build/withdraw_ring_0000.zkey circuits/keys/withdraw_ring.zkey <beaconHex> 10
+# (same for collateral_ring)
 
-# 4. Finalize (beacon for dev)
-npx snarkjs zkey beacon circuits/build/withdraw_ring_0000.zkey \
-    circuits/build/withdraw_ring_final.zkey <beaconHex> 10
-npx snarkjs zkey beacon circuits/build/collateral_ring_0000.zkey \
-    circuits/build/collateral_ring_final.zkey <beaconHex> 10
-
-# 5. Export verification keys
-npx snarkjs zkey export verificationkey circuits/build/withdraw_ring_final.zkey \
-    circuits/keys/withdraw_ring_vkey.json
-npx snarkjs zkey export verificationkey circuits/build/collateral_ring_final.zkey \
-    circuits/keys/collateral_ring_vkey.json
+# 4. Export verification keys
+npx snarkjs zkey export verificationkey circuits/keys/withdraw_ring.zkey   circuits/keys/withdraw_ring_vkey.json
+npx snarkjs zkey export verificationkey circuits/keys/collateral_ring.zkey circuits/keys/collateral_ring_vkey.json
 ```
 
-### Deployed VK hashes (Base Sepolia)
+What ships in the repo:
+- `frontend/public/circuits/*.zkey` and `*.wasm`: the browser prover
+- `circuits/keys/*_vkey.json`: read by the `/api/zkverify` and `/api/borrow` routes when submitting proofs to zkVerify
 
-| Circuit | VK hash |
+All of these must come from the same setup. Changing a circuit means a new setup, a new vkHash and a redeploy of every shard.
+
+| Circuit | vkHash (zkVerify) |
 |---|---|
-| withdraw_ring | 0x3c7529ffc44c852ad3b1b566a976ea29f379eec2a2edadb7ade311a432962e49 |
-| collateral_ring | Recompiled in session 2 (commitment formula fix) — check circuits/keys/ |
-
-The withdraw_ring VK hash is embedded in ShieldedPool.sol for attestation verification. Changing the circuit requires a new trusted setup AND a contract redeployment.
+| withdraw_ring | `0x1702813c4e71d1e48547214eae39ad1b2d07d3643713094e92e619f4f2b0e572` |
 
 ---
 
-## circomlib Templates Used (V2A)
+## circomlib Templates Used
 
-| Template | Used In |
+| Template | Use |
 |---|---|
-| Poseidon(2) | Both circuits — commitment hash |
-| Poseidon(2) | Both circuits — nullifierHash = Poseidon(nullifier, ring_index) |
-| MerkleTreeChecker(24) | Both circuits — global Merkle inclusion |
-| MultiMux1 | MerkleTreeChecker — left/right sibling ordering |
-| GreaterEqThan(96) | collateral_ring — LTV inequality check |
-| Num2Bits | GreaterEqThan internal bit decomposition |
-
----
-
-## V1 Circuits (Superseded)
-
-| Circuit | Issue |
-|---|---|
-| deposit.circom | Pedersen commitment, wrong formula for V2A |
-| withdraw.circom | Depth-20 tree, single-note proof, wrong public signals |
-| collateral.circom | Raw LTV check only — no proof that collateral actually exists on-chain |
+| `Poseidon(3)` | Commitment |
+| `Poseidon(1)` | nullifierHash |
+| `Poseidon(2)` | Merkle node hashing |
+| `MerkleTreeChecker(24)` | Global inclusion (defined in each circuit) |
+| `LessThan(4)` | `ring_index` range check |
+| `GreaterEqThan(96)` | collateral_ring LTV inequality |

@@ -134,6 +134,7 @@ DEPLOYER_PRIVATE_KEY=0x... node frontend/live-test.mjs
 
 **Known limitations (accepted for testnet):**
 - zkVerify and LendingPool operator is a single EOA — needs a multisig before mainnet
+- The withdrawal recipient is bound by the operator's attestation leaf, not inside the proof; making it a public circuit input is the next circuit change (see [`docs/circuits.md`](docs/circuits.md))
 - Shard shuffle is `keccak256`-seeded, not Chainlink VRF
 - Repaying from the user's wallet reveals that the wallet had a loan (not which note or depositor)
 - Groth16 keys come from a local development setup, not a public multi-party ceremony

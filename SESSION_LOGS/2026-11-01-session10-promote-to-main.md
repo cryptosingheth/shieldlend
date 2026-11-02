@@ -22,6 +22,9 @@
 | S10-03 | MEDIUM | `next build` failed: `circomlibjs` and `snarkjs` have no typings | `frontend/src/types/zk-libs.d.ts` module declarations |
 | S10-04 | MEDIUM | Fresh clone could not prove: `*.zkey` was gitignored, but the frontend fetches it from `/circuits/` | Commit `withdraw_ring.zkey` + `collateral_ring.zkey` (ADR-32) |
 | S10-05 | LOW | `npm ci` impossible (lockfile gitignored), and plain `npm install` hits an ERESOLVE peer conflict (`@wagmi/connectors@8` vs wagmi 2) | Commit `package-lock.json`, add `frontend/.npmrc` with `legacy-peer-deps=true` |
+| S10-06 | MEDIUM | Fresh clone could not withdraw or borrow: `/api/zkverify` and `/api/borrow` read `circuits/keys/*_vkey.json`, which `keys/` in `.gitignore` excluded | Commit both vkey JSONs (checked equal to the vkeys exported from the shipped zkeys) |
+| S10-07 | HIGH (open) | `recipient` is not a circuit signal; it is bound only by the operator's attestation leaf, so a copied proof could be paired with another recipient | Documented in `docs/circuits.md` and README; fix = recipient as public input, new setup, redeploy |
+| S10-08 | LOW | `docs/circuits.md` described the pre-audit circuits (2-input commitment, ring-index nullifier, recipient as public input, ~24k constraints) | Rewritten from the actual circuits: 13,588 / 13,691 constraints from the r1cs, which match the zkey headers |
 
 `npm run dev` skips type-checking, which is why S10-02 and S10-03 never surfaced during development.
 
@@ -54,7 +57,7 @@ Also found: `b195ce2` (2026-04-09, labelled docs) deleted the whole tree; V2A+ r
 | Metric | Value |
 |--------|-------|
 | Total sessions | 10 |
-| Total bugs found | 61 |
-| Total bugs fixed | 59 |
-| Open (accepted trade-offs) | 2 |
+| Total bugs found | 64 |
+| Total bugs fixed | 61 |
+| Open | 3 (2 accepted trade-offs + S10-07) |
 | Contracts deployed | 4 times (Sessions 1, 4, 6, 7) |
