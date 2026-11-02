@@ -41,7 +41,9 @@
 
 ## Open Items
 
-1. **Rotate the relay/deployer key.** It was public in branch history from April until this session. It is the LendingPool admin and operator and the ZkVerifyAggregation operator, so anyone holding it can post aggregation roots. Testnet only; it holds no mainnet balance.
+1. **Rotate the relay/deployer key.** It was public in branch history from April until this session. It is the LendingPool admin and operator and the ZkVerifyAggregation operator, so anyone holding it can post aggregation roots. Testnet only; it holds no mainnet balance. Rotation means a full redeploy: `ZkVerifyAggregation.operator` and `LendingPool.admin` are `immutable`, and `ShieldedPool` / `NullifierRegistry` have no admin-transfer function. No script in `contracts/script/` deploys `ZkVerifyAggregation` (the V1 `Deploy.s.sol` that did was removed in `b195ce2`).
+
+Also found: `b195ce2` (2026-04-09, labelled docs) deleted the whole tree; V2A+ re-added only V2 files, so `LICENSE` was lost. Restored from the original MIT text.
 2. Browser re-test of the stealth auto-forward (ADR-29/30/31) is still pending.
 3. Borrow → repay still not confirmed end-to-end in the browser.
 
