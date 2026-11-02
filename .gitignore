@@ -3,8 +3,9 @@
 .env.local
 .env.*.local
 
-# Proving keys (large binary files)
-keys/
+# Proving keys (large binary files); verification keys are small and loaded by the API routes
+**/keys/*
+!circuits/keys/*_vkey.json
 *.zkey
 !frontend/public/circuits/*.zkey
 *.ptau
